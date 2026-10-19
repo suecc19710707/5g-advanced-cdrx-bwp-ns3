@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+5G-Advanced Joint 2D DRL Agent Evaluation Results Visualizer (Dynamic Adaptive Axes)
+File: plot_evaluation_results.py
+"""
+
+import os
+import sys
+import argparse
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def main(csv_path="deterministic_evaluation_results.csv", output_path="plot_evaluation_results.png"):
+
+    if not os.path.exists(csv_path):
+        print(f"❌ 找不到評估數據檔: '{csv_path}'，請確認檔名與路徑。")
+        return
+
+    print(f"📊 正在讀取評估數據檔: {csv_path}")
+    df = pd.read_csv(csv_path)
+    sla_target_ms = (
+        float(df["SlaTargetMs"].iloc[0])
+        if "SlaTargetMs" in df.columns
+        else 30.0
+    )
+
+    # 若無 SLA Compliance 欄位，自動手動換算
+    if "SLA_Compliance_Rate_Pct" not in df.columns:
+        if "SLA_Violation_Rate_Pct" in df.columns:
+            df["SLA_Compliance_Rate_Pct"] = 100.0 - df["SLA_Violation_Rate_Pct"]
+        else:
+            df["SLA_Compliance_Rate_Pct"] = 0.0
+
+    seeds = df["Seed"].astype(str)
+    
+    # 設定高視覺品質的主題風格
+    sns.set_theme(style='whitegrid', palette='colorblind', font='DejaVu Sans')
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 13), sharex=True)
+    fig.suptitle(f'5G-Advanced Joint 2D DRL Deterministic Evaluation Across {len(df)} Unseen Seeds',
+                 fontsize=14, fontweight='bold', y=0.98)
+
+    # -------------------------------------------------------------------------
+    # 子圖 1：P99 Tail Latency (ms) [自適應 Y 軸]
+    # -------------------------------------------------------------------------
+    ax1 = axes[0]
+    bars1 = ax1.bar(seeds, df["AvgP99LatencyMs"], color='#2b5c8f', alpha=0.85, width=0.55, edgecolor='black', linewidth=0.8)
+    
+    ax1.axhline(y=sla_target_ms, color='#e74c3c', linestyle='--', linewidth=2.0, label=f'{sla_target_ms:g} ms QoS SLA Target Bound')
+    
+    # 動態自適應設定上限，確保柱狀圖不被裁切
+    max_lat = max(df["AvgP99LatencyMs"].max(), sla_target_ms * 1.25)
+    ax1.fill_between(range(len(seeds)), 0, sla_target_ms, color='#27ae60', alpha=0.1, label=f'SLA Compliant Zone (<{sla_target_ms:g}ms)')
+
+    for bar in bars1:
+        height = bar.get_height()
+        ax1.annotate(f'{height:.2f} ms',
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 3),
+                     textcoords="offset points",
+                     ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    avg_p99_all = df["AvgP99LatencyMs"].mean()
+    ax1.set_title(f'1. P99 Tail Latency across Seeds (Average: {avg_p99_all:.2f} ms)', fontsize=11, fontweight='bold', loc='left')
+    ax1.set_ylabel('P99 Latency (ms)', fontsize=10, fontweight='bold')
+    ax1.set_ylim(0, max_lat * 1.22)
+    ax1.legend(loc='upper right', frameon=True)
+
+    # -------------------------------------------------------------------------
+    # 子圖 2：QoS SLA Compliance Rate (%) [自適應 0 ~ 108% 全範圍]
+    # -------------------------------------------------------------------------
+    ax2 = axes[1]
+    bars2 = ax2.bar(seeds, df["SLA_Compliance_Rate_Pct"], color='#27ae60', alpha=0.85, width=0.55, edgecolor='black', linewidth=0.8)
+    
+    ax2.axhline(y=95.0, color='#f39c12', linestyle=':', linewidth=1.8, label='95% Target High Reliability SLA')
+
+    for bar in bars2:
+        height = bar.get_height()
+        ax2.annotate(f'{height:.1f}%',
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 3),
+                     textcoords="offset points",
+                     ha='center', va='bottom', fontsize=9, fontweight='bold', color='#1e8449')
+
+    avg_sla = df["SLA_Compliance_Rate_Pct"].mean()
+    ax2.set_title(f'2. QoS SLA Compliance Rate (%) (Average: {avg_sla:.1f}%)', fontsize=11, fontweight='bold', loc='left')
+    ax2.set_ylabel('SLA Compliance (%)', fontsize=10, fontweight='bold')
+    ax2.set_ylim(0, 108.0)
+    ax2.legend(loc='upper right', frameon=True)
+
+    # -------------------------------------------------------------------------
+    # 子圖 3：Base Station (gNB) & UE Power Trade-off [動態雙 Y 軸]
+    # -------------------------------------------------------------------------
+    ax3 = axes[2]
+    color_gnb = '#2980b9'
+    color_ue = '#8e44ad'
+
+    # gNB 功耗自適應邊界
+    gnb_min, gnb_max = df["AvgGnbPowerW"].min(), df["AvgGnbPowerW"].max()
+    gnb_margin = max(2.0, (gnb_max - gnb_min) * 0.5) if gnb_max != gnb_min else 10.0
+    
+    line1 = ax3.plot(seeds, df["AvgGnbPowerW"], color=color_gnb, linewidth=2.2, marker='^', markersize=6, label='gNB Power (W)')
+    ax3.set_ylabel('gNB Power (W)', color=color_gnb, fontsize=10, fontweight='bold')
+    ax3.tick_params(axis='y', labelcolor=color_gnb)
+    ax3.set_ylim(max(0, gnb_min - gnb_margin), gnb_max + gnb_margin * 1.5)
+
+    # UE 功耗自適應邊界
+    ax3_twin = ax3.twinx()
+    ue_min, ue_max = df["AvgUePowerMw"].min(), df["AvgUePowerMw"].max()
+    ue_margin = max(5.0, (ue_max - ue_min) * 0.5) if ue_max != ue_min else 20.0
+
+    line2 = ax3_twin.plot(seeds, df["AvgUePowerMw"], color=color_ue, linewidth=2.2, marker='v', markersize=6, label='UE Power (mW)')
+    ax3_twin.set_ylabel('UE Power (mW)', color=color_ue, fontsize=10, fontweight='bold')
+    ax3_twin.tick_params(axis='y', labelcolor=color_ue)
+    ax3_twin.set_ylim(max(0, ue_min - ue_margin), ue_max + ue_margin * 1.5)
+
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax3.legend(lines, labels, loc='upper right', frameon=True)
+
+    ax3.set_title('3. Base Station & UE Power Stability Across Seeds', fontsize=11, fontweight='bold', loc='left')
+    ax3.set_xlabel('Random Seed Index (Unseen Environments)', fontsize=10, fontweight='bold')
+
+    sns.despine(fig=fig, right=False)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"✅ 動態自適應評估圖表已成功輸出至: {output_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Plot deterministic evaluation results.")
+    parser.add_argument("csv_path", nargs="?", default="deterministic_evaluation_results.csv")
+    parser.add_argument("--output", default="plot_evaluation_results.png")
+    args = parser.parse_args()
+    main(args.csv_path, args.output)

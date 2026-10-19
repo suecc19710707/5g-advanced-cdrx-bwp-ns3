@@ -1,0 +1,110 @@
+diff --git a/plot_fair_rule_vs_drl.py b/plot_fair_rule_vs_drl.py
+new file mode 100644
+index 000000000..3ab07aa8f
+--- /dev/null
++++ b/plot_fair_rule_vs_drl.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python3
++"""Plot an apples-to-apples ns-3 packet-level rule-based versus DRL comparison."""
++
++import argparse
++from pathlib import Path
++
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++import numpy as np
++import pandas as pd
++import seaborn as sns
++
++
++METRICS = [
++    ("P99LatencyMs", "Packet-level P99 latency", "ms", False),
++    ("QosSatisfactionRatePct", "30 ms packet compliance", "%", True),
++    ("AvgPowerWatts", "Average gNB power", "W", False),
++    ("UeAvgPowerMw", "Average UE power", "mW / UE", False),
++    ("EnergyEfficiency_MbitsPerJoule", "Energy efficiency", "Mbit / J", True),
++    ("TotalRxMbits", "Delivered traffic", "Mbit", True),
++]
++
++
++def main(rule_csv, drl_csv, summary_csv, output_png):
++    rule = pd.read_csv(rule_csv)
++    drl = pd.read_csv(drl_csv)
++    if len(rule) != len(drl):
++        raise ValueError("rule and DRL CSV files must contain the same number of seeds")
++
++    seeds = np.arange(101, 101 + len(rule))
++    rows = []
++    for name, frame in (("1D Rule-Based", rule), ("DRL checkpoint", drl)):
++        row = {"Method": name, "NumSeeds": len(frame)}
++        for column, _, _, _ in METRICS:
++            row[f"{column}_Mean"] = frame[column].mean()
++            row[f"{column}_Std"] = frame[column].std()
++        rows.append(row)
++
++    summary = pd.DataFrame(rows)
++    summary_path = Path(summary_csv).expanduser().resolve()
++    summary_path.parent.mkdir(parents=True, exist_ok=True)
++    summary.to_csv(summary_path, index=False)
++
++    sns.set_theme(style="whitegrid", palette="colorblind")
++    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
++    colors = ["#4c78a8", "#f58518"]
++
++    for ax, (column, title, unit, higher_is_better) in zip(axes.flat, METRICS):
++        values = [rule[column].to_numpy(), drl[column].to_numpy()]
++        means = [x.mean() for x in values]
++        stds = [x.std(ddof=1) for x in values]
++        x_pos = np.arange(2)
++
++        ax.bar(x_pos, means, yerr=stds, capsize=5, color=colors, alpha=0.8,
++               edgecolor="black", linewidth=0.8)
++        for method_index, method_values in enumerate(values):
++            jitter = np.linspace(-0.08, 0.08, len(method_values))
++            ax.scatter(np.full(len(method_values), method_index) + jitter,
++                       method_values, color="black", s=18, alpha=0.65, zorder=3)
++
++        delta_pct = (means[1] / means[0] - 1.0) * 100.0
++        direction = "higher is better" if higher_is_better else "lower is better"
++        ax.set_title(f"{title}\nDRL vs rule: {delta_pct:+.2f}% ({direction})", fontsize=11)
++        ax.set_ylabel(unit)
++        ax.set_xticks(x_pos, ["1D Rule", "DRL"])
++        margin = max(abs(max(means) - min(means)) * 2.5, max(means) * 0.08)
++        ax.set_ylim(max(0.0, min(min(x) for x in values) - margin),
++                    max(max(x) for x in values) + margin)
++
++    fig.suptitle(
++        f"Fair ns-3 comparison across {len(seeds)} matched seeds "
++        "(10 UEs, 2 Mbps/UE, fixed 20 MHz)",
++        fontsize=15,
++        fontweight="bold",
++    )
++    fig.text(
++        0.5,
++        0.01,
++        "Error bars: standard deviation across seeds; dots: individual matched-seed runs. "
++        "P99 is computed over all packets in each ns-3 episode.",
++        ha="center",
++        fontsize=10,
++    )
++    plt.tight_layout(rect=[0, 0.04, 1, 0.94])
++
++    output_path = Path(output_png).expanduser().resolve()
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    fig.savefig(output_path, dpi=240, bbox_inches="tight")
++    plt.close(fig)
++
++    print(summary.to_string(index=False))
++    print(f"Summary CSV: {summary_path}")
++    print(f"Comparison PNG: {output_path}")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--rule-csv", required=True)
++    parser.add_argument("--drl-csv", required=True)
++    parser.add_argument("--summary-csv", required=True)
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    main(args.rule_csv, args.drl_csv, args.summary_csv, args.output)

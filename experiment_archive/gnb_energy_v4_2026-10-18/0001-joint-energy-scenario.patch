@@ -1,0 +1,1262 @@
+diff --git a/scratch/joint-energy-mvp.cc b/scratch/joint-energy-mvp.cc
+index a268eef3a..906e6bc60 100644
+--- a/scratch/joint-energy-mvp.cc
++++ b/scratch/joint-energy-mvp.cc
+@@ -13,116 +13,210 @@
+ #include <algorithm>
+ #include <unordered_map>
+ #include <cmath>
++#include <sys/socket.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++#include <cstring>
++#include <iostream>
+ 
+ using namespace ns3;
+ 
+ NS_LOG_COMPONENT_DEFINE("JointEnergyMvp");
+ 
+-// ==================================================================================
+-// 1. 3GPP BWP 規格與動態切換功率映射表 (3GPP TS 38.104 / TS 38.133 / TR 38.840)
+-// ==================================================================================
+ enum BwpState {
+-    BWP_NARROW_20MHZ = 0,  // 20 MHz Low-Power BWP (51 PRBs, 30kHz SCS)
+-    BWP_WIDE_100MHZ  = 1   // 100 MHz High-Performance BWP (273 PRBs, 30kHz SCS)
++    BWP_NARROW_20MHZ = 0,
++    BWP_WIDE_100MHZ  = 1
+ };
+ 
+ struct BwpPowerProfile {
+-    double pRxMw;          // Active Rx 接收解碼功耗 (mW)
+-    double pMicroSleepMw;  // Active Idle / Micro-Sleep PDCCH 聽診功耗 (mW)
+-    uint32_t prbCount;     // PRB 數量
+-    double channelBwMhz;   // 頻道頻寬 (MHz)
++    double pRxMw;
++    double pMicroSleepMw;
++    uint32_t prbCount;
++    double channelBwMhz;
+ };
+ 
+-// 3GPP BWP 實體層功率參數 (20MHz vs 100MHz)
+ const BwpPowerProfile g_bwpPowerProfiles[] = {
+-    {120.0, 20.0, 51,  20.0},  // Index 0: 20 MHz BWP (BWP_NARROW_20MHZ)
+-    {250.0, 45.0, 273, 100.0}  // Index 1: 100 MHz BWP (BWP_WIDE_100MHZ)
++    {120.0, 20.0, 51,  20.0},
++    {250.0, 45.0, 273, 100.0}
+ };
+ 
+-// ----------------------------------------------------------------------------------
+-// 2. 封包延遲與佇列追蹤器 (支援 DCI 動態 OnDuration 擴展與喚醒延遲懲罰)
+-// ----------------------------------------------------------------------------------
+-class PacketDelayTracker
++class RlIpcClient
+ {
+ public:
+-    PacketDelayTracker(bool enableCdrx = false, bool enableDciDynamic = false, double phaseOffsetMs = 0.0, double cdrxOnDurationMs = 10.0, double cycleMs = 40.0)
+-        : m_enableCdrx(enableCdrx),
+-          m_enableDciDynamic(enableDciDynamic),
+-          m_phaseOffsetMs(phaseOffsetMs),
+-          m_cdrxOnDurationMs(cdrxOnDurationMs),
+-          m_dynamicOnDurationMs(cdrxOnDurationMs),
+-          m_cycleMs(cycleMs),
+-          m_totalTxBytes(0),
+-          m_totalRxBytes(0),
+-          m_totalDropBytes(0)
++    RlIpcClient(const std::string& host = "127.0.0.1", int port = 5555)
++        : m_host(host), m_port(port), m_sockFd(-1), m_connected(false)
+     {}
+ 
+-    void UpdateDynamicOnDurationMs(double newOnDurationMs)
++    ~RlIpcClient()
+     {
+-        if (m_enableDciDynamic)
++        if (m_sockFd >= 0) close(m_sockFd);
++    }
++
++    bool Connect()
++    {
++        m_sockFd = socket(AF_INET, SOCK_STREAM, 0);
++        if (m_sockFd < 0) return false;
++
++        struct sockaddr_in servAddr;
++        std::memset(&servAddr, 0, sizeof(servAddr));
++        servAddr.sin_family = AF_INET;
++        servAddr.sin_port = htons(m_port);
++        inet_pton(AF_INET, m_host.c_str(), &servAddr.sin_addr);
++
++        if (connect(m_sockFd, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0)
+         {
+-            m_dynamicOnDurationMs = newOnDurationMs;
++            close(m_sockFd);
++            m_sockFd = -1;
++            return false;
++        }
++        m_connected = true;
++        return true;
++    }
++
++    int StepIpc(double backlogBytes, double maxUeBacklogBytes, double offeredRateMbps,
++                double deliveredRateMbps,
++                double delayMs,
++                double avgCqi, double p10Cqi, double minCqi, double avgMcs,
++                double wActiveMs, int bwpState,
++                double gnbPowerW, double uePowerMw, double jainFairness)
++    {
++        if (!m_connected && !Connect())
++        {
++            return -1;
++        }
++
++        char sendBuffer[384];
++        std::snprintf(sendBuffer, sizeof(sendBuffer),
++                      "S4,%.2f,%.2f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.4f\n",
++                      backlogBytes, maxUeBacklogBytes, offeredRateMbps, deliveredRateMbps, delayMs,
++                      avgCqi, p10Cqi, minCqi,
++                      avgMcs, wActiveMs, bwpState, gnbPowerW, uePowerMw, jainFairness);
++
++        if (send(m_sockFd, sendBuffer, std::strlen(sendBuffer), 0) < 0)
++        {
++            m_connected = false;
++            return -1;
++        }
++
++        char recvBuffer[64];
++        std::memset(recvBuffer, 0, sizeof(recvBuffer));
++        ssize_t bytesRead = recv(m_sockFd, recvBuffer, sizeof(recvBuffer) - 1, 0);
++        if (bytesRead <= 0)
++        {
++            m_connected = false;
++            return -1;
+         }
++
++        recvBuffer[bytesRead] = '\0';
++        int actionIdx = -1;
++        std::sscanf(recvBuffer, "%d", &actionIdx);
++        return actionIdx;
+     }
+ 
++private:
++    std::string m_host;
++    int m_port;
++    int m_sockFd;
++    bool m_connected;
++};
++
++class PacketDelayTracker
++{
++public:
++    PacketDelayTracker()
++        : m_totalTxBytes(0),
++          m_totalRxBytes(0),
++          m_totalDropBytes(0)
++    {}
++
+     void RecordTx(Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t interface)
+     {
+-        m_txTimes[packet->GetUid()] = Simulator::Now();
+-        m_totalTxBytes += packet->GetSize();
++        uint32_t payloadBytes = packet->GetSize() >= 8 ? packet->GetSize() - 8 : packet->GetSize();
++        m_txInfo[packet->GetUid()] = {Simulator::Now(), payloadBytes};
++        m_pendingBytes += payloadBytes;
++        m_totalTxBytes += payloadBytes;
++        m_windowTxBytes += payloadBytes;
+     }
+ 
+     void RecordRx(Ptr<const Packet> packet, const Address& from, const Address& to)
+     {
+         uint64_t uid = packet->GetUid();
+-        auto it = m_txTimes.find(uid);
+-        if (it != m_txTimes.end())
++        auto it = m_txInfo.find(uid);
++        if (it != m_txInfo.end())
+         {
+-            Time sendTime = it->second;
++            Time sendTime = it->second.first;
+             Time delay = Simulator::Now() - sendTime;
+             double rawDelayMs = delay.GetSeconds() * 1000.0;
+-
+-            // 硬性 C-DRX PHY 門鎖判定
+-            if (m_enableCdrx)
+-            {
+-                double effectiveOnDurationMs = m_enableDciDynamic ? m_dynamicOnDurationMs : m_cdrxOnDurationMs;
+-                double sendTimeSec = sendTime.GetSeconds();
+-                double cycleTimeMs = std::fmod(sendTimeSec * 1000.0, m_cycleMs);
+-
+-                double ueOnStart = m_phaseOffsetMs;
+-                double ueOnEnd = m_phaseOffsetMs + effectiveOnDurationMs;
+-
+-                // 若發射時間非屬於 UE 甦醒視窗，則累加喚醒等待延遲懲罰
+-                if (cycleTimeMs < ueOnStart || cycleTimeMs > ueOnEnd)
+-                {
+-                    double penaltyMs = (cycleTimeMs < ueOnStart) ? (ueOnStart - cycleTimeMs) : ((m_cycleMs - cycleTimeMs) + ueOnStart);
+-                    rawDelayMs += penaltyMs;
+-                }
+-            }
+-
+             m_delaysMs.push_back(rawDelayMs);
++            m_windowDelaysMs.push_back(rawDelayMs);
++            m_pendingBytes = m_pendingBytes >= it->second.second
++                                 ? m_pendingBytes - it->second.second
++                                 : 0;
++            m_txInfo.erase(it);
+         }
+         m_totalRxBytes += packet->GetSize();
++        m_windowRxBytes += packet->GetSize();
+     }
+ 
+     void RecordDrop(Ptr<const Packet> packet)
+     {
+         m_totalDropBytes += packet->GetSize();
++        auto it = m_txInfo.find(packet->GetUid());
++        if (it != m_txInfo.end())
++        {
++            m_pendingBytes = m_pendingBytes >= it->second.second
++                                 ? m_pendingBytes - it->second.second
++                                 : 0;
++            m_txInfo.erase(it);
++        }
+     }
+ 
+     uint64_t GetPendingBytes() const
+     {
+-        uint64_t processedBytes = m_totalRxBytes + m_totalDropBytes;
+-        return (m_totalTxBytes >= processedBytes) ? (m_totalTxBytes - processedBytes) : 0;
++        return m_pendingBytes;
++    }
++
++    uint64_t GetTotalTxBytes() const
++    {
++        return m_totalTxBytes;
++    }
++
++    uint64_t GetTotalRxBytes() const
++    {
++        return m_totalRxBytes;
+     }
+ 
+     double GetP99Latency() const
+     {
+-        if (m_delaysMs.empty()) return 0.0;
+-        std::vector<double> sortedDelays = m_delaysMs;
+-        std::sort(sortedDelays.begin(), sortedDelays.end());
+-        size_t idxP99 = static_cast<size_t>(0.99 * sortedDelays.size());
+-        if (idxP99 >= sortedDelays.size()) idxP99 = sortedDelays.size() - 1;
+-        return sortedDelays[idxP99];
++        return CalculateP99(m_delaysMs);
++    }
++
++    double GetWindowP99Latency() const
++    {
++        return CalculateP99(m_windowDelaysMs);
++    }
++
++    void ResetWindowStats()
++    {
++        m_windowDelaysMs.clear();
++        m_windowTxBytes = 0;
++        m_windowRxBytes = 0;
++    }
++
++    double GetWindowOfferedRateMbps(double windowSeconds) const
++    {
++        return windowSeconds > 0.0
++                   ? (static_cast<double>(m_windowTxBytes) * 8.0) /
++                         (windowSeconds * 1e6)
++                   : 0.0;
++    }
++
++    double GetWindowDeliveredRateMbps(double windowSeconds) const
++    {
++        return windowSeconds > 0.0
++                   ? (static_cast<double>(m_windowRxBytes) * 8.0) /
++                         (windowSeconds * 1e6)
++                   : 0.0;
+     }
+ 
+     double GetQosSatisfactionRate(double targetDelayMs = 20.0) const
+@@ -137,46 +231,153 @@ public:
+     }
+ 
+ private:
+-    bool m_enableCdrx;
+-    bool m_enableDciDynamic;
+-    double m_phaseOffsetMs;
+-    double m_cdrxOnDurationMs;
+-    double m_dynamicOnDurationMs;
+-    double m_cycleMs;
+-    std::unordered_map<uint64_t, Time> m_txTimes;
++    static double CalculateP99(const std::vector<double>& delaysMs)
++    {
++        if (delaysMs.empty()) return 0.0;
++        std::vector<double> sortedDelays = delaysMs;
++        std::sort(sortedDelays.begin(), sortedDelays.end());
++        size_t idxP99 = static_cast<size_t>(0.99 * sortedDelays.size());
++        if (idxP99 >= sortedDelays.size()) idxP99 = sortedDelays.size() - 1;
++        return sortedDelays[idxP99];
++    }
++
++    std::unordered_map<uint64_t, std::pair<Time, uint32_t>> m_txInfo;
+     std::vector<double> m_delaysMs;
++    std::vector<double> m_windowDelaysMs;
++    uint64_t m_pendingBytes{0};
++    uint64_t m_windowTxBytes{0};
++    uint64_t m_windowRxBytes{0};
+     uint64_t m_totalTxBytes;
+     uint64_t m_totalRxBytes;
+     uint64_t m_totalDropBytes;
+ };
+ 
+-// 宣告 UE 追蹤器前置介面
++class RadioResourceController
++{
++public:
++    RadioResourceController(Ptr<NrMacSchedulerNs3> scheduler,
++                            Ptr<NrGnbPhy> gnbPhy,
++                            double periodMs,
++                            bool enableGating,
++                            bool enableBwpDynamic)
++        : m_scheduler(scheduler),
++          m_gnbPhy(gnbPhy),
++          m_periodMs(periodMs),
++          m_enableGating(enableGating),
++          m_enableBwpDynamic(enableBwpDynamic),
++          m_activeWindowMs(periodMs),
++          m_bwp(BWP_WIDE_100MHZ)
++    {
++        NS_ABORT_MSG_IF(!m_scheduler || !m_gnbPhy,
++                        "The gNB scheduler or PHY does not support resource control");
++    }
++
++    void Start(double activeWindowMs, BwpState bwp)
++    {
++        UpdateState(activeWindowMs, bwp);
++        Simulator::ScheduleNow(&RadioResourceController::BeginCycle, this);
++    }
++
++    void UpdateState(double activeWindowMs, BwpState bwp)
++    {
++        m_activeWindowMs = std::max(0.0, std::min(m_periodMs, activeWindowMs));
++        m_bwp = bwp;
++    }
++
++    uint64_t GetDlRlcBacklogBytes() const
++    {
++        return m_scheduler->GetTotalDlBufferBytes();
++    }
++
++    NrMacSchedulerNs3::DlObservationStats GetDlObservationStats() const
++    {
++        return m_scheduler->GetDlObservationStats();
++    }
++
++private:
++    void BeginCycle()
++    {
++        ApplyBwpMask();
++        m_scheduler->SetDlDataSchedulingEnabled(true);
++        if (m_enableGating && m_activeWindowMs < m_periodMs)
++        {
++            Simulator::Schedule(MilliSeconds(m_activeWindowMs),
++                                &RadioResourceController::EndActiveWindow,
++                                this);
++        }
++        Simulator::Schedule(MilliSeconds(m_periodMs),
++                            &RadioResourceController::BeginCycle,
++                            this);
++    }
++
++    void EndActiveWindow()
++    {
++        m_scheduler->SetDlDataSchedulingEnabled(false);
++    }
++
++    void ApplyBwpMask()
++    {
++        uint64_t rbPerRbg = m_scheduler->GetNumRbPerRbg();
++        NS_ABORT_MSG_IF(rbPerRbg == 0, "The scheduler RBG size is not configured");
++        uint32_t totalRbgs = m_gnbPhy->GetRbNum() / rbPerRbg;
++        NS_ABORT_MSG_IF(totalRbgs == 0, "The configured PHY has no schedulable RBGs");
++
++        uint32_t usableRbgs = totalRbgs;
++        if (m_bwp == BWP_NARROW_20MHZ)
++        {
++            uint32_t requestedPrbs = g_bwpPowerProfiles[m_bwp].prbCount;
++            usableRbgs = std::min(totalRbgs,
++                                  static_cast<uint32_t>(std::ceil(
++                                      static_cast<double>(requestedPrbs) / rbPerRbg)));
++        }
++        std::vector<bool> mask(totalRbgs, false);
++        uint32_t firstUsable = (totalRbgs - usableRbgs) / 2;
++        std::fill(mask.begin() + firstUsable,
++                  mask.begin() + firstUsable + usableRbgs,
++                  true);
++        m_scheduler->SetDlNotchedRbgMask(mask);
++    }
++
++    Ptr<NrMacSchedulerNs3> m_scheduler;
++    Ptr<NrGnbPhy> m_gnbPhy;
++    double m_periodMs;
++    bool m_enableGating;
++    bool m_enableBwpDynamic;
++    double m_activeWindowMs;
++    BwpState m_bwp;
++};
++
+ class UeEnergyTracker;
++class GnbSlotEnergyTracker;
+ 
+-// ----------------------------------------------------------------------------------
+-// 3. 閉迴路動態佇列感知控制器 (支援時域 Active Window + 頻域 Dynamic BWP 2D 對齊)
+-// ----------------------------------------------------------------------------------
+ class DynamicDtxController
+ {
+ public:
+-    DynamicDtxController(PacketDelayTracker* tracker, UeEnergyTracker* ueTracker, ApplicationContainer apps,
+-                         double totalDataRateMbps, bool enableDciDynamic = false, bool enableBwpDynamic = false,
++    DynamicDtxController(PacketDelayTracker* tracker, UeEnergyTracker* ueTracker, GnbSlotEnergyTracker* gnbTracker,
++                         RadioResourceController* radioController, double totalDataRateMbps,
++                         bool enableDciDynamic = false,
++                         bool enableBwpDynamic = false, bool enableRlIpc = false, int ipcPort = 5555,
+                          double linkDelaySec = 0.010, double evalIntervalMs = 40.0, double minActiveMs = 10.0,
+-                         double maxActiveMs = 30.0, double stepUpMs = 4.0, double stepDownMs = 2.0,
++                         double maxActiveMs = 30.0, double initialActiveMs = 30.0,
++                         double stepUpMs = 4.0, double stepDownMs = 2.0,
+                          uint64_t backlogThresholdBytes = 2000,
+-                         std::string timelineCsvName = "active_window_timeline.csv")
++                         std::string timelineCsvName = "active_window_timeline.csv",
++                         double warmupMs = 200.0)
+         : m_tracker(tracker),
+           m_ueTracker(ueTracker),
+-          m_apps(apps),
++          m_gnbTracker(gnbTracker),
++          m_radioController(radioController),
+           m_totalDataRateMbps(totalDataRateMbps),
+           m_enableDciDynamic(enableDciDynamic),
+           m_enableBwpDynamic(enableBwpDynamic),
++          m_enableRlIpc(enableRlIpc),
++          m_ipcPort(ipcPort),
+           m_evalIntervalSec(evalIntervalMs / 1000.0),
+           m_minActiveMs(minActiveMs),
+           m_maxActiveMs(maxActiveMs),
+           m_stepUpMs(stepUpMs),
+           m_stepDownMs(stepDownMs),
+-          m_currentActiveMs(minActiveMs),
++          m_currentActiveMs(std::max(minActiveMs, std::min(maxActiveMs, initialActiveMs))),
+           m_currentBwp(BWP_NARROW_20MHZ),
+           m_bwpInactivityTimerMs(0.0),
+           m_bwpInactivityTimeoutMs(10.0),
+@@ -184,9 +385,20 @@ public:
+           m_avgTbsPerSlot(3000),
+           m_slotDurationMs(0.5),
+           m_backlogThresholdBytes(backlogThresholdBytes),
+-          m_timelineCsvName(timelineCsvName)
++          m_timelineCsvName(timelineCsvName),
++          m_warmupMs(warmupMs),
++          m_ipcClient(nullptr)
+     {
+         m_bdpThresholdBytes = static_cast<uint64_t>((totalDataRateMbps * 1e6 * linkDelaySec) / 8.0);
++        if (m_enableRlIpc)
++        {
++            m_ipcClient = new RlIpcClient("127.0.0.1", ipcPort);
++        }
++    }
++
++    ~DynamicDtxController()
++    {
++        if (m_ipcClient) delete m_ipcClient;
+     }
+ 
+     void Start()
+@@ -203,21 +415,40 @@ public:
+         }
+         csv.close();
+ 
+-        Simulator::Schedule(Seconds(m_evalIntervalSec), &DynamicDtxController::EvaluateAndAdjust, this);
++        Simulator::Schedule(MilliSeconds(m_warmupMs), &DynamicDtxController::BeginControl, this);
+     }
+ 
++    void BeginControl();
+     void EvaluateAndAdjust();
++    void EvaluateAndAdjustRlIpc();
+ 
+     double GetCurrentActiveMs() const { return m_currentActiveMs; }
+     BwpState GetCurrentBwp() const { return m_currentBwp; }
+ 
+ private:
++    void AppendTimeline(uint64_t totalPending, uint64_t rlcBacklogBytes)
++    {
++        std::ofstream csv(m_timelineCsvName, std::ios::app);
++        if (csv.is_open())
++        {
++            csv << Simulator::Now().GetSeconds() << ","
++                << m_currentActiveMs << ","
++                << (m_currentBwp == BWP_WIDE_100MHZ ? 100 : 20) << ","
++                << totalPending << ","
++                << rlcBacklogBytes << ","
++                << m_totalDataRateMbps << "\n";
++        }
++    }
++
+     PacketDelayTracker* m_tracker;
+     UeEnergyTracker* m_ueTracker;
+-    ApplicationContainer m_apps;
++    GnbSlotEnergyTracker* m_gnbTracker;
++    RadioResourceController* m_radioController;
+     double m_totalDataRateMbps;
+     bool m_enableDciDynamic;
+     bool m_enableBwpDynamic;
++    bool m_enableRlIpc;
++    int m_ipcPort;
+     double m_evalIntervalSec;
+     double m_minActiveMs;
+     double m_maxActiveMs;
+@@ -233,27 +464,47 @@ private:
+     uint64_t m_backlogThresholdBytes;
+     uint64_t m_bdpThresholdBytes;
+     std::string m_timelineCsvName;
++    double m_warmupMs;
++    RlIpcClient* m_ipcClient;
+ };
+ 
+-// ----------------------------------------------------------------------------------
+-// 4. 基地台功耗追蹤器 (gNB Energy Tracker)
+-// ----------------------------------------------------------------------------------
+ class GnbSlotEnergyTracker
+ {
+ public:
+-    GnbSlotEnergyTracker(double slotDurationMs, double p0Active, double pMicroSleep, double pTxMax, double deltaP)
++    GnbSlotEnergyTracker(double slotDurationMs,
++                         double p0Active,
++                         double pMicroSleep,
++                         double pTxMax,
++                         double deltaP,
++                         double narrowCapacityMbps,
++                         double wideCapacityMbps,
++                         double wideActivePowerOverheadW,
++                         double wideSleepPowerOverheadW,
++                         BwpState initialBwp)
+         : m_slotDurationSec(slotDurationMs / 1000.0),
+           m_p0Active(p0Active),
+           m_pMicroSleep(pMicroSleep),
+           m_pTxMax(pTxMax),
+           m_deltaP(deltaP),
++          m_narrowCapacityMbps(narrowCapacityMbps),
++          m_wideCapacityMbps(wideCapacityMbps),
++          m_wideActivePowerOverheadW(wideActivePowerOverheadW),
++          m_wideSleepPowerOverheadW(wideSleepPowerOverheadW),
++          m_currentBwp(initialBwp),
+           m_totalEnergyJoules(0.0),
++          m_windowEnergyJoules(0.0),
+           m_activeSlots(0),
+           m_sleepSlots(0),
++          m_windowSlots(0),
+           m_lastTotalRxBytes(0)
+     {}
+ 
+-    void TrackSlot(Ptr<FlowMonitor> monitor, double maxCapacityMbps)
++    void UpdateBwpState(BwpState newBwp)
++    {
++        m_currentBwp = newBwp;
++    }
++
++    void TrackSlot(Ptr<FlowMonitor> monitor)
+     {
+         uint64_t currentRxBytes = 0;
+         FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
+@@ -270,20 +521,42 @@ public:
+         {
+             m_activeSlots++;
+             double slotThroughputMbps = (bytesInSlot * 8.0) / (m_slotDurationSec * 1e6);
++            double maxCapacityMbps = m_currentBwp == BWP_WIDE_100MHZ
++                                         ? m_wideCapacityMbps
++                                         : m_narrowCapacityMbps;
+             double slotLoad = std::min(1.0, slotThroughputMbps / maxCapacityMbps);
+-            slotPower = m_p0Active + (m_deltaP * m_pTxMax * slotLoad);
++            double bwpOverhead = m_currentBwp == BWP_WIDE_100MHZ
++                                     ? m_wideActivePowerOverheadW
++                                     : 0.0;
++            slotPower = m_p0Active + bwpOverhead + (m_deltaP * m_pTxMax * slotLoad);
+         }
+         else
+         {
+             m_sleepSlots++;
+-            slotPower = m_pMicroSleep;
++            double bwpOverhead = m_currentBwp == BWP_WIDE_100MHZ
++                                     ? m_wideSleepPowerOverheadW
++                                     : 0.0;
++            slotPower = m_pMicroSleep + bwpOverhead;
+         }
+ 
+         m_totalEnergyJoules += slotPower * m_slotDurationSec;
+-        Simulator::Schedule(Seconds(m_slotDurationSec), &GnbSlotEnergyTracker::TrackSlot, this, monitor, maxCapacityMbps);
++        m_windowEnergyJoules += slotPower * m_slotDurationSec;
++        m_windowSlots++;
++        Simulator::Schedule(Seconds(m_slotDurationSec), &GnbSlotEnergyTracker::TrackSlot, this, monitor);
+     }
+ 
+     double GetAvgPower() const { return (m_activeSlots + m_sleepSlots > 0) ? m_totalEnergyJoules / ((m_activeSlots + m_sleepSlots) * m_slotDurationSec) : 0.0; }
++    double GetWindowAvgPower() const
++    {
++        return m_windowSlots > 0
++                   ? m_windowEnergyJoules / (m_windowSlots * m_slotDurationSec)
++                   : 0.0;
++    }
++    void ResetWindowStats()
++    {
++        m_windowEnergyJoules = 0.0;
++        m_windowSlots = 0;
++    }
+     double GetTotalEnergy() const { return m_totalEnergyJoules; }
+ 
+ private:
+@@ -292,20 +565,25 @@ private:
+     double m_pMicroSleep;
+     double m_pTxMax;
+     double m_deltaP;
++    double m_narrowCapacityMbps;
++    double m_wideCapacityMbps;
++    double m_wideActivePowerOverheadW;
++    double m_wideSleepPowerOverheadW;
++    BwpState m_currentBwp;
+     double m_totalEnergyJoules;
++    double m_windowEnergyJoules;
+     uint32_t m_activeSlots;
+     uint32_t m_sleepSlots;
++    uint32_t m_windowSlots;
+     uint64_t m_lastTotalRxBytes;
+ };
+ 
+-// ----------------------------------------------------------------------------------
+-// 5. UE 手機端功耗追蹤器 (支援 DCI 級別動態時域對齊 ＋ 3GPP BWP 2D 頻域動態切換)
+-// ----------------------------------------------------------------------------------
+ class UeEnergyTracker
+ {
+ public:
+     UeEnergyTracker(uint32_t numUes, double slotDurationMs, bool enableCdrx, bool enableDciDynamic = false,
+-                    bool enableBwpDynamic = false, double phaseOffsetMs = 0.0, double cdrxOnDurationMs = 10.0,
++                    bool enableBwpDynamic = false, BwpState initialBwp = BWP_NARROW_20MHZ,
++                    double phaseOffsetMs = 0.0, double cdrxOnDurationMs = 10.0,
+                     double pDeepSleepMw = 1.5)
+         : m_numUes(numUes),
+           m_slotDurationSec(slotDurationMs / 1000.0),
+@@ -315,10 +593,11 @@ public:
+           m_phaseOffsetMs(phaseOffsetMs),
+           m_cdrxOnDurationMs(cdrxOnDurationMs),
+           m_dynamicOnDurationMs(cdrxOnDurationMs),
+-          m_currentBwp(BWP_NARROW_20MHZ),
++          m_currentBwp(initialBwp),
+           m_pDeepSleepMw(pDeepSleepMw),
+           m_totalEnergyJoules(0.0),
+-          m_switchingDelayRemainingMs(0.0),
++          m_windowEnergyJoules(0.0),
++          m_windowSlots(0),
+           m_lastRxBytesPerUe(numUes, 0)
+     {
+         m_ueEnergyJoules.resize(numUes, 0.0);
+@@ -337,8 +616,6 @@ public:
+         if (m_enableBwpDynamic && m_currentBwp != newBwp)
+         {
+             m_currentBwp = newBwp;
+-            // 3GPP TS 38.133 BWP Switching Delay Penalty (1.0 ms Interruption Gap)
+-            m_switchingDelayRemainingMs = 1.0;
+         }
+     }
+ 
+@@ -356,24 +633,13 @@ public:
+ 
+         double nowSec = Simulator::Now().GetSeconds();
+         double dtxPeriodSec = 0.040;
+-
+         double effectiveOnDurationMs = m_enableDciDynamic ? m_dynamicOnDurationMs : m_cdrxOnDurationMs;
+ 
+         double ueCdrxCycleTimeSec = std::fmod(nowSec - (m_phaseOffsetMs / 1000.0), dtxPeriodSec);
+         if (ueCdrxCycleTimeSec < 0) ueCdrxCycleTimeSec += dtxPeriodSec;
+ 
+         bool inUeOnDuration = (ueCdrxCycleTimeSec <= (effectiveOnDurationMs / 1000.0));
+-
+-        // 處理 BWP 切換中斷延遲懲罰
+-        if (m_switchingDelayRemainingMs > 0.0)
+-        {
+-            m_switchingDelayRemainingMs -= (m_slotDurationSec * 1000.0);
+-            if (m_switchingDelayRemainingMs < 0.0) m_switchingDelayRemainingMs = 0.0;
+-        }
+-
+-        // 取得當前 Active BWP 之 3GPP 實體層功耗 (20MHz vs 100MHz)
+-        double currentRxPowerMw = m_enableBwpDynamic ? g_bwpPowerProfiles[m_currentBwp].pRxMw : g_bwpPowerProfiles[BWP_WIDE_100MHZ].pRxMw;
+-        double currentMicroSleepPowerMw = m_enableBwpDynamic ? g_bwpPowerProfiles[m_currentBwp].pMicroSleepMw : g_bwpPowerProfiles[BWP_WIDE_100MHZ].pMicroSleepMw;
++        BwpPowerProfile bwpProfile = g_bwpPowerProfiles[m_currentBwp];
+ 
+         for (uint32_t i = 0; i < m_numUes; ++i)
+         {
+@@ -381,19 +647,19 @@ public:
+             m_lastRxBytesPerUe[i] = currentRxBytes[i];
+ 
+             double uePowerMw = 0.0;
+-            if (bytesInSlot > 0 && m_switchingDelayRemainingMs <= 0.0)
++            if (bytesInSlot > 0)
+             {
+-                uePowerMw = currentRxPowerMw;
++                uePowerMw = bwpProfile.pRxMw;
+             }
+             else if (!m_enableCdrx)
+             {
+-                uePowerMw = currentMicroSleepPowerMw;
++                uePowerMw = bwpProfile.pMicroSleepMw;
+             }
+             else
+             {
+                 if (inUeOnDuration)
+                 {
+-                    uePowerMw = currentMicroSleepPowerMw;
++                    uePowerMw = bwpProfile.pMicroSleepMw;
+                 }
+                 else
+                 {
+@@ -404,7 +670,9 @@ public:
+             double energyJoules = (uePowerMw / 1000.0) * m_slotDurationSec;
+             m_ueEnergyJoules[i] += energyJoules;
+             m_totalEnergyJoules += energyJoules;
++            m_windowEnergyJoules += energyJoules;
+         }
++        m_windowSlots++;
+ 
+         Simulator::Schedule(Seconds(m_slotDurationSec), &UeEnergyTracker::TrackSlot, this, monitor, controller);
+     }
+@@ -418,6 +686,19 @@ public:
+ 
+     double GetTotalEnergyJoules() const { return m_totalEnergyJoules; }
+ 
++    double GetWindowAvgPowerMwPerUe() const
++    {
++        if (m_windowSlots == 0 || m_numUes == 0) return 0.0;
++        double windowDurationSec = m_windowSlots * m_slotDurationSec;
++        return (m_windowEnergyJoules / windowDurationSec / m_numUes) * 1000.0;
++    }
++
++    void ResetWindowStats()
++    {
++        m_windowEnergyJoules = 0.0;
++        m_windowSlots = 0;
++    }
++
+     double GetUeEnergyJoules(uint32_t ueIdx) const
+     {
+         if (ueIdx < m_ueEnergyJoules.size()) return m_ueEnergyJoules[ueIdx];
+@@ -441,16 +722,34 @@ private:
+     BwpState m_currentBwp;
+     double m_pDeepSleepMw;
+     double m_totalEnergyJoules;
+-    double m_switchingDelayRemainingMs;
++    double m_windowEnergyJoules;
++    uint32_t m_windowSlots;
+     std::vector<uint64_t> m_lastRxBytesPerUe;
+     std::vector<double> m_ueEnergyJoules;
+ };
+ 
+-// DynamicDtxController 函數成員實作 (包含時域 On-Duration ＋ 頻域 BWP 2D 雙重動態調適)
++void DynamicDtxController::BeginControl()
++{
++    if (m_tracker) m_tracker->ResetWindowStats();
++    if (m_gnbTracker) m_gnbTracker->ResetWindowStats();
++    if (m_ueTracker) m_ueTracker->ResetWindowStats();
++
++    if (m_enableRlIpc)
++    {
++        EvaluateAndAdjustRlIpc();
++    }
++    else
++    {
++        EvaluateAndAdjust();
++    }
++}
++
+ void DynamicDtxController::EvaluateAndAdjust()
+ {
+     uint64_t totalPending = m_tracker ? m_tracker->GetPendingBytes() : 0;
+-    uint64_t rlcBacklogBytes = (totalPending > m_bdpThresholdBytes) ? (totalPending - m_bdpThresholdBytes) : 0;
++    uint64_t rlcBacklogBytes = m_radioController
++                                   ? m_radioController->GetDlRlcBacklogBytes()
++                                   : 0;
+ 
+     double oldActiveMs = m_currentActiveMs;
+     BwpState oldBwp = m_currentBwp;
+@@ -472,7 +771,6 @@ void DynamicDtxController::EvaluateAndAdjust()
+             m_currentActiveMs = std::max(m_minActiveMs, m_currentActiveMs - m_stepDownMs);
+         }
+ 
+-        // 🛠️ 2D 頻域動態：佇列積壓時，即時升頻至 100 MHz 寬頻 BWP 全力衝刺，並重設 Inactivity Timer
+         if (m_enableBwpDynamic)
+         {
+             m_currentBwp = BWP_WIDE_100MHZ;
+@@ -483,7 +781,6 @@ void DynamicDtxController::EvaluateAndAdjust()
+     {
+         m_currentActiveMs = std::max(m_minActiveMs, m_currentActiveMs - m_stepDownMs);
+ 
+-        // 🛠️ 2D 頻域動態：佇列清空時，倒數 Inactivity Timer，歸零後切回 20 MHz 窄頻 BWP 極致省電
+         if (m_enableBwpDynamic)
+         {
+             if (m_bwpInactivityTimerMs <= 0.0)
+@@ -497,44 +794,113 @@ void DynamicDtxController::EvaluateAndAdjust()
+         }
+     }
+ 
+-    // 觸發時域與頻域之屬性同步更新
+     if (std::abs(m_currentActiveMs - oldActiveMs) > 1e-3 || m_currentBwp != oldBwp)
+     {
+-        for (uint32_t i = 0; i < m_apps.GetN(); ++i)
++        if (m_radioController)
+         {
+-            Ptr<Application> app = m_apps.Get(i);
+-            app->SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=" + std::to_string(m_currentActiveMs / 1000.0) + "]"));
+-            app->SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=" + std::to_string((m_cellDtxPeriodMs - m_currentActiveMs) / 1000.0) + "]"));
++            m_radioController->UpdateState(m_currentActiveMs, m_currentBwp);
+         }
+ 
+-        // 🛠️ 觸發 DCI format 2_6 廣播，將動態 Active Window 與 BWP 狀態同步至 UE
+-        if (m_enableDciDynamic && m_tracker)
++        if (m_enableDciDynamic)
+         {
+-            m_tracker->UpdateDynamicOnDurationMs(m_currentActiveMs);
++            if (m_ueTracker) m_ueTracker->UpdateDynamicOnDurationMs(m_currentActiveMs);
+         }
+-
+-        if (m_ueTracker)
++        if (m_enableBwpDynamic && m_ueTracker)
+         {
+-            if (m_enableDciDynamic) m_ueTracker->UpdateDynamicOnDurationMs(m_currentActiveMs);
+-            if (m_enableBwpDynamic) m_ueTracker->UpdateBwpState(m_currentBwp);
++            m_ueTracker->UpdateBwpState(m_currentBwp);
+         }
++        if (m_enableBwpDynamic && m_gnbTracker)
++        {
++            m_gnbTracker->UpdateBwpState(m_currentBwp);
++        }
++    }
++
++    AppendTimeline(totalPending, rlcBacklogBytes);
++    if (m_tracker) m_tracker->ResetWindowStats();
++    if (m_gnbTracker) m_gnbTracker->ResetWindowStats();
++    if (m_ueTracker) m_ueTracker->ResetWindowStats();
++
++    Simulator::Schedule(Seconds(m_evalIntervalSec), &DynamicDtxController::EvaluateAndAdjust, this);
++}
+ 
+-        NS_LOG_INFO("[Closed-Loop DTX + DCI + BWP 2D] Active Window: " << m_currentActiveMs << " ms, BWP: " << (m_currentBwp == BWP_WIDE_100MHZ ? "100MHz" : "20MHz"));
++void DynamicDtxController::EvaluateAndAdjustRlIpc()
++{
++    if (!m_ipcClient) return;
++
++    uint64_t totalPending = m_tracker ? m_tracker->GetPendingBytes() : 0;
++    NrMacSchedulerNs3::DlObservationStats dlStats;
++    if (m_radioController)
++    {
++        dlStats = m_radioController->GetDlObservationStats();
++    }
++    uint64_t rlcBacklogBytes = dlStats.totalBufferBytes;
++    double offeredRateMbps = m_tracker
++                                 ? m_tracker->GetWindowOfferedRateMbps(m_evalIntervalSec)
++                                 : 0.0;
++    double deliveredRateMbps = m_tracker
++                                   ? m_tracker->GetWindowDeliveredRateMbps(m_evalIntervalSec)
++                                   : 0.0;
++    double p99DelayMs = m_tracker ? m_tracker->GetWindowP99Latency() : 0.0;
++    double gnbPowerW = m_gnbTracker ? m_gnbTracker->GetWindowAvgPower() : 24.5;
++    double uePowerMw = m_ueTracker ? m_ueTracker->GetWindowAvgPowerMwPerUe() : 55.0;
++    double jainFairness = 0.74;
++
++    if (m_tracker) m_tracker->ResetWindowStats();
++    if (m_gnbTracker) m_gnbTracker->ResetWindowStats();
++    if (m_ueTracker) m_ueTracker->ResetWindowStats();
++
++    int actionIdx = m_ipcClient->StepIpc((double)rlcBacklogBytes,
++                                         (double)dlStats.maxUeBufferBytes,
++                                         offeredRateMbps,
++                                         deliveredRateMbps,
++                                         p99DelayMs,
++                                         dlStats.meanCqi,
++                                         dlStats.p10Cqi,
++                                         dlStats.minCqi,
++                                         dlStats.meanMcs,
++                                         m_currentActiveMs,
++                                         (int)m_currentBwp,
++                                         gnbPowerW,
++                                         uePowerMw,
++                                         jainFairness);
++
++    if (actionIdx < 0 || actionIdx >= 10)
++    {
++        Simulator::Stop();
++        return;
+     }
+ 
+-    std::ofstream csv(m_timelineCsvName, std::ios::app);
+-    if (csv.is_open())
++    if (actionIdx >= 0)
+     {
+-        csv << Simulator::Now().GetSeconds() << ","
+-            << m_currentActiveMs << ","
+-            << (m_currentBwp == BWP_WIDE_100MHZ ? 100 : 20) << ","
+-            << totalPending << ","
+-            << rlcBacklogBytes << ","
+-            << m_totalDataRateMbps << "\n";
+-        csv.close();
++        double deltaWOptions[] = {-4.0, -2.0, 0.0, 2.0, 4.0};
++        double deltaW = deltaWOptions[actionIdx % 5];
++        BwpState nextBwp = (actionIdx / 5 == 1) ? BWP_WIDE_100MHZ : BWP_NARROW_20MHZ;
++
++        m_currentActiveMs = std::max(m_minActiveMs, std::min(m_maxActiveMs, m_currentActiveMs + deltaW));
++        m_currentBwp = nextBwp;
++
++        if (m_radioController)
++        {
++            m_radioController->UpdateState(m_currentActiveMs, m_currentBwp);
++        }
++
++        if (m_enableDciDynamic)
++        {
++            if (m_ueTracker) m_ueTracker->UpdateDynamicOnDurationMs(m_currentActiveMs);
++        }
++        if (m_enableBwpDynamic && m_ueTracker)
++        {
++            m_ueTracker->UpdateBwpState(m_currentBwp);
++        }
++        if (m_enableBwpDynamic && m_gnbTracker)
++        {
++            m_gnbTracker->UpdateBwpState(m_currentBwp);
++        }
+     }
+ 
+-    Simulator::Schedule(Seconds(m_evalIntervalSec), &DynamicDtxController::EvaluateAndAdjust, this);
++    AppendTimeline(totalPending, rlcBacklogBytes);
++
++    Simulator::Schedule(Seconds(m_evalIntervalSec), &DynamicDtxController::EvaluateAndAdjustRlIpc, this);
+ }
+ 
+ void ExportStatsToCsv(const std::string &filename, double simTime, bool enableGating, bool enableQueueAware,
+@@ -588,40 +954,121 @@ void ExportStatsToCsv(const std::string &filename, double simTime, bool enableGa
+ 
+ int main(int argc, char *argv[])
+ {
+-    uint32_t numUes = 3;
+-    double simTime = 5.0;
++    uint32_t numUes = 10;
++    uint32_t numerology = 1;
++    double simTime = 10.0;
+     double udpPacketRateMbps = 2.0;
++    bool enableBurstTraffic = false;
++    bool synchronizeBurstTraffic = false;
++    double udpBurstRateMbps = 3.0;
++    double burstMeanOnMs = 80.0;
++    double burstMeanOffMs = 120.0;
++    double gnbTxPowerDbm = 30.0;
++    double gnbP0ActiveW = 150.0;
++    double gnbPMicroSleepW = 15.0;
++    double gnbPTxMaxW = 40.0;
++    double gnbDeltaP = 4.7;
++    double gnbNarrowCapacityMbps = 100.0;
++    double gnbWideCapacityMbps = 100.0;
++    double gnbWideActivePowerOverheadW = 0.0;
++    double gnbWideSleepPowerOverheadW = 0.0;
+     bool enableGating = true;
+     bool enableQueueAware = false;
+     bool enableCdrx = false;
+     bool enableDciDynamic = false;
+     bool enableBwpDynamic = false;
++    uint32_t fixedBwpMHz = 100;
++    bool enableRlIpc = false;
++    int ipcPort = 5555;
+     double phaseOffsetMs = 0.0;
+     uint32_t cdrxOnDurationMs = 10;
+     uint32_t cdrxInactivityMs = 10;
+     double cellDtxPeriodMs = 40.0;
+     double cellDtxActiveMs = 10.0;
+     double qosTargetDelayMs = 20.0;
++    double controllerEvalIntervalMs = 40.0;
++    double controllerWarmupMs = 200.0;
++    double controllerMinActiveMs = 10.0;
++    double controllerMaxActiveMs = 30.0;
++    double controllerInitialActiveMs = 30.0;
++    double controllerStepUpMs = 4.0;
++    double controllerStepDownMs = 2.0;
++    uint64_t controllerBacklogThresholdBytes = 2000;
++    uint32_t rngSeed = 42;
++    uint64_t rngRun = 1;
+     std::string csvFileName = "joint_energy_results.csv";
++    std::string timelineCsvName = "active_window_timeline.csv";
+ 
+     CommandLine cmd(__FILE__);
+     cmd.AddValue("numUes", "Number of UEs", numUes);
++    cmd.AddValue("numerology", "NR numerology (1 gives 30 kHz SCS)", numerology);
+     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
+-    cmd.AddValue("udpDataRate", "UDP Downlink Data Rate in Mbps per UE", udpPacketRateMbps);
++    cmd.AddValue("udpDataRate", "Constant/base UDP downlink rate in Mbps per UE", udpPacketRateMbps);
++    cmd.AddValue("enableBurstTraffic", "Add an independent On/Off burst source for every UE", enableBurstTraffic);
++    cmd.AddValue("synchronizeBurstTraffic", "Use a shared deterministic On/Off burst regime across UEs", synchronizeBurstTraffic);
++    cmd.AddValue("udpBurstRate", "Additional UDP burst rate in Mbps per UE", udpBurstRateMbps);
++    cmd.AddValue("burstMeanOnMs", "Mean burst On duration in ms", burstMeanOnMs);
++    cmd.AddValue("burstMeanOffMs", "Mean burst Off duration in ms", burstMeanOffMs);
++    cmd.AddValue("gnbTxPowerDbm", "gNB downlink transmission power in dBm", gnbTxPowerDbm);
++    cmd.AddValue("gnbP0ActiveW", "gNB active baseline power in watts", gnbP0ActiveW);
++    cmd.AddValue("gnbPMicroSleepW", "gNB micro-sleep power in watts", gnbPMicroSleepW);
++    cmd.AddValue("gnbPTxMaxW", "gNB maximum RF transmit-power term in watts", gnbPTxMaxW);
++    cmd.AddValue("gnbDeltaP", "gNB load-dependent power slope", gnbDeltaP);
++    cmd.AddValue("gnbNarrowCapacityMbps", "Energy-model reference capacity for 20 MHz BWP", gnbNarrowCapacityMbps);
++    cmd.AddValue("gnbWideCapacityMbps", "Energy-model reference capacity for 100 MHz BWP", gnbWideCapacityMbps);
++    cmd.AddValue("gnbWideActivePowerOverheadW", "Additional active power for 100 MHz BWP", gnbWideActivePowerOverheadW);
++    cmd.AddValue("gnbWideSleepPowerOverheadW", "Additional sleep power for 100 MHz BWP", gnbWideSleepPowerOverheadW);
+     cmd.AddValue("enableGating", "Enable Cell-DTX Scheduler Gating", enableGating);
+     cmd.AddValue("enableQueueAware", "Enable Closed-Loop Dynamic Controller", enableQueueAware);
+     cmd.AddValue("enableCdrx", "Enable UE C-DRX Energy Saving Mode", enableCdrx);
+     cmd.AddValue("enableDciDynamic", "Enable 3GPP DCI-Level Dynamic Alignment", enableDciDynamic);
+     cmd.AddValue("enableBwpDynamic", "Enable DCI-based Dynamic BWP Switching (20MHz <-> 100MHz)", enableBwpDynamic);
++    cmd.AddValue("fixedBwpMHz", "Fixed BWP bandwidth (20 or 100) when dynamic BWP is disabled", fixedBwpMHz);
++    cmd.AddValue("enableRlIpc", "Enable Socket IPC for Reinforcement Learning Co-Simulation", enableRlIpc);
++    cmd.AddValue("ipcPort", "Socket IPC Server Port", ipcPort);
+     cmd.AddValue("phaseOffsetMs", "Phase Offset between gNB and UE C-DRX in ms", phaseOffsetMs);
+     cmd.AddValue("cdrxOnDurationMs", "C-DRX OnDuration Timer in ms", cdrxOnDurationMs);
+     cmd.AddValue("cdrxInactivityMs", "C-DRX Inactivity Timer in ms", cdrxInactivityMs);
+     cmd.AddValue("cellDtxPeriodMs", "Cell-DTX Period in ms", cellDtxPeriodMs);
+     cmd.AddValue("cellDtxActiveMs", "Cell-DTX Active Duration in ms", cellDtxActiveMs);
+     cmd.AddValue("qosTargetDelayMs", "QoS Target Delay Bound in ms", qosTargetDelayMs);
++    cmd.AddValue("controllerEvalIntervalMs", "Rule/DRL controller evaluation interval in ms", controllerEvalIntervalMs);
++    cmd.AddValue("controllerWarmupMs", "Warm-up time before the first controller state in ms", controllerWarmupMs);
++    cmd.AddValue("controllerMinActiveMs", "Minimum controller active window in ms", controllerMinActiveMs);
++    cmd.AddValue("controllerMaxActiveMs", "Maximum controller active window in ms", controllerMaxActiveMs);
++    cmd.AddValue("controllerInitialActiveMs", "Controller active window at episode start in ms", controllerInitialActiveMs);
++    cmd.AddValue("controllerStepUpMs", "Rule-Based active-window increase per decision in ms", controllerStepUpMs);
++    cmd.AddValue("controllerStepDownMs", "Rule-Based active-window decrease per decision in ms", controllerStepDownMs);
++    cmd.AddValue("controllerBacklogThresholdBytes", "Rule-Based RLC backlog threshold in bytes", controllerBacklogThresholdBytes);
++    cmd.AddValue("rngSeed", "ns-3 random-number generator seed", rngSeed);
++    cmd.AddValue("rngRun", "ns-3 independent random-number generator run", rngRun);
+     cmd.AddValue("csvFileName", "Output CSV file name", csvFileName);
++    cmd.AddValue("timelineCsvName", "Controller timeline CSV file name", timelineCsvName);
+     cmd.Parse(argc, argv);
+ 
++    NS_ABORT_MSG_IF(fixedBwpMHz != 20 && fixedBwpMHz != 100,
++                    "fixedBwpMHz must be either 20 or 100");
++    NS_ABORT_MSG_IF(udpPacketRateMbps <= 0.0, "udpDataRate must be greater than zero");
++    NS_ABORT_MSG_IF(enableBurstTraffic && udpBurstRateMbps <= 0.0,
++                    "udpBurstRate must be greater than zero when burst traffic is enabled");
++    NS_ABORT_MSG_IF(enableBurstTraffic &&
++                        (burstMeanOnMs <= 0.0 || burstMeanOffMs <= 0.0),
++                    "burst On/Off means must be greater than zero");
++    NS_ABORT_MSG_IF(controllerInitialActiveMs < controllerMinActiveMs ||
++                        controllerInitialActiveMs > controllerMaxActiveMs,
++                    "controllerInitialActiveMs must be inside the controller min/max range");
++    NS_ABORT_MSG_IF(gnbP0ActiveW < 0.0 || gnbPMicroSleepW < 0.0 ||
++                        gnbPTxMaxW < 0.0 || gnbDeltaP < 0.0,
++                    "gNB power-model parameters cannot be negative");
++    NS_ABORT_MSG_IF(gnbNarrowCapacityMbps <= 0.0 || gnbWideCapacityMbps <= 0.0,
++                    "gNB energy-model capacities must be greater than zero");
++    NS_ABORT_MSG_IF(gnbWideActivePowerOverheadW < 0.0 ||
++                        gnbWideSleepPowerOverheadW < 0.0,
++                    "gNB wide-BWP power overheads cannot be negative");
++
++    RngSeedManager::SetSeed(rngSeed);
++    RngSeedManager::SetRun(rngRun);
++
+     Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
+     Ptr<NrHelper> nrHelper = CreateObject<NrHelper>();
+     nrHelper->SetEpcHelper(epcHelper);
+@@ -640,9 +1087,11 @@ int main(int argc, char *argv[])
+     mobility.Install(gnbNodes);
+ 
+     Ptr<ListPositionAllocator> uePositionAlloc = CreateObject<ListPositionAllocator>();
+-    uePositionAlloc->Add(Vector(30.0, 0.0, 1.5));
+-    uePositionAlloc->Add(Vector(60.0, 0.0, 1.5));
+-    uePositionAlloc->Add(Vector(150.0, 0.0, 1.5));
++    for (uint32_t i = 0; i < numUes; ++i)
++    {
++        double dist = 30.0 + (i * 12.0);
++        uePositionAlloc->Add(Vector(dist, 0.0, 1.5));
++    }
+     mobility.SetPositionAllocator(uePositionAlloc);
+     mobility.Install(ueNodes);
+ 
+@@ -664,6 +1113,18 @@ int main(int argc, char *argv[])
+     NetDeviceContainer gnbNetDev = nrHelper->InstallGnbDevice(gnbNodes, allBwps);
+     NetDeviceContainer ueNetDev = nrHelper->InstallUeDevice(ueNodes, allBwps);
+ 
++    Ptr<NrMacSchedulerNs3> scheduler =
++        DynamicCast<NrMacSchedulerNs3>(NrHelper::GetScheduler(gnbNetDev.Get(0), 0));
++    Ptr<NrGnbPhy> gnbPhy = NrHelper::GetGnbPhy(gnbNetDev.Get(0), 0);
++    NS_ABORT_MSG_IF(!scheduler || !gnbPhy, "Unable to access the gNB scheduler or PHY");
++    gnbPhy->SetAttribute("Numerology", UintegerValue(numerology));
++    gnbPhy->SetAttribute("TxPower", DoubleValue(gnbTxPowerDbm));
++    RadioResourceController radioController(scheduler,
++                                            gnbPhy,
++                                            cellDtxPeriodMs,
++                                            enableGating,
++                                            enableBwpDynamic);
++
+     Ptr<Node> pgw = epcHelper->GetPgwNode();
+     NodeContainer remoteHostContainer;
+     remoteHostContainer.Create(1);
+@@ -679,7 +1140,7 @@ int main(int argc, char *argv[])
+     p2ph.SetChannelAttribute("Delay", TimeValue(Seconds(0.010)));
+     NetDeviceContainer internetDevices = p2ph.Install(pgw, remoteHost);
+ 
+-    PacketDelayTracker delayTracker(enableCdrx, enableDciDynamic, phaseOffsetMs, cdrxOnDurationMs, cellDtxPeriodMs);
++    PacketDelayTracker delayTracker;
+     Ptr<Ipv4L3Protocol> remoteHostIpv4 = remoteHost->GetObject<Ipv4L3Protocol>();
+     if (remoteHostIpv4)
+     {
+@@ -722,38 +1183,108 @@ int main(int argc, char *argv[])
+             udpServer->TraceConnectWithoutContext("RxWithAddresses", MakeCallback(&PacketDelayTracker::RecordRx, &delayTracker));
+         }
+ 
+-        OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(ueIpIface.GetAddress(i), port + i));
+-        onoff.SetAttribute("PacketSize", UintegerValue(1024));
+-        onoff.SetAttribute("DataRate", DataRateValue(DataRate(std::to_string(udpPacketRateMbps) + "Mbps")));
+-
+-        if (enableGating)
++        const InetSocketAddress destination(ueIpIface.GetAddress(i), port + i);
++        OnOffHelper baseTraffic("ns3::UdpSocketFactory", destination);
++        baseTraffic.SetAttribute("PacketSize", UintegerValue(1024));
++        baseTraffic.SetAttribute(
++            "DataRate",
++            DataRateValue(DataRate(std::to_string(udpPacketRateMbps) + "Mbps")));
++        baseTraffic.SetAttribute(
++            "OnTime",
++            StringValue("ns3::ConstantRandomVariable[Constant=100.0]"));
++        baseTraffic.SetAttribute(
++            "OffTime",
++            StringValue("ns3::ConstantRandomVariable[Constant=0.0]"));
++        clientApps.Add(baseTraffic.Install(remoteHost));
++
++        if (enableBurstTraffic)
+         {
+-            onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=" + std::to_string(cellDtxActiveMs / 1000.0) + "]"));
+-            onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=" + std::to_string((cellDtxPeriodMs - cellDtxActiveMs) / 1000.0) + "]"));
+-        }
+-        else
+-        {
+-            onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=100.0]"));
+-            onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0.0]"));
++            OnOffHelper burstTraffic("ns3::UdpSocketFactory", destination);
++            burstTraffic.SetAttribute("PacketSize", UintegerValue(1024));
++            burstTraffic.SetAttribute(
++                "DataRate",
++                DataRateValue(DataRate(std::to_string(udpBurstRateMbps) + "Mbps")));
++            if (synchronizeBurstTraffic)
++            {
++                burstTraffic.SetAttribute(
++                    "OnTime",
++                    StringValue("ns3::ConstantRandomVariable[Constant=" +
++                                std::to_string(burstMeanOnMs / 1000.0) + "]"));
++                burstTraffic.SetAttribute(
++                    "OffTime",
++                    StringValue("ns3::ConstantRandomVariable[Constant=" +
++                                std::to_string(burstMeanOffMs / 1000.0) + "]"));
++            }
++            else
++            {
++                burstTraffic.SetAttribute(
++                    "OnTime",
++                    StringValue("ns3::ExponentialRandomVariable[Mean=" +
++                                std::to_string(burstMeanOnMs / 1000.0) + "]"));
++                burstTraffic.SetAttribute(
++                    "OffTime",
++                    StringValue("ns3::ExponentialRandomVariable[Mean=" +
++                                std::to_string(burstMeanOffMs / 1000.0) + "]"));
++            }
++            clientApps.Add(burstTraffic.Install(remoteHost));
+         }
+-
+-        clientApps.Add(onoff.Install(remoteHost));
+     }
+ 
+     serverApps.Start(Seconds(0.01));
+-    clientApps.Start(Seconds(0.05));
++    // Warm the channel and attachment state without creating packets that the
++    // controller could not influence. Traffic and control begin together.
++    const double trafficStartSec = std::max(0.02, controllerWarmupMs / 1000.0);
++    clientApps.Start(Seconds(trafficStartSec));
+ 
+     FlowMonitorHelper flowmonHelper;
+     Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
+ 
+-    GnbSlotEnergyTracker gnbSlotTracker(1.0, 150.0, 15.0, 40.0, 4.7);
+-    Simulator::Schedule(MilliSeconds(1), &GnbSlotEnergyTracker::TrackSlot, &gnbSlotTracker, monitor, 100.0);
+-
+-    UeEnergyTracker ueSlotTracker(numUes, 1.0, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, cdrxOnDurationMs, 1.5);
+-
+-    double totalTrafficRateMbps = udpPacketRateMbps * numUes;
+-    DynamicDtxController dynamicController(&delayTracker, &ueSlotTracker, clientApps, totalTrafficRateMbps, enableDciDynamic, enableBwpDynamic, 0.010, 40.0, 10.0, 30.0, 4.0, 2.0, 2000, "active_window_timeline.csv");
+-    if (enableGating && enableQueueAware)
++    BwpState initialBwp = enableBwpDynamic || fixedBwpMHz == 20
++                              ? BWP_NARROW_20MHZ
++                              : BWP_WIDE_100MHZ;
++    GnbSlotEnergyTracker gnbSlotTracker(1.0,
++                                       gnbP0ActiveW,
++                                       gnbPMicroSleepW,
++                                       gnbPTxMaxW,
++                                       gnbDeltaP,
++                                       gnbNarrowCapacityMbps,
++                                       gnbWideCapacityMbps,
++                                       gnbWideActivePowerOverheadW,
++                                       gnbWideSleepPowerOverheadW,
++                                       initialBwp);
++    Simulator::Schedule(MilliSeconds(1),
++                        &GnbSlotEnergyTracker::TrackSlot,
++                        &gnbSlotTracker,
++                        monitor);
++
++    UeEnergyTracker ueSlotTracker(numUes,
++                                  1.0,
++                                  enableCdrx,
++                                  enableDciDynamic,
++                                  enableBwpDynamic,
++                                  initialBwp,
++                                  phaseOffsetMs,
++                                  cdrxOnDurationMs,
++                                  1.5);
++
++    const double burstDutyCycle = enableBurstTraffic
++                                      ? burstMeanOnMs / (burstMeanOnMs + burstMeanOffMs)
++                                      : 0.0;
++    const double meanRatePerUeMbps =
++        udpPacketRateMbps + burstDutyCycle * udpBurstRateMbps;
++    double totalTrafficRateMbps = meanRatePerUeMbps * numUes;
++    DynamicDtxController dynamicController(&delayTracker, &ueSlotTracker, &gnbSlotTracker,
++                                           &radioController,
++                                           totalTrafficRateMbps, enableDciDynamic, enableBwpDynamic,
++                                           enableRlIpc, ipcPort, 0.010, controllerEvalIntervalMs,
++                                           controllerMinActiveMs, controllerMaxActiveMs,
++                                           controllerInitialActiveMs,
++                                           controllerStepUpMs, controllerStepDownMs,
++                                           controllerBacklogThresholdBytes, timelineCsvName,
++                                           controllerWarmupMs);
++    bool dynamicControlEnabled = enableGating && (enableQueueAware || enableRlIpc);
++    radioController.Start(cellDtxActiveMs, initialBwp);
++    if (dynamicControlEnabled)
+     {
+         dynamicController.Start();
+     }
+@@ -771,7 +1302,7 @@ int main(int argc, char *argv[])
+         totalRxBytes += iter->second.rxBytes;
+     }
+ 
+-    double finalActiveMs = enableQueueAware ? dynamicController.GetCurrentActiveMs() : cellDtxActiveMs;
++    double finalActiveMs = dynamicControlEnabled ? dynamicController.GetCurrentActiveMs() : cellDtxActiveMs;
+     double avgPower = gnbSlotTracker.GetAvgPower();
+     double totalEnergy = gnbSlotTracker.GetTotalEnergy();
+     double totalRxMbits = (totalRxBytes * 8.0) / 1e6;
+@@ -779,12 +1310,16 @@ int main(int argc, char *argv[])
+     double p99Latency = delayTracker.GetP99Latency();
+     double qosSatisfaction = delayTracker.GetQosSatisfactionRate(qosTargetDelayMs);
+ 
++    std::cout << "OfferedTxBytes=" << delayTracker.GetTotalTxBytes()
++              << ", PendingBytes=" << delayTracker.GetPendingBytes()
++              << ", AppRxBytes=" << delayTracker.GetTotalRxBytes() << std::endl;
++
+     double ueAvgPowerMw = ueSlotTracker.GetAvgPowerMwPerUe();
+     double ueTotalEnergy = ueSlotTracker.GetTotalEnergyJoules();
+     double ueBatteryMah = ueSlotTracker.GetBatteryConsumptionMah();
+     double ue3EnergyJoules = ueSlotTracker.GetUeEnergyJoules(2);
+ 
+-    ExportStatsToCsv(csvFileName, simTime, enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules);
++    ExportStatsToCsv(csvFileName, Simulator::Now().GetSeconds(), enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules);
+ 
+     Simulator::Destroy();
+     return 0;

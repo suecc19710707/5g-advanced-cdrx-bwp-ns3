@@ -1,0 +1,2 @@
+Episode,EpisodeReward,AvgP99LatencyMs,AvgGnbPowerW,AvgUePowerMw,AvgBacklogBytes,AvgMaxUeBacklogBytes,AvgOfferedRateMbps,AvgCqi,AvgP10Cqi,AvgMinCqi,AvgDlMcs,SlaViolationRate,Loss
+1,-3.5571690487308403,31.0665,104.41399999999999,51.158,51065.55,8463.1,23.09328,13.605,11.05,11.05,25.310000000000002,0.4,0.7764037847518921

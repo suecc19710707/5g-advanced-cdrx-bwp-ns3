@@ -1,0 +1,3 @@
+Method,ActualSimTimeSec,FinalActiveWindowMs,TotalRxMbits,AvgThroughputMbps,AvgGnbPowerW,TotalEnergyJ,EnergyEfficiencyMbitsPerJoule,GnbEnergyKwhPerTb,P99LatencyMs,QosSatisfactionRatePct,UeAvgPowerMw
+2D Rule-Based,10.0,30,129.569,12.9569,105.148,1051.38,0.123238,18.031956,92.2646,72.44,62.0485
+2D DRL Gamma=0.5,10.04,10,50.233,5.0033,53.3461,535.541,0.0937986,23.691422,45.7826,89.8237,12.9473

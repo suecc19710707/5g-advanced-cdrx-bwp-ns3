@@ -1,0 +1,4 @@
+Case,Numerology,ActiveWindowMs,BandwidthMode,OfferedTxBytes,AppRxBytes,PendingBytes,P99LatencyMs
+Gating10Narrow,1,10,Narrow51Prb,2526480,1374208,1153620,211.670
+Gating30Narrow,1,30,Narrow51Prb,2526480,2107392,598212,88.374
+Gating30Wide,1,30,WideFullCarrier,2526480,2285568,467712,128.775

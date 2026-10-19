@@ -1,0 +1,68 @@
+diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
+index 09099852..43f1a7a1 100644
+--- a/model/nr-mac-scheduler-ns3.cc
++++ b/model/nr-mac-scheduler-ns3.cc
+@@ -487,6 +487,18 @@ NrMacSchedulerNs3::IsHarqReTxEnable() const
+     return m_enableHarqReTx && m_maxHarqReTx > 0;
+ }
+ 
++void
++NrMacSchedulerNs3::SetDlDataSchedulingEnabled(bool enabled)
++{
++    m_dlDataSchedulingEnabled = enabled;
++}
++
++bool
++NrMacSchedulerNs3::IsDlDataSchedulingEnabled() const
++{
++    return m_dlDataSchedulingEnabled;
++}
++
+ void
+ NrMacSchedulerNs3::SetNrFhSchedSapProvider(NrFhSchedSapProvider* s)
+ {
+@@ -2634,7 +2646,7 @@ NrMacSchedulerNs3::DoScheduleDl(const std::vector<DlHarqInfo>& dlHarqFeedback,
+ 
+     NS_ASSERT(dlAssignationStartPoint.m_rbg == 0);
+ 
+-    if (dlSymAvail > 0 && !activeDlUe->empty())
++    if (m_dlDataSchedulingEnabled && dlSymAvail > 0 && !activeDlUe->empty())
+     {
+         uint8_t usedDl =
+             DoScheduleDlData(&dlAssignationStartPoint, dlSymAvail, *activeDlUe, allocInfo);
+diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
+index 1654877d..a5823ea5 100644
+--- a/model/nr-mac-scheduler-ns3.h
++++ b/model/nr-mac-scheduler-ns3.h
+@@ -560,6 +560,23 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+      */
+     bool IsHarqReTxEnable() const override;
+ 
++    /**
++     * @brief Enable or disable scheduling of new downlink data.
++     *
++     * HARQ retransmissions and control signaling remain enabled while new data
++     * scheduling is disabled. This allows a cell sleep controller to stop
++     * serving queued RLC data without changing the offered application load.
++     *
++     * @param enabled true to schedule new DL data; false to keep it queued
++     */
++    void SetDlDataSchedulingEnabled(bool enabled);
++
++    /**
++     * @brief Check whether new downlink data scheduling is enabled.
++     * @return true when new DL data may be scheduled
++     */
++    bool IsDlDataSchedulingEnabled() const;
++
+     /**
+      * @brief Sets the default RACH UL
+      * grant MCS
+@@ -1006,6 +1023,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+     int8_t m_maxDlMcs{0};        //!< Maximum index for DL MCS
+     Time m_cqiTimersThreshold;   //!< The time while a CQI is valid
+     bool m_enableHarqReTx{true}; //!< Whether HARQ retransmissions are enabled
++    bool m_dlDataSchedulingEnabled{true}; //!< Whether new DL data can be scheduled
+     uint8_t m_maxHarqReTx{3};    //!< Maximum number of HARQ retransmissions per TB
+ 
+     uint8_t m_rachUlGrantMcs{0}; //!< The MCS that will be used for UL RACH grant

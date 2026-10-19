@@ -1,0 +1,4 @@
+SimTime,EnableGating,EnableQueueAware,EnableCdrx,EnableDciDynamic,EnableBwpDynamic,PhaseOffsetMs,CellDtxPeriodMs,CellDtxActiveMs,UdpDataRateMbps,TotalRxBytes,TotalRxMbits,AvgPowerWatts,TotalEnergyJoules,EnergyEfficiency_MbitsPerJoule,P99LatencyMs,QosSatisfactionRatePct,UeAvgPowerMw,UeTotalEnergyJoules,UeBatteryMah,Ue3EnergyJoules
+2.2,1,0,1,1,1,0,40,30,1,10029696,80.2376,112.923,248.318,0.323125,21.7087,100,98.8703,2.17515,0.163299,0.218025
+2.2,1,0,1,1,1,0,40,30,1,10031800,80.2544,112.917,248.304,0.323211,21.6737,100,98.8796,2.17535,0.163315,0.218025
+2.2,1,0,1,1,1,0,40,30,1,10029696,80.2376,112.837,248.13,0.32337,21.6826,100,98.7492,2.17248,0.163099,0.218025
