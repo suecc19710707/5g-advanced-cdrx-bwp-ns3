@@ -1,0 +1,122 @@
+From fb0ca0378fd5d547ae06d12bc32135470e911d1c Mon Sep 17 00:00:00 2001
+From: suecc0707 <suecc0707@gmail.com>
+Date: Mon, 19 Oct 2026 13:51:26 +0800
+Subject: [PATCH] nr: expose controlled same-cell BWP switching
+
+---
+ model/nr-ue-rrc.cc | 37 +++++++++++++++++++++++++++++++++++++
+ model/nr-ue-rrc.h  | 15 +++++++++++++++
+ 2 files changed, 52 insertions(+)
+
+diff --git a/model/nr-ue-rrc.cc b/model/nr-ue-rrc.cc
+index 58e4047e..9acfb5d8 100644
+--- a/model/nr-ue-rrc.cc
++++ b/model/nr-ue-rrc.cc
+@@ -22,6 +22,7 @@
+ #include "nr-rlc.h"
+ 
+ #include "ns3/double.h"
++#include "ns3/boolean.h"
+ #include "ns3/fatal-error.h"
+ #include "ns3/log.h"
+ #include "ns3/object-factory.h"
+@@ -220,6 +221,12 @@ NrUeRrc::GetTypeId()
+                           DoubleValue(3.0),
+                           MakeDoubleAccessor(&NrUeRrc::m_bwpSwitchHysteresisDb),
+                           MakeDoubleChecker<double>(0.0))
++            .AddAttribute("EnableAutomaticBwpSwitch",
++                          "Enable the UE-local RSRP policy for same-cell primary-BWP switching. "
++                          "Disable it when an external controller owns BWP selection.",
++                          BooleanValue(true),
++                          MakeBooleanAccessor(&NrUeRrc::m_enableAutomaticBwpSwitch),
++                          MakeBooleanChecker())
+             .AddAttribute("Srb0",
+                           "SignalingRadioBearerInfo for SRB0",
+                           PointerValue(),
+@@ -737,6 +744,27 @@ NrUeRrc::GetPrimaryDlIndex() const
+     return m_primaryDlIndex;
+ }
+ 
++bool
++NrUeRrc::RequestPrimaryBwpSwitch(uint8_t targetBwpId)
++{
++    NS_LOG_FUNCTION(this << +targetBwpId);
++    const bool changed = GetPrimaryDlIndex() != targetBwpId;
++    if (!SwitchPrimaryBwpSameCell(targetBwpId))
++    {
++        return false;
++    }
++
++    const uint32_t targetArfcn = m_cphySapProvider.at(targetBwpId)->GetArfcn();
++    // BWP IDs, rather than ARFCNs, determine whether an indication is needed:
++    // nested 20/100 MHz BWPs may intentionally share the same centre ARFCN.
++    if (changed && m_rrcSapUser != nullptr)
++    {
++        m_rrcSapUser->SendIdealBwpSwitchIndication(m_rnti, targetBwpId);
++        m_reportedPrimaryArfcn = targetArfcn;
++    }
++    return true;
++}
++
+ void
+ NrUeRrc::SetCellIndividualOffset(uint16_t cellId, double offsetDb)
+ {
+@@ -2036,6 +2064,10 @@ NrUeRrc::SwitchPrimaryBwpSameCell(std::size_t targetBwpId)
+ void
+ NrUeRrc::EvaluateSameCellBwpSwitch()
+ {
++    if (!m_enableAutomaticBwpSwitch)
++    {
++        return;
++    }
+     // Only meaningful for a connected UE with a known serving cell that spans
+     // more than one carrier (otherwise there is nothing to switch between).
+     if (m_state != CONNECTED_NORMALLY || m_cellId == 0)
+@@ -4620,6 +4652,11 @@ NrUeRrc::ReconfigureFromSib1(const uint8_t bwpId,
+     NS_LOG_FUNCTION(this << "IMSI " << m_imsi << ", cellId " << m_cellId << ", primary UL "
+                          << GetPrimaryUlIndex() << ", primary DL " << GetPrimaryDlIndex());
+     NrDeviceRegistry::SetUeTargetCell(cellId, m_imsi);
++    // The helper is configuring this PHY from the serving cell's SIB1, so the
++    // (cell, carrier) relationship is already authoritative here.  Record it
++    // for the same-cell BWP guard instead of waiting for a later measurement
++    // report, which may arrive only after a controller requests a switch.
++    TrackCellArfcn(cellId, m_cphySapProvider.at(bwpId)->GetArfcn());
+     // A BWP can host the primary UL only if its pattern has UL-capable slots
+     m_bwpUlCapable[bwpId] = tddPattern.find('U') != std::string::npos ||
+                             tddPattern.find('F') != std::string::npos ||
+diff --git a/model/nr-ue-rrc.h b/model/nr-ue-rrc.h
+index 166e6dda..f693b7ce 100644
+--- a/model/nr-ue-rrc.h
++++ b/model/nr-ue-rrc.h
+@@ -354,6 +354,18 @@ class NR_EXPORT NrUeRrc : public Object
+      */
+     uint16_t GetPrimaryDlIndex() const;
+ 
++    /**
++     * @brief Request a controlled primary-BWP switch inside the serving cell.
++     *
++     * This public policy entry point uses the existing guarded same-cell
++     * switching mechanism and, on success, reports the selected BWP to the gNB
++     * so its per-UE downlink routing follows the UE.
++     *
++     * @param targetBwpId BWP index to make primary.
++     * @return true when already selected or successfully switched.
++     */
++    bool RequestPrimaryBwpSwitch(uint8_t targetBwpId);
++
+     /**
+      * @brief Install the callback used to update the BWP manager routing when
+      * the primary DL/UL BWP pair changes (e.g. on handover to a cell whose
+@@ -1744,6 +1756,9 @@ class NR_EXPORT NrUeRrc : public Object
+     /// serving BWP's RSRP by before the UE switches its primary BWP to it.
+     double m_bwpSwitchHysteresisDb{3.0};
+ 
++    /// Whether the UE-local RSRP policy may change the primary BWP.
++    bool m_enableAutomaticBwpSwitch{true};
++
+     /// True once the UE has reported its current primary BWP to the gNB; used
+     /// to avoid resending the same indication every measurement.
+     uint32_t m_reportedPrimaryArfcn{0};
+-- 
+2.43.0
+

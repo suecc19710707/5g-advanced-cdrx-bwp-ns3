@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
+#include <memory>
 
 using namespace ns3;
 
@@ -43,6 +44,20 @@ const BwpResourceProfile g_bwpResourceProfiles[] = {
     {51,  20.0},
     {273, 100.0}
 };
+
+static void
+SwitchAllUesToPrimaryBwp(NetDeviceContainer ueDevices, uint8_t targetBwpId)
+{
+    for (uint32_t i = 0; i < ueDevices.GetN(); ++i)
+    {
+        Ptr<NrUeNetDevice> ueDevice = DynamicCast<NrUeNetDevice>(ueDevices.Get(i));
+        NS_ABORT_MSG_IF(!ueDevice || !ueDevice->GetRrc(),
+                        "Unable to access UE RRC for physical BWP switch");
+        NS_ABORT_MSG_IF(!ueDevice->GetRrc()->RequestPrimaryBwpSwitch(targetBwpId),
+                        "UE " << i << " rejected primary BWP switch to "
+                              << +targetBwpId);
+    }
+}
 
 class RlIpcClient
 {
@@ -742,14 +757,23 @@ public:
         : m_gnbModels(gnbModels),
           m_ueModels(ueModels),
           m_ueNodes(ueNodes),
+          m_measurementStart(Seconds(0)),
+          m_gnbEnergyBaselineJ(0.0),
+          m_ueEnergyBaselineJ(0.0),
           m_windowStart(Seconds(0)),
           m_windowGnbEnergyJ(0.0),
           m_windowUeEnergyJ(0.0)
     {
+        m_ueEnergyBaselinesJ.assign(m_ueModels.GetN(), 0.0);
         ResetWindowStats();
     }
 
     double GetTotalGnbEnergyJ() const
+    {
+        return GetRawGnbEnergyJ() - m_gnbEnergyBaselineJ;
+    }
+
+    double GetRawGnbEnergyJ() const
     {
         double total = 0.0;
         for (uint32_t i = 0; i < m_gnbModels.GetN(); ++i)
@@ -761,6 +785,11 @@ public:
 
     double GetTotalUeEnergyJ() const
     {
+        return GetRawUeEnergyJ() - m_ueEnergyBaselineJ;
+    }
+
+    double GetRawUeEnergyJ() const
+    {
         double total = 0.0;
         for (uint32_t i = 0; i < m_ueModels.GetN(); ++i)
         {
@@ -771,13 +800,13 @@ public:
 
     double GetAvgGnbPowerW() const
     {
-        const double elapsed = Simulator::Now().GetSeconds();
+        const double elapsed = (Simulator::Now() - m_measurementStart).GetSeconds();
         return elapsed > 0.0 ? GetTotalGnbEnergyJ() / elapsed : 0.0;
     }
 
     double GetAvgUePowerMwPerUe() const
     {
-        const double elapsed = Simulator::Now().GetSeconds();
+        const double elapsed = (Simulator::Now() - m_measurementStart).GetSeconds();
         return elapsed > 0.0 && m_ueModels.GetN() > 0
                    ? GetTotalUeEnergyJ() / elapsed / m_ueModels.GetN() * 1000.0
                    : 0.0;
@@ -807,6 +836,19 @@ public:
         m_windowUeEnergyJ = GetTotalUeEnergyJ();
     }
 
+    void ResetMeasurementBaseline()
+    {
+        m_measurementStart = Simulator::Now();
+        m_gnbEnergyBaselineJ = GetRawGnbEnergyJ();
+        m_ueEnergyBaselineJ = GetRawUeEnergyJ();
+        for (uint32_t i = 0; i < m_ueModels.GetN(); ++i)
+        {
+            m_ueEnergyBaselinesJ[i] =
+                m_ueModels.Get(i)->GetTotalEnergyConsumption();
+        }
+        ResetWindowStats();
+    }
+
     void UpdateDynamicOnDurationMs(double onDurationMs)
     {
         for (uint32_t i = 0; i < m_ueNodes.GetN(); ++i)
@@ -822,7 +864,8 @@ public:
     double GetUeEnergyJ(uint32_t ueIndex) const
     {
         return ueIndex < m_ueModels.GetN()
-                   ? m_ueModels.Get(ueIndex)->GetTotalEnergyConsumption()
+                   ? m_ueModels.Get(ueIndex)->GetTotalEnergyConsumption() -
+                         m_ueEnergyBaselinesJ[ueIndex]
                    : 0.0;
     }
 
@@ -837,6 +880,10 @@ private:
     energy::DeviceEnergyModelContainer m_gnbModels;
     energy::DeviceEnergyModelContainer m_ueModels;
     NodeContainer m_ueNodes;
+    Time m_measurementStart;
+    double m_gnbEnergyBaselineJ;
+    double m_ueEnergyBaselineJ;
+    std::vector<double> m_ueEnergyBaselinesJ;
     Time m_windowStart;
     double m_windowGnbEnergyJ;
     double m_windowUeEnergyJ;
@@ -1070,6 +1117,7 @@ int main(int argc, char *argv[])
     bool enableCdrx = false;
     bool enableDciDynamic = false;
     bool enableBwpDynamic = false;
+    bool enableTrueBwp = false;
     uint32_t fixedBwpMHz = 100;
     bool enableRlIpc = false;
     int ipcPort = 5555;
@@ -1117,6 +1165,10 @@ int main(int argc, char *argv[])
                  "Legacy name: dynamically switch the schedulable PRB profile "
                  "(20/100 MHz-equivalent) on one physical 100 MHz BWP",
                  enableBwpDynamic);
+    cmd.AddValue("enableTrueBwp",
+                 "Experimental v6: create physical 20 and 100 MHz gNB/UE BWPs; "
+                 "fixed-mode validation only",
+                 enableTrueBwp);
     cmd.AddValue("fixedBwpMHz",
                  "Fixed schedulable PRB profile (20 or 100 MHz-equivalent); the PHY remains 100 MHz",
                  fixedBwpMHz);
@@ -1144,6 +1196,8 @@ int main(int argc, char *argv[])
 
     NS_ABORT_MSG_IF(fixedBwpMHz != 20 && fixedBwpMHz != 100,
                     "fixedBwpMHz must be either 20 or 100");
+    NS_ABORT_MSG_IF(enableTrueBwp && enableBwpDynamic,
+                    "v6 phase 1 validates fixed physical BWPs before enabling dynamic switching");
     NS_ABORT_MSG_IF(udpPacketRateMbps <= 0.0, "udpDataRate must be greater than zero");
     NS_ABORT_MSG_IF(enableBurstTraffic && udpBurstRateMbps <= 0.0,
                     "udpBurstRate must be greater than zero when burst traffic is enabled");
@@ -1193,8 +1247,52 @@ int main(int argc, char *argv[])
     nrHelper->SetBeamformingHelper(idealBeamformingHelper);
 
     CcBwpCreator ccBwpCreator;
-    CcBwpCreator::SimpleOperationBandConf bandConf(3.5e9, 100e6, 1);
-    OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
+    OperationBandInfo band;
+    if (!enableTrueBwp)
+    {
+        CcBwpCreator::SimpleOperationBandConf bandConf(3.5e9, 100e6, 1);
+        band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
+    }
+    else
+    {
+        // 5G NR allows a narrow BWP to be contained in a wider carrier BWP.
+        // CcBwpCreator partitions BWPs into non-overlapping slices, so the v6
+        // prototype describes the nested pair explicitly.  Each entry creates
+        // a real gNB/UE PHY with its own channel bandwidth; fixed-mode tests
+        // must pass before any runtime switching policy is connected.
+        constexpr double centerHz = 3.5e9;
+        constexpr double wideBandwidthHz = 100e6;
+        constexpr double narrowBandwidthHz = 20e6;
+        constexpr double narrowCenterHz = centerHz - 40e6;
+        band.m_centralFrequency = centerHz;
+        band.m_channelBandwidth = wideBandwidthHz;
+        band.m_lowerFrequency = centerHz - wideBandwidthHz / 2.0;
+        band.m_higherFrequency = centerHz + wideBandwidthHz / 2.0;
+
+        auto cc = std::make_unique<ComponentCarrierInfo>();
+        cc->m_ccId = 0;
+        cc->m_centralFrequency = centerHz;
+        cc->m_channelBandwidth = wideBandwidthHz;
+        cc->m_lowerFrequency = band.m_lowerFrequency;
+        cc->m_higherFrequency = band.m_higherFrequency;
+
+        auto narrowBwp = std::make_unique<BandwidthPartInfo>();
+        narrowBwp->m_bwpId = BWP_NARROW_20MHZ;
+        narrowBwp->m_centralFrequency = narrowCenterHz;
+        narrowBwp->m_channelBandwidth = narrowBandwidthHz;
+        narrowBwp->m_lowerFrequency = narrowCenterHz - narrowBandwidthHz / 2.0;
+        narrowBwp->m_higherFrequency = narrowCenterHz + narrowBandwidthHz / 2.0;
+        cc->m_bwp.emplace_back(std::move(narrowBwp));
+
+        auto wideBwp = std::make_unique<BandwidthPartInfo>();
+        wideBwp->m_bwpId = BWP_WIDE_100MHZ;
+        wideBwp->m_centralFrequency = centerHz;
+        wideBwp->m_channelBandwidth = wideBandwidthHz;
+        wideBwp->m_lowerFrequency = band.m_lowerFrequency;
+        wideBwp->m_higherFrequency = band.m_higherFrequency;
+        cc->m_bwp.emplace_back(std::move(wideBwp));
+        band.m_cc.emplace_back(std::move(cc));
+    }
 
     Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
     channelHelper->ConfigureFactories("UMi", "Default", "ThreeGpp");
@@ -1204,15 +1302,49 @@ int main(int argc, char *argv[])
 
     BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({band});
 
+    const uint8_t selectedBwpId = enableTrueBwp && fixedBwpMHz == 100
+                                      ? BWP_WIDE_100MHZ
+                                      : BWP_NARROW_20MHZ;
+    if (enableTrueBwp)
+    {
+        nrHelper->SetGnbBwpManagerAlgorithmAttribute(
+            "NGBR_VIDEO_TCP_DEFAULT", UintegerValue(selectedBwpId));
+        nrHelper->SetUeBwpManagerAlgorithmAttribute(
+            "NGBR_VIDEO_TCP_DEFAULT", UintegerValue(selectedBwpId));
+    }
+
     NetDeviceContainer gnbNetDev = nrHelper->InstallGnbDevice(gnbNodes, allBwps);
     NetDeviceContainer ueNetDev = nrHelper->InstallUeDevice(ueNodes, allBwps);
 
+    if (enableTrueBwp)
+    {
+        for (uint32_t ueId = 0; ueId < ueNetDev.GetN(); ++ueId)
+        {
+            DynamicCast<NrUeNetDevice>(ueNetDev.Get(ueId))
+                ->GetRrc()
+                ->SetAttribute("EnableAutomaticBwpSwitch", BooleanValue(false));
+        }
+    }
+
     Ptr<NrMacSchedulerNs3> scheduler =
-        DynamicCast<NrMacSchedulerNs3>(NrHelper::GetScheduler(gnbNetDev.Get(0), 0));
-    Ptr<NrGnbPhy> gnbPhy = NrHelper::GetGnbPhy(gnbNetDev.Get(0), 0);
+        DynamicCast<NrMacSchedulerNs3>(NrHelper::GetScheduler(gnbNetDev.Get(0), selectedBwpId));
+    Ptr<NrGnbPhy> gnbPhy = NrHelper::GetGnbPhy(gnbNetDev.Get(0), selectedBwpId);
     NS_ABORT_MSG_IF(!scheduler || !gnbPhy, "Unable to access the gNB scheduler or PHY");
-    gnbPhy->SetAttribute("Numerology", UintegerValue(numerology));
-    gnbPhy->SetAttribute("TxPower", DoubleValue(gnbTxPowerDbm));
+    for (uint32_t bwpId = 0; bwpId < allBwps.size(); ++bwpId)
+    {
+        Ptr<NrGnbPhy> configuredPhy = NrHelper::GetGnbPhy(gnbNetDev.Get(0), bwpId);
+        configuredPhy->SetAttribute("Numerology", UintegerValue(numerology));
+        configuredPhy->SetAttribute("TxPower", DoubleValue(gnbTxPowerDbm));
+        for (uint32_t ueId = 0; ueId < ueNetDev.GetN(); ++ueId)
+        {
+            // Secondary UE BWPs have not necessarily received their RRC PHY
+            // configuration when the Energy listener is installed.  Give all
+            // physical BWPs the scenario numerology up front so their slot
+            // duration is valid independently of which BWP starts primary.
+            NrHelper::GetUePhy(ueNetDev.Get(ueId), bwpId)
+                ->SetNumerology(numerology);
+        }
+    }
     RadioResourceController radioController(scheduler,
                                             gnbPhy,
                                             cellDtxPeriodMs,
@@ -1328,6 +1460,14 @@ int main(int argc, char *argv[])
     // Warm the channel and attachment state without creating packets that the
     // controller could not influence. Traffic and control begin together.
     const double trafficStartSec = std::max(0.02, controllerWarmupMs / 1000.0);
+    if (enableTrueBwp && selectedBwpId != BWP_NARROW_20MHZ)
+    {
+        const double switchTimeSec = std::max(0.01, trafficStartSec - 0.05);
+        Simulator::Schedule(Seconds(switchTimeSec),
+                            &SwitchAllUesToPrimaryBwp,
+                            ueNetDev,
+                            selectedBwpId);
+    }
     clientApps.Start(Seconds(trafficStartSec));
 
     FlowMonitorHelper flowmonHelper;
@@ -1354,7 +1494,12 @@ int main(int argc, char *argv[])
     nrEnergyHelper.SetGnbEnergyModelAttribute("PowerUnit",
                                                DoubleValue(gnbEnergyPowerUnitW));
     nrEnergyHelper.SetGnbEnergyModelAttribute("ReferenceRbCount",
-                                               UintegerValue(gnbPhy->GetRbNum()));
+                                               UintegerValue(enableTrueBwp
+                                                                 ? NrHelper::GetGnbPhy(
+                                                                       gnbNetDev.Get(0),
+                                                                       BWP_WIDE_100MHZ)
+                                                                       ->GetRbNum()
+                                                                 : gnbPhy->GetRbNum()));
     nrEnergyHelper.SetUeEnergyModelAttribute("FreqRange", StringValue("FR1"));
     nrEnergyHelper.SetUeEnergyModelAttribute("PowerUnit", DoubleValue(ueEnergyPowerUnitMw));
     nrEnergyHelper.SetUeEnergyModelAttribute("ReferenceBwpBandwidth", UintegerValue(100));
@@ -1368,8 +1513,14 @@ int main(int argc, char *argv[])
     energy::DeviceEnergyModelContainer gnbEnergyModels =
         nrEnergyHelper.InstallGnb(gnbNetDev, gnbEnergySources);
     energy::DeviceEnergyModelContainer ueEnergyModels =
-        nrEnergyHelper.InstallUe(ueNetDev, ueEnergySources);
+        nrEnergyHelper.InstallUe(ueNetDev, ueEnergySources, selectedBwpId);
     OfficialEnergyMetrics energyMetrics(gnbEnergyModels, ueEnergyModels, ueNodes);
+    if (enableTrueBwp)
+    {
+        Simulator::Schedule(Seconds(trafficStartSec),
+                            &OfficialEnergyMetrics::ResetMeasurementBaseline,
+                            &energyMetrics);
+    }
 
     const double burstDutyCycle = enableBurstTraffic
                                       ? burstMeanOnMs / (burstMeanOnMs + burstMeanOffMs)
@@ -1426,7 +1577,11 @@ int main(int argc, char *argv[])
               << ", GnbBsCategory=" << gnbEnergyBsCategory
               << ", GnbPowerUnitW=" << gnbEnergyPowerUnitW
               << ", UePowerUnitMw=" << ueEnergyPowerUnitMw
-              << ", FrequencyControl=PRB-profile-on-100MHz-PHY" << std::endl;
+              << ", FrequencyControl="
+              << (enableTrueBwp ? "fixed-physical-BWP-v6-prototype"
+                                : "PRB-profile-on-100MHz-PHY")
+              << ", ActivePhysicalBwpMHz="
+              << (enableTrueBwp ? fixedBwpMHz : 100) << std::endl;
 
     ExportStatsToCsv(csvFileName, Simulator::Now().GetSeconds(), enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules);
 

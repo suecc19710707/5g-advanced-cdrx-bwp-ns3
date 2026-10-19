@@ -41,3 +41,12 @@ The v5 branch also records an important semantic correction: the current
 frequency action is a schedulable-PRB profile on one physical 100 MHz BWP, not
 a physical 20/100 MHz BWP switch.  Official UE energy follows the actual PHY
 bandwidth; the former manual 20 MHz energy scaling override was removed.
+
+## `true-bwp-dci-v6` phase 1
+
+The first v6 checkpoint validates fixed physical 20 MHz and 100 MHz gNB/UE
+PHY BWPs before dynamic switching is connected to the DRL agent.  The scenario,
+RRC extension patch, fixed-mode measurements, and remaining simulator
+limitations are documented in:
+
+- `true_bwp_dci_v6_2026-10-19/`
