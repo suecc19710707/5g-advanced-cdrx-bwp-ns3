@@ -229,6 +229,8 @@ def evaluate_deterministic_policy(
             "SLA_Violation_Rate_Pct": sla_viol_rate,
             "SLA_Compliance_Rate_Pct": 100.0 - sla_viol_rate,
             "EnergyModel": "5G-LENA-TR38.864-TR38.840",
+            "FrequencyControlMode": "PRB-profile-on-single-physical-BWP",
+            "PhysicalBandwidthMHz": 100,
             "GnbEnergyBsCategory": gnb_energy_bs_category,
             "GnbEnergyRefConfig": gnb_energy_ref_config,
             "GnbEnergyEtaMode": gnb_energy_eta_mode,

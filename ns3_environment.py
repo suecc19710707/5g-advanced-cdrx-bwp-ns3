@@ -7,7 +7,8 @@ Architecture:
   - Real-time Socket IPC Server (127.0.0.1:5555)
   - Continuous Stateful ns-3 NR Physical Layer Simulation (No Restart per Step)
   - State Space (Box 10D): fixed-size load/backlog/channel statistics and control state
-  - Action Space (Discrete 10D): 2D Joint Actions (5 x Delta_W x 2 x BWP_State)
+  - Action Space (Discrete 10D): 2D Joint Actions
+    (5 x Delta_W x 2 x schedulable-PRB profile on one physical 100 MHz BWP)
 """
 
 import os
@@ -29,6 +30,8 @@ OBSERVATION_FIELDS = (
     "min_cqi",
     "mean_dl_mcs",
     "active_window",
+    # Legacy IPC field name: this selects the 20/100 MHz-equivalent PRB mask;
+    # it is not a physical 5G-LENA BWP switch.
     "bwp_state",
 )
 

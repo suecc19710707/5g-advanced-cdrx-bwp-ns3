@@ -738,8 +738,7 @@ class OfficialEnergyMetrics
 public:
     OfficialEnergyMetrics(energy::DeviceEnergyModelContainer gnbModels,
                           energy::DeviceEnergyModelContainer ueModels,
-                          NodeContainer ueNodes,
-                          BwpState initialBwp)
+                          NodeContainer ueNodes)
         : m_gnbModels(gnbModels),
           m_ueModels(ueModels),
           m_ueNodes(ueNodes),
@@ -747,7 +746,6 @@ public:
           m_windowGnbEnergyJ(0.0),
           m_windowUeEnergyJ(0.0)
     {
-        UpdateBwpState(initialBwp);
         ResetWindowStats();
     }
 
@@ -818,17 +816,6 @@ public:
             {
                 drx->SetAttribute("OnDuration", TimeValue(MilliSeconds(onDurationMs)));
             }
-        }
-    }
-
-    void UpdateBwpState(BwpState bwp)
-    {
-        const uint32_t bandwidthMhz = bwp == BWP_WIDE_100MHZ ? 100 : 20;
-        for (uint32_t i = 0; i < m_ueModels.GetN(); ++i)
-        {
-            Ptr<NrUeEnergyModel> model = DynamicCast<NrUeEnergyModel>(m_ueModels.Get(i));
-            NS_ABORT_MSG_IF(!model, "NrEnergyHelper returned a non-NR UE energy model");
-            model->ApplyBwpScaling(bandwidthMhz);
         }
     }
 
@@ -931,10 +918,6 @@ void DynamicDtxController::EvaluateAndAdjust()
         {
             if (m_energyMetrics) m_energyMetrics->UpdateDynamicOnDurationMs(m_currentActiveMs);
         }
-        if (m_enableBwpDynamic && m_energyMetrics)
-        {
-            m_energyMetrics->UpdateBwpState(m_currentBwp);
-        }
     }
 
     AppendTimeline(totalPending, rlcBacklogBytes);
@@ -1007,10 +990,6 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
         if (m_enableDciDynamic)
         {
             if (m_energyMetrics) m_energyMetrics->UpdateDynamicOnDurationMs(m_currentActiveMs);
-        }
-        if (m_enableBwpDynamic && m_energyMetrics)
-        {
-            m_energyMetrics->UpdateBwpState(m_currentBwp);
         }
     }
 
@@ -1134,8 +1113,13 @@ int main(int argc, char *argv[])
     cmd.AddValue("enableQueueAware", "Enable Closed-Loop Dynamic Controller", enableQueueAware);
     cmd.AddValue("enableCdrx", "Enable UE C-DRX Energy Saving Mode", enableCdrx);
     cmd.AddValue("enableDciDynamic", "Enable 3GPP DCI-Level Dynamic Alignment", enableDciDynamic);
-    cmd.AddValue("enableBwpDynamic", "Enable DCI-based Dynamic BWP Switching (20MHz <-> 100MHz)", enableBwpDynamic);
-    cmd.AddValue("fixedBwpMHz", "Fixed BWP bandwidth (20 or 100) when dynamic BWP is disabled", fixedBwpMHz);
+    cmd.AddValue("enableBwpDynamic",
+                 "Legacy name: dynamically switch the schedulable PRB profile "
+                 "(20/100 MHz-equivalent) on one physical 100 MHz BWP",
+                 enableBwpDynamic);
+    cmd.AddValue("fixedBwpMHz",
+                 "Fixed schedulable PRB profile (20 or 100 MHz-equivalent); the PHY remains 100 MHz",
+                 fixedBwpMHz);
     cmd.AddValue("enableRlIpc", "Enable Socket IPC for Reinforcement Learning Co-Simulation", enableRlIpc);
     cmd.AddValue("ipcPort", "Socket IPC Server Port", ipcPort);
     cmd.AddValue("phaseOffsetMs", "Phase Offset between gNB and UE C-DRX in ms", phaseOffsetMs);
@@ -1385,7 +1369,7 @@ int main(int argc, char *argv[])
         nrEnergyHelper.InstallGnb(gnbNetDev, gnbEnergySources);
     energy::DeviceEnergyModelContainer ueEnergyModels =
         nrEnergyHelper.InstallUe(ueNetDev, ueEnergySources);
-    OfficialEnergyMetrics energyMetrics(gnbEnergyModels, ueEnergyModels, ueNodes, initialBwp);
+    OfficialEnergyMetrics energyMetrics(gnbEnergyModels, ueEnergyModels, ueNodes);
 
     const double burstDutyCycle = enableBurstTraffic
                                       ? burstMeanOnMs / (burstMeanOnMs + burstMeanOffMs)
@@ -1441,7 +1425,8 @@ int main(int argc, char *argv[])
               << ", GnbRefConfig=" << gnbEnergyRefConfig
               << ", GnbBsCategory=" << gnbEnergyBsCategory
               << ", GnbPowerUnitW=" << gnbEnergyPowerUnitW
-              << ", UePowerUnitMw=" << ueEnergyPowerUnitMw << std::endl;
+              << ", UePowerUnitMw=" << ueEnergyPowerUnitMw
+              << ", FrequencyControl=PRB-profile-on-100MHz-PHY" << std::endl;
 
     ExportStatsToCsv(csvFileName, Simulator::Now().GetSeconds(), enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules);
 

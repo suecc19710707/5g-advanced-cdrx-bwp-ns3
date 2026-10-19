@@ -36,3 +36,8 @@ GitLab merge requests !408 and !417.  Provenance, assumptions, validation, and
 the complete nested `contrib/nr` patch series are stored in:
 
 - `official_energy_v5_2026-10-19/`
+
+The v5 branch also records an important semantic correction: the current
+frequency action is a schedulable-PRB profile on one physical 100 MHz BWP, not
+a physical 20/100 MHz BWP switch.  Official UE energy follows the actual PHY
+bandwidth; the former manual 20 MHz energy scaling override was removed.
