@@ -1,7 +1,7 @@
 From fb0ca0378fd5d547ae06d12bc32135470e911d1c Mon Sep 17 00:00:00 2001
 From: suecc0707 <suecc0707@gmail.com>
 Date: Mon, 19 Oct 2026 13:51:26 +0800
-Subject: [PATCH] nr: expose controlled same-cell BWP switching
+Subject: [PATCH 1/2] nr: expose controlled same-cell BWP switching
 
 ---
  model/nr-ue-rrc.cc | 37 +++++++++++++++++++++++++++++++++++++

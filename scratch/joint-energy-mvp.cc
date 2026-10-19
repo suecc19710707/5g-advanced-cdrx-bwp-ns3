@@ -57,6 +57,35 @@ SwitchAllUesToPrimaryBwp(NetDeviceContainer ueDevices, uint8_t targetBwpId)
                         "UE " << i << " rejected primary BWP switch to "
                               << +targetBwpId);
     }
+    std::cout << "PhysicalBwpSwitchTimeSec=" << Simulator::Now().GetSeconds()
+              << ", TargetBwpId=" << +targetBwpId
+              << ", TargetBwpMHz="
+              << g_bwpResourceProfiles[targetBwpId].channelBwMhz << std::endl;
+}
+
+static void
+ApplyUeEnergyBwpScaling(energy::DeviceEnergyModelContainer ueEnergyModels,
+                        uint32_t bandwidthMhz)
+{
+    for (uint32_t i = 0; i < ueEnergyModels.GetN(); ++i)
+    {
+        Ptr<NrUeEnergyModel> model =
+            DynamicCast<NrUeEnergyModel>(ueEnergyModels.Get(i));
+        NS_ABORT_MSG_IF(!model, "Expected an NrUeEnergyModel for UE " << i);
+        model->ApplyBwpScaling(bandwidthMhz);
+    }
+}
+
+static void
+SwitchAllUesToPrimaryBwpAndEnergy(
+    NetDeviceContainer ueDevices,
+    energy::DeviceEnergyModelContainer ueEnergyModels,
+    uint8_t targetBwpId)
+{
+    SwitchAllUesToPrimaryBwp(ueDevices, targetBwpId);
+    ApplyUeEnergyBwpScaling(
+        ueEnergyModels,
+        static_cast<uint32_t>(g_bwpResourceProfiles[targetBwpId].channelBwMhz));
 }
 
 class RlIpcClient
@@ -1118,7 +1147,11 @@ int main(int argc, char *argv[])
     bool enableDciDynamic = false;
     bool enableBwpDynamic = false;
     bool enableTrueBwp = false;
+    bool enableTrueBwpSwitchScript = false;
+    bool enableBwpValidationTraces = false;
     uint32_t fixedBwpMHz = 100;
+    double bwpSwitchToWideSec = 0.8;
+    double bwpSwitchBackToNarrowSec = 1.4;
     bool enableRlIpc = false;
     int ipcPort = 5555;
     double phaseOffsetMs = 0.0;
@@ -1166,12 +1199,23 @@ int main(int argc, char *argv[])
                  "(20/100 MHz-equivalent) on one physical 100 MHz BWP",
                  enableBwpDynamic);
     cmd.AddValue("enableTrueBwp",
-                 "Experimental v6: create physical 20 and 100 MHz gNB/UE BWPs; "
-                 "fixed-mode validation only",
+                 "Experimental v6: create physical 20 and 100 MHz gNB/UE BWPs",
                  enableTrueBwp);
+    cmd.AddValue("enableTrueBwpSwitchScript",
+                 "Run deterministic physical-BWP sequence 20 -> 100 -> 20 MHz",
+                 enableTrueBwpSwitchScript);
+    cmd.AddValue("enableBwpValidationTraces",
+                 "Write the built-in UE PHY DCI trace for BWP validation",
+                 enableBwpValidationTraces);
     cmd.AddValue("fixedBwpMHz",
                  "Fixed schedulable PRB profile (20 or 100 MHz-equivalent); the PHY remains 100 MHz",
                  fixedBwpMHz);
+    cmd.AddValue("bwpSwitchToWideSec",
+                 "Absolute simulation time for scripted 20 -> 100 MHz switch",
+                 bwpSwitchToWideSec);
+    cmd.AddValue("bwpSwitchBackToNarrowSec",
+                 "Absolute simulation time for scripted 100 -> 20 MHz switch",
+                 bwpSwitchBackToNarrowSec);
     cmd.AddValue("enableRlIpc", "Enable Socket IPC for Reinforcement Learning Co-Simulation", enableRlIpc);
     cmd.AddValue("ipcPort", "Socket IPC Server Port", ipcPort);
     cmd.AddValue("phaseOffsetMs", "Phase Offset between gNB and UE C-DRX in ms", phaseOffsetMs);
@@ -1196,8 +1240,16 @@ int main(int argc, char *argv[])
 
     NS_ABORT_MSG_IF(fixedBwpMHz != 20 && fixedBwpMHz != 100,
                     "fixedBwpMHz must be either 20 or 100");
+    NS_ABORT_MSG_IF(enableTrueBwpSwitchScript && !enableTrueBwp,
+                    "enableTrueBwpSwitchScript requires enableTrueBwp=true");
     NS_ABORT_MSG_IF(enableTrueBwp && enableBwpDynamic,
-                    "v6 phase 1 validates fixed physical BWPs before enabling dynamic switching");
+                    "Policy-driven true-BWP switching is not enabled yet; use "
+                    "enableTrueBwpSwitchScript for the deterministic validation sequence");
+    NS_ABORT_MSG_IF(enableTrueBwpSwitchScript &&
+                        (bwpSwitchToWideSec <= 0.0 ||
+                         bwpSwitchBackToNarrowSec <= bwpSwitchToWideSec ||
+                         bwpSwitchBackToNarrowSec >= simTime),
+                    "Scripted BWP times must satisfy 0 < wide < narrow < simTime");
     NS_ABORT_MSG_IF(udpPacketRateMbps <= 0.0, "udpDataRate must be greater than zero");
     NS_ABORT_MSG_IF(enableBurstTraffic && udpBurstRateMbps <= 0.0,
                     "udpBurstRate must be greater than zero when burst traffic is enabled");
@@ -1302,7 +1354,8 @@ int main(int argc, char *argv[])
 
     BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({band});
 
-    const uint8_t selectedBwpId = enableTrueBwp && fixedBwpMHz == 100
+    const uint8_t selectedBwpId = enableTrueBwp && !enableTrueBwpSwitchScript &&
+                                          fixedBwpMHz == 100
                                       ? BWP_WIDE_100MHZ
                                       : BWP_NARROW_20MHZ;
     if (enableTrueBwp)
@@ -1392,6 +1445,10 @@ int main(int argc, char *argv[])
     {
         nrHelper->AttachToGnb(ueNetDev.Get(i), gnbNetDev.Get(0));
     }
+    if (enableBwpValidationTraces)
+    {
+        nrHelper->EnableUePhyCtrlMsgsTraces();
+    }
 
     uint16_t port = 1234;
     ApplicationContainer clientApps;
@@ -1460,14 +1517,6 @@ int main(int argc, char *argv[])
     // Warm the channel and attachment state without creating packets that the
     // controller could not influence. Traffic and control begin together.
     const double trafficStartSec = std::max(0.02, controllerWarmupMs / 1000.0);
-    if (enableTrueBwp && selectedBwpId != BWP_NARROW_20MHZ)
-    {
-        const double switchTimeSec = std::max(0.01, trafficStartSec - 0.05);
-        Simulator::Schedule(Seconds(switchTimeSec),
-                            &SwitchAllUesToPrimaryBwp,
-                            ueNetDev,
-                            selectedBwpId);
-    }
     clientApps.Start(Seconds(trafficStartSec));
 
     FlowMonitorHelper flowmonHelper;
@@ -1512,11 +1561,41 @@ int main(int argc, char *argv[])
 
     energy::DeviceEnergyModelContainer gnbEnergyModels =
         nrEnergyHelper.InstallGnb(gnbNetDev, gnbEnergySources);
-    energy::DeviceEnergyModelContainer ueEnergyModels =
-        nrEnergyHelper.InstallUe(ueNetDev, ueEnergySources, selectedBwpId);
+    energy::DeviceEnergyModelContainer ueEnergyModels = enableTrueBwpSwitchScript
+        ? nrEnergyHelper.InstallUeAllBwps(ueNetDev, ueEnergySources, selectedBwpId)
+        : nrEnergyHelper.InstallUe(ueNetDev, ueEnergySources, selectedBwpId);
     OfficialEnergyMetrics energyMetrics(gnbEnergyModels, ueEnergyModels, ueNodes);
     if (enableTrueBwp)
     {
+        const double initializeEnergySec = std::max(0.0, trafficStartSec - 1e-6);
+        Simulator::Schedule(Seconds(initializeEnergySec),
+                            &ApplyUeEnergyBwpScaling,
+                            ueEnergyModels,
+                            selectedBwpId == BWP_WIDE_100MHZ ? 100u : 20u);
+        if (selectedBwpId != BWP_NARROW_20MHZ)
+        {
+            const double switchTimeSec = std::max(0.01, trafficStartSec - 0.05);
+            Simulator::Schedule(Seconds(switchTimeSec),
+                                &SwitchAllUesToPrimaryBwpAndEnergy,
+                                ueNetDev,
+                                ueEnergyModels,
+                                selectedBwpId);
+        }
+        if (enableTrueBwpSwitchScript)
+        {
+            NS_ABORT_MSG_IF(bwpSwitchToWideSec <= trafficStartSec,
+                            "The first scripted BWP switch must occur after traffic starts");
+            Simulator::Schedule(Seconds(bwpSwitchToWideSec),
+                                &SwitchAllUesToPrimaryBwpAndEnergy,
+                                ueNetDev,
+                                ueEnergyModels,
+                                static_cast<uint8_t>(BWP_WIDE_100MHZ));
+            Simulator::Schedule(Seconds(bwpSwitchBackToNarrowSec),
+                                &SwitchAllUesToPrimaryBwpAndEnergy,
+                                ueNetDev,
+                                ueEnergyModels,
+                                static_cast<uint8_t>(BWP_NARROW_20MHZ));
+        }
         Simulator::Schedule(Seconds(trafficStartSec),
                             &OfficialEnergyMetrics::ResetMeasurementBaseline,
                             &energyMetrics);
@@ -1578,10 +1657,13 @@ int main(int argc, char *argv[])
               << ", GnbPowerUnitW=" << gnbEnergyPowerUnitW
               << ", UePowerUnitMw=" << ueEnergyPowerUnitMw
               << ", FrequencyControl="
-              << (enableTrueBwp ? "fixed-physical-BWP-v6-prototype"
-                                : "PRB-profile-on-100MHz-PHY")
+              << (enableTrueBwpSwitchScript
+                      ? "scripted-physical-BWP-v6"
+                      : (enableTrueBwp ? "fixed-physical-BWP-v6-prototype"
+                                       : "PRB-profile-on-100MHz-PHY"))
               << ", ActivePhysicalBwpMHz="
-              << (enableTrueBwp ? fixedBwpMHz : 100) << std::endl;
+              << (enableTrueBwpSwitchScript ? 20 : (enableTrueBwp ? fixedBwpMHz : 100))
+              << std::endl;
 
     ExportStatsToCsv(csvFileName, Simulator::Now().GetSeconds(), enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules);
 

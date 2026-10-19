@@ -50,3 +50,12 @@ RRC extension patch, fixed-mode measurements, and remaining simulator
 limitations are documented in:
 
 - `true_bwp_dci_v6_2026-10-19/`
+
+## `true-bwp-dci-v6` phase 2
+
+The deterministic `20 -> 100 -> 20 MHz` test now switches the UE RRC primary
+BWP, gNB per-UE routing, DCI BWP ID, and official UE Energy bandwidth scaling
+as one controlled operation. One official UE model observes all BWP PHYs
+without double-counting the UE. DCI interval counts, traffic continuity,
+energy timing, regression results, and the second nested 5G-LENA patch are
+recorded in the same directory. Policy/IPC integration remains the next phase.

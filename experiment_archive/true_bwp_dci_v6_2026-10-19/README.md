@@ -1,16 +1,21 @@
-# True physical BWP v6 — phase 1 checkpoint
+# True physical BWP v6 — fixed and scripted-switch checkpoints
 
-This checkpoint is the fixed-mode validation stage for replacing the v5
-scheduler PRB profile with distinct physical gNB/UE PHY bandwidth parts.
-Dynamic DRL switching is deliberately still disabled.
+This directory records both the fixed-mode validation and the deterministic
+`20 -> 100 -> 20 MHz` runtime-switch validation used before connecting the
+policy/DRL controller.  Policy-driven switching is deliberately still
+disabled.
 
 ## Provenance
 
 - Parent ns-3 checkpoint: `44d7e76599f43f0b9e948343a808291004748be0`
   (`official-energy-v5`).
-- Nested 5G-LENA commit: `fb0ca0378fd5d547ae06d12bc32135470e911d1c`.
-- Reproduction patch:
-  `0001-nr-expose-controlled-same-cell-BWP-switching.patch`.
+- Nested 5G-LENA commits:
+  - `fb0ca0378fd5d547ae06d12bc32135470e911d1c` (controlled RRC switch);
+  - `b7b3ae7b90792a1ad6484c6e10fb521aeeb8d96f` (one UE Energy model
+    observing every runtime BWP).
+- Reproduction patch series:
+  - `0001-nr-expose-controlled-same-cell-BWP-switching.patch`;
+  - `0002-nr-account-UE-energy-across-runtime-BWP-switches.patch`.
 
 ## Physical configuration
 
@@ -41,8 +46,8 @@ experiment.
 
 ## Energy accounting
 
-The official 5G-LENA UE Energy listener is attached to the selected physical
-BWP. A trace confirmed:
+In fixed mode, the official 5G-LENA UE Energy listener is attached to the
+selected physical BWP. A trace confirmed:
 
 - fixed 20 MHz: `ApplyBwpScaling(20)` on the first DL TB;
 - fixed 100 MHz: `ApplyBwpScaling(100)` on the first DL TB, followed by
@@ -51,6 +56,15 @@ BWP. A trace confirmed:
 For v6 true-BWP runs, cumulative energy baselines are reset at the common
 traffic-start time. Attachment and the initial BWP-1 switch therefore do not
 bias the fixed-mode comparison.
+
+For scripted runtime switching, `NrEnergyHelper::InstallUeAllBwps()` creates
+exactly one `NrUeEnergyModel` per UE and one listener subscribed to every BWP
+PHY. Each callback is bound to its source PHY, so its bandwidth, cached slot
+duration, and UL transmit power come from the BWP that carried the TB. All
+BWPs share one `activeUntil` deadline, preventing a stale timer from an old
+BWP from ending a new BWP's active interval. The switch event also calls the
+official `ApplyBwpScaling()` API immediately, so monitoring power changes at
+the switch rather than waiting for the first TB.
 
 ## Fixed-mode validation
 
@@ -73,16 +87,51 @@ At equal offered load, the narrow BWP lowers UE active power but needs more
 active OFDM resources; the wide BWP finishes the same traffic with fewer
 active symbols, so the official gNB model reports lower average power here.
 
+## Scripted runtime-switch validation
+
+Command shape:
+
+```bash
+./ns3 run "scratch/joint-energy-mvp --enableTrueBwp=true \
+  --enableTrueBwpSwitchScript=true --enableBwpValidationTraces=true \
+  --simTime=2.0 --numUes=3 --udpDataRate=2 \
+  --enableGating=false --enableCdrx=false \
+  --bwpSwitchToWideSec=0.8 --bwpSwitchBackToNarrowSec=1.4"
+```
+
+The built-in UE PHY DCI trace reported:
+
+| Time region | Expected BWP | DL DCI count |
+|---|---:|---:|
+| before 0.8 s | 0 (20 MHz) | 447 |
+| 0.8–1.4 s | 1 (100 MHz) | 450 |
+| after 1.4 s | 0 (20 MHz) | 438 |
+
+Three additional BWP-0 DCI records arrived at 0.801036 s, one per UE. They
+were already in the k-delay pipeline before the 0.8 s switch; no later BWP-0
+DL DCI occurred in the wide interval. The return to BWP 0 had no stale BWP-1
+DL DCI.
+
+The official UE energy trace applied 100 MHz to all three UE models at exactly
+0.800000 s and 20 MHz at exactly 1.400000 s. End-to-end results were 11.0231
+Mbit received, 11.9451 ms P99, 100% QoS, 71.4095 W average gNB power, and
+81.0778 mW average UE power per UE. Offered/application counters remained
+continuous across both switches (`1374948` offered bytes, `1339392` received,
+`9396` pending).
+
+Full build, `nr-energy-integration`, and `nr-energy-models` passed after the
+change.
+
 ## Remaining work and limitation
 
-- Dynamic switching and Python/DRL integration are not enabled yet.
+- Deterministic runtime switching is enabled; rule-based and Python/DRL action
+  integration are not enabled yet.
 - `NrChannelHelper` creates one `SpectrumChannel` object per BWP. The nested
   spectral ranges are therefore a simulator-level BWP abstraction rather than
   two simultaneously interacting overlapping RF transmissions. Only the
   selected BWP may carry user data in the controlled experiment.
-- The official UE helper attaches one energy listener/model to the selected
-  BWP. Phase 2 must make that binding follow every runtime switch without
-  double-counting inactive BWPs.
-- Phase 2 acceptance requires DCI traces with changing BWP IDs, continuous
-  per-UE traffic, synchronized gNB/UE primary BWP state, and official energy
-  callbacks on the newly active BWP.
+- The runtime validation changes primary BWP through the existing ideal RRC
+  indication and 5G-LENA `DciInfoElementTdma` BWP ID. It does not bit-encode a
+  standards DCI message over a modeled control channel.
+- The next acceptance stage is to route rule-based and IPC/DRL actions through
+  the validated switch event, then run the offered-load sweep.

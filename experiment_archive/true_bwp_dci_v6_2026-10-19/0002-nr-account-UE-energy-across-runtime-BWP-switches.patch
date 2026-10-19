@@ -1,0 +1,324 @@
+From b7b3ae7b90792a1ad6484c6e10fb521aeeb8d96f Mon Sep 17 00:00:00 2001
+From: suecc0707 <suecc0707@gmail.com>
+Date: Mon, 19 Oct 2026 21:15:23 +0800
+Subject: [PATCH 2/2] nr: account UE energy across runtime BWP switches
+
+---
+ helper/nr-energy-helper.cc         | 54 +++++++++++++++++++++++
+ helper/nr-energy-helper.h          | 17 +++++++
+ model/nr-ue-phy-energy-listener.cc | 71 +++++++++++++++++++++++-------
+ model/nr-ue-phy-energy-listener.h  | 32 ++++++++++++++
+ 4 files changed, 159 insertions(+), 15 deletions(-)
+
+diff --git a/helper/nr-energy-helper.cc b/helper/nr-energy-helper.cc
+index 2c5a4c4c..cedb4d12 100644
+--- a/helper/nr-energy-helper.cc
++++ b/helper/nr-energy-helper.cc
+@@ -360,6 +360,60 @@ NrEnergyHelper::InstallUe(NetDeviceContainer ueDevs,
+     return models;
+ }
+ 
++energy::DeviceEnergyModelContainer
++NrEnergyHelper::InstallUeAllBwps(NetDeviceContainer ueDevs,
++                                 energy::EnergySourceContainer sources,
++                                 uint32_t initialBwpIndex)
++{
++    NS_LOG_FUNCTION(this << ueDevs.GetN() << initialBwpIndex);
++    NS_ASSERT_MSG(ueDevs.GetN() == sources.GetN(),
++                  "One energy source per UE device is required (index-aligned)");
++
++    energy::DeviceEnergyModelContainer models;
++    for (uint32_t i = 0; i < ueDevs.GetN(); ++i)
++    {
++        Ptr<NetDevice> dev = ueDevs.Get(i);
++        Ptr<energy::EnergySource> source = sources.Get(i);
++        NS_ASSERT_MSG(source->GetNode() == dev->GetNode(),
++                      "Energy source " << i << " is not on the same node as UE device " << i
++                                       << "; the two containers must be index-aligned");
++
++        Ptr<NrUeNetDevice> nrDev = DynamicCast<NrUeNetDevice>(dev);
++        NS_ABORT_MSG_IF(!nrDev, "NrEnergyHelper::InstallUeAllBwps needs NrUeNetDevice objects");
++        const uint32_t nBwps = std::max(1u, nrDev->GetCcMapSize());
++        NS_ABORT_MSG_IF(initialBwpIndex >= nBwps,
++                        "UE device " << i << " has no initial bandwidth part "
++                                     << initialBwpIndex);
++
++        Ptr<NrUeEnergyModel> model = m_ueModelFactory.Create<NrUeEnergyModel>();
++        AttachToSource(model, source);
++
++        Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
++        listener->SetEnergyModel(model);
++        for (uint32_t bwp = 0; bwp < nBwps; ++bwp)
++        {
++            if (bwp != initialBwpIndex)
++            {
++                listener->AddPhy(NrHelper::GetUePhy(dev, bwp));
++            }
++        }
++        listener->AddPhy(NrHelper::GetUePhy(dev, initialBwpIndex));
++
++        if (m_enableDrx)
++        {
++            Ptr<NrUeDrxModel> drx = m_drxFactory.Create<NrUeDrxModel>();
++            drx->SetEnergyModel(model);
++            listener->SetDrxModel(drx);
++            drx->Start(Simulator::Now());
++            dev->GetNode()->AggregateObject(drx);
++        }
++
++        dev->GetNode()->AggregateObject(listener);
++        models.Add(model);
++    }
++    return models;
++}
++
+ energy::DeviceEnergyModelContainer
+ NrEnergyHelper::Install(NetDeviceContainer gnbDevs,
+                         energy::EnergySourceContainer gnbSources,
+diff --git a/helper/nr-energy-helper.h b/helper/nr-energy-helper.h
+index 42b0743e..669ef24b 100644
+--- a/helper/nr-energy-helper.h
++++ b/helper/nr-energy-helper.h
+@@ -237,6 +237,23 @@ class NrEnergyHelper
+                                                  energy::EnergySourceContainer sources,
+                                                  uint32_t bwpIndex);
+ 
++    /**
++     * @brief Install one UE energy model per device and observe every BWP PHY.
++     *
++     * This overload supports runtime BWP switching without creating multiple
++     * energy models for one UE.  @p initialBwpIndex is subscribed last so its
++     * bandwidth scaling represents the primary BWP before the first TB.
++     *
++     * @param ueDevs UE NetDevices from NrHelper::InstallUeDevice.
++     * @param sources One energy::EnergySource per UE node, index-aligned.
++     * @param initialBwpIndex Primary BWP when energy accounting starts.
++     * @return Container of the created UE device energy models.
++     */
++    energy::DeviceEnergyModelContainer InstallUeAllBwps(
++        NetDeviceContainer ueDevs,
++        energy::EnergySourceContainer sources,
++        uint32_t initialBwpIndex = 0);
++
+     /**
+      * @brief Install both sides in one call.
+      *
+diff --git a/model/nr-ue-phy-energy-listener.cc b/model/nr-ue-phy-energy-listener.cc
+index 712ea3c3..ead62389 100644
+--- a/model/nr-ue-phy-energy-listener.cc
++++ b/model/nr-ue-phy-energy-listener.cc
+@@ -60,17 +60,27 @@ NrUePhyEnergyListener::~NrUePhyEnergyListener()
+ 
+ void
+ NrUePhyEnergyListener::SetPhy(Ptr<NrUePhy> phy)
++{
++    AddPhy(phy);
++}
++
++void
++NrUePhyEnergyListener::AddPhy(Ptr<NrUePhy> phy)
+ {
+     NS_LOG_FUNCTION(this << phy);
+     NS_ASSERT_MSG(phy, "NrUePhy pointer must not be null");
+     m_phy = phy;
++    m_phys.push_back(phy);
+     m_slotDuration = phy->GetSlotPeriod();
+-    RefreshBwpScaling();
++    RefreshBwpScaling(phy);
+     phy->TraceConnectWithoutContext(
+         "DlDataStats",
+-        MakeCallback(&NrUePhyEnergyListener::DlTbReceivedCallback, this));
+-    phy->TraceConnectWithoutContext("UlDataStats",
+-                                    MakeCallback(&NrUePhyEnergyListener::UlTbSentCallback, this));
++        MakeCallback(&NrUePhyEnergyListener::DlTbReceivedFromPhy, this)
++            .Bind(phy, m_slotDuration));
++    phy->TraceConnectWithoutContext(
++        "UlDataStats",
++        MakeCallback(&NrUePhyEnergyListener::UlTbSentFromPhy, this)
++            .Bind(phy, m_slotDuration));
+ }
+ 
+ void
+@@ -96,6 +106,7 @@ NrUePhyEnergyListener::DoDispose()
+ {
+     NS_LOG_FUNCTION(this);
+     m_phy = nullptr;
++    m_phys.clear();
+     m_model = nullptr;
+     m_drx = nullptr;
+     Object::DoDispose();
+@@ -104,13 +115,19 @@ NrUePhyEnergyListener::DoDispose()
+ void
+ NrUePhyEnergyListener::RefreshBwpScaling()
+ {
+-    NS_LOG_FUNCTION(this);
+-    if (!m_phy || !m_model)
++    RefreshBwpScaling(m_phy);
++}
++
++void
++NrUePhyEnergyListener::RefreshBwpScaling(Ptr<NrUePhy> phy)
++{
++    NS_LOG_FUNCTION(this << phy);
++    if (!phy || !m_model)
+     {
+         return;
+     }
+     // GetChannelBandwidth() is in Hz; TR 38.840 Section 8.1.3 scales in MHz.
+-    uint32_t bwMhz = m_phy->GetChannelBandwidth() / 1000000;
++    uint32_t bwMhz = phy->GetChannelBandwidth() / 1000000;
+     if (bwMhz > 0 && bwMhz != m_lastBwpMhz)
+     {
+         m_model->ApplyBwpScaling(bwMhz);
+@@ -124,6 +141,18 @@ NrUePhyEnergyListener::DlTbReceivedCallback(uint64_t imsi,
+                                             uint32_t symStart,
+                                             uint32_t numSym,
+                                             uint32_t rank)
++{
++    DlTbReceivedFromPhy(m_phy, m_slotDuration, imsi, tbSize, symStart, numSym, rank);
++}
++
++void
++NrUePhyEnergyListener::DlTbReceivedFromPhy(Ptr<NrUePhy> phy,
++                                           Time slotDuration,
++                                           uint64_t imsi,
++                                           uint32_t tbSize,
++                                           uint32_t symStart,
++                                           uint32_t numSym,
++                                           uint32_t rank)
+ {
+     NS_LOG_FUNCTION(this << imsi << tbSize << symStart << numSym << rank);
+     if (!m_model || tbSize == 0)
+@@ -134,7 +163,7 @@ NrUePhyEnergyListener::DlTbReceivedCallback(uint64_t imsi,
+     {
+         m_model->TriggerSetupTransition();
+     }
+-    RefreshBwpScaling();
++    RefreshBwpScaling(phy);
+     // Table 21 scales with powered receive chains, which 5G-LENA does not model;
+     // that count is a static configuration on the energy model. Rank counts
+     // spatial layers, so it drives the scaling only if the user opts in.
+@@ -149,9 +178,9 @@ NrUePhyEnergyListener::DlTbReceivedCallback(uint64_t imsi,
+     }
+     // TR 38.840 Table 18/20 values are averaged over the operations within a slot
+     // (Release 16, p.63), so the active value is charged for the whole slot.
+-    Time end = Simulator::Now() + m_slotDuration;
++    Time end = Simulator::Now() + slotDuration;
+     m_activeUntil = std::max(m_activeUntil, end);
+-    Simulator::Schedule(m_slotDuration, &NrUePhyEnergyListener::ReturnToMonitoring, this);
++    Simulator::Schedule(slotDuration, &NrUePhyEnergyListener::ReturnToMonitoring, this);
+ }
+ 
+ void
+@@ -160,25 +189,37 @@ NrUePhyEnergyListener::UlTbSentCallback(uint64_t imsi,
+                                         uint32_t symStart,
+                                         uint32_t numSym,
+                                         uint32_t rank)
++{
++    UlTbSentFromPhy(m_phy, m_slotDuration, imsi, tbSize, symStart, numSym, rank);
++}
++
++void
++NrUePhyEnergyListener::UlTbSentFromPhy(Ptr<NrUePhy> phy,
++                                       Time slotDuration,
++                                       uint64_t imsi,
++                                       uint32_t tbSize,
++                                       uint32_t symStart,
++                                       uint32_t numSym,
++                                       uint32_t rank)
+ {
+     NS_LOG_FUNCTION(this << imsi << tbSize << symStart << numSym << rank);
+     if (!m_model || tbSize == 0)
+     {
+         return;
+     }
+-    RefreshBwpScaling();
+-    if (m_phy)
++    RefreshBwpScaling(phy);
++    if (phy)
+     {
+-        m_model->SetUlTxPowerDbm(m_phy->GetTxPower());
++        m_model->SetUlTxPowerDbm(phy->GetTxPower());
+     }
+     m_model->ChangeState(NR_UE_UL_TX);
+     if (m_drx)
+     {
+         m_drx->NotifyDataActivity();
+     }
+-    Time end = Simulator::Now() + m_slotDuration;
++    Time end = Simulator::Now() + slotDuration;
+     m_activeUntil = std::max(m_activeUntil, end);
+-    Simulator::Schedule(m_slotDuration, &NrUePhyEnergyListener::ReturnToMonitoring, this);
++    Simulator::Schedule(slotDuration, &NrUePhyEnergyListener::ReturnToMonitoring, this);
+ }
+ 
+ void
+diff --git a/model/nr-ue-phy-energy-listener.h b/model/nr-ue-phy-energy-listener.h
+index 96558e3e..dd4f68c6 100644
+--- a/model/nr-ue-phy-energy-listener.h
++++ b/model/nr-ue-phy-energy-listener.h
+@@ -17,6 +17,7 @@
+ #include "ns3/ptr.h"
+ 
+ #include <algorithm>
++#include <vector>
+ 
+ namespace ns3
+ {
+@@ -91,6 +92,19 @@ class NrUePhyEnergyListener : public Object
+      */
+     void SetPhy(Ptr<NrUePhy> phy);
+ 
++    /**
++     * @brief Subscribe this listener to one additional UE BWP PHY.
++     *
++     * All subscribed PHYs drive the same UE energy model.  Each callback is
++     * bound to its source PHY, so runtime BWP switches apply the bandwidth,
++     * slot duration, and UL transmit power of the BWP that actually carried
++     * the transport block.  A shared active-until deadline prevents stale
++     * timers from another BWP from ending an overlapping active interval.
++     *
++     * @param phy Additional UE PHY to observe.
++     */
++    void AddPhy(Ptr<NrUePhy> phy);
++
+     /**
+      * @brief Connect the UE energy model that this listener will drive.
+      * @param model Pointer to the NrUeEnergyModel instance.
+@@ -163,6 +177,22 @@ class NrUePhyEnergyListener : public Object
+                           uint32_t numSym,
+                           uint32_t rank);
+ 
++    void DlTbReceivedFromPhy(Ptr<NrUePhy> phy,
++                             Time slotDuration,
++                             uint64_t imsi,
++                             uint32_t tbSize,
++                             uint32_t symStart,
++                             uint32_t numSym,
++                             uint32_t rank);
++
++    void UlTbSentFromPhy(Ptr<NrUePhy> phy,
++                         Time slotDuration,
++                         uint64_t imsi,
++                         uint32_t tbSize,
++                         uint32_t symStart,
++                         uint32_t numSym,
++                         uint32_t rank);
++
+     /**
+      * @brief Return the UE energy model to PDCCH-only monitoring.
+      *
+@@ -179,8 +209,10 @@ class NrUePhyEnergyListener : public Object
+      * energy model without any PHY-side hook.
+      */
+     void RefreshBwpScaling();
++    void RefreshBwpScaling(Ptr<NrUePhy> phy);
+ 
+     Ptr<NrUePhy> m_phy;           //!< Attached UE PHY (may be null)
++    std::vector<Ptr<NrUePhy>> m_phys; //!< All observed BWP PHYs
+     Ptr<NrUeEnergyModel> m_model; //!< Attached UE energy model (may be null)
+     Ptr<NrUeDrxModel> m_drx;      //!< Attached DRX model (may be null)
+ 
+-- 
+2.43.0
+
