@@ -1,0 +1,1814 @@
+From eec1db4c92c43643842e4653062ba89034e182e0 Mon Sep 17 00:00:00 2001
+From: "nipuna.dulara" <pererannd.21@uom.lk>
+Date: Fri, 28 Aug 2026 13:05:55 +0530
+Subject: [PATCH 4/9] nr: Refine the gNB and UE power models against the 3GPP
+ reference
+
+Tighten several details against TR 38.864/TR 38.840: gNB sp is now
+computed against the configured reference Tx power rather than the
+instantaneous one, the slot symbol count is taken from NrPhy instead of
+assumed, the BS Category 2 rows are added for reference sets 2 and 3,
+and RefConfigSet is made a coherent reference configuration with the
+DL/UL guard period separated from the sleep transitions it used to be
+folded into. Document PowerUnit as a calibration assumption rather than
+a 3GPP value. On the UE side, MIMO rank is no longer treated as a
+receive-chain count, UE power is charged slot-averaged for the whole
+slot, and the transient/BWP-scaling API is tightened, including a fix
+for the transition transient losing energy at its boundary and on
+re-trigger.
+---
+ model/nr-gnb-energy-model.cc           | 192 +++++++++++--
+ model/nr-gnb-energy-model.h            |  84 +++++-
+ model/nr-gnb-phy-energy-listener.cc    |  28 +-
+ model/nr-gnb-phy-energy-listener.h     |  13 +-
+ model/nr-ue-drx-model.cc               |   6 +-
+ model/nr-ue-energy-model.cc            |  90 ++++--
+ model/nr-ue-energy-model.h             |  70 +++--
+ model/nr-ue-phy-energy-listener.cc     |  44 +--
+ model/nr-ue-phy-energy-listener.h      |  28 +-
+ test/nr-test-energy-models.cc          | 378 ++++++++++++++++++++++++-
+ test/nr-test-ue-phy-energy-listener.cc | 135 +++++----
+ 11 files changed, 891 insertions(+), 177 deletions(-)
+
+diff --git a/model/nr-gnb-energy-model.cc b/model/nr-gnb-energy-model.cc
+index 3a3f1613..25ad6453 100644
+--- a/model/nr-gnb-energy-model.cc
++++ b/model/nr-gnb-energy-model.cc
+@@ -27,9 +27,10 @@ namespace ns3
+ NS_LOG_COMPONENT_DEFINE("NrGnbEnergyModel");
+ NS_OBJECT_ENSURE_REGISTERED(NrGnbEnergyModel);
+ 
+-// TR 38.864 Table 5.1-3 relative power values, indexed [P1..P5]. The values
+-// depend on both the BS category and the reference configuration set, which a
+-// single ns-3 attribute default cannot express, so they live in a lookup table.
++// TR 38.864 Table 5.1-3 relative power values, indexed [P1..P5]. BS category and
++// reference configuration set are two independent axes of the table and every
++// combination is tabulated, which a single ns-3 attribute default cannot express,
++// so they live in a lookup table.
+ namespace
+ {
+ struct GnbPowerRow
+@@ -41,11 +42,57 @@ struct GnbPowerRow
+     double p5; //!< Active UL
+ };
+ 
+-// TR 38.864 Table 5.1-3.
++// TR 38.864 Table 5.1-3. Deep sleep (P1) and light sleep (P2) are merged cells in
++// the table, i.e. the same value across all three sets of a given BS category.
+ constexpr GnbPowerRow CAT1_SET1 = {1.0, 25.0, 55.0, 280.0, 110.0};
+ constexpr GnbPowerRow CAT1_SET2 = {1.0, 25.0, 50.0, 200.0, 90.0};
+ constexpr GnbPowerRow CAT1_SET3 = {1.0, 25.0, 38.0, 152.0, 80.0};
+ constexpr GnbPowerRow CAT2_SET1 = {1.0, 2.1, 5.5, 32.0, 6.5};
++constexpr GnbPowerRow CAT2_SET2 = {1.0, 2.1, 5.0, 26.0, 5.8};
++constexpr GnbPowerRow CAT2_SET3 = {1.0, 2.1, 3.0, 17.6, 4.2};
++
++// TR 38.864 Table 5.1-1 reference configurations, indexed to RefConfigSet - 1
++// (Custom has no entry). Only the members the model actually consumes are held:
++// the reference Tx power, which nothing else supplies, and the SCS, which the
++// PHY-derived symbol duration is checked against. For the record the full rows
++// are:
++//   Set 1: FR1 TDD,  100 MHz,  30 kHz, 1 TRP, 64 TxRU, 55 dBm
++//   Set 2: FR1 FDD,   20 MHz,  15 kHz, 1 TRP, 32 TxRU, 49 dBm
++//   Set 3: FR2 TDD,  100 MHz, 120 kHz, 1 TRP,  2 TxRU, 33 dBm
++struct GnbRefConfig
++{
++    double refTxPowerDbm; //!< Total DL power level
++    uint32_t scsKhz;      //!< Subcarrier spacing
++};
++
++constexpr GnbRefConfig GNB_REF_CONFIG[] = {
++    {55.0, 30},  // Set1
++    {49.0, 15},  // Set2
++    {33.0, 120}, // Set3
++};
++
++// TR 38.864 Table 5.1-4 (total transition time T) and Table 5.1-5 (additional
++// transition energy E, in relative power x ms), indexed by NrGnbPowerState.
++// Both cover ramping down and ramping up together, so the energy is charged once
++// on sleep entry. They are the same across reference sets for a given category.
++// (Time is not constexpr-constructible, so this is a runtime-const array.)
++struct GnbTransition
++{
++    double energyRelMs; //!< Table 5.1-5 additional transition energy
++    Time totalTime;     //!< Table 5.1-4 total transition time
++};
++
++const GnbTransition CAT1_TRANSITION[] = {
++    {1000.0, MilliSeconds(50)}, // DeepSleep
++    {90.0, MilliSeconds(6)},    // LightSleep
++    {0.0, MilliSeconds(0)},     // MicroSleep (immediate)
++};
++
++const GnbTransition CAT2_TRANSITION[] = {
++    {17000.0, Seconds(10)},      // DeepSleep
++    {1088.0, MilliSeconds(640)}, // LightSleep
++    {0.0, MilliSeconds(0)},      // MicroSleep (immediate)
++};
+ } // namespace
+ 
+ TypeId
+@@ -62,10 +109,20 @@ NrGnbEnergyModel::GetTypeId()
+                           MakeEnumAccessor<BsCategory>(&NrGnbEnergyModel::m_bsCategory),
+                           MakeEnumChecker(BsCat1, "BsCat1", BsCat2, "BsCat2"))
+             .AddAttribute("RefConfigSet",
+-                          "Reference configuration set (TR 38.864 Table 5.1-1).",
+-                          EnumValue(Set1),
++                          "Named TR 38.864 Table 5.1-1 reference configuration. A named set "
++                          "is one coherent bundle: it fixes ReferenceTxPowerDbm and requires "
++                          "the PHY numerology to match the set's SCS. Custom applies no "
++                          "preset and leaves every reference parameter as configured.",
++                          EnumValue(Custom),
+                           MakeEnumAccessor<RefConfigSet>(&NrGnbEnergyModel::m_refConfig),
+-                          MakeEnumChecker(Set1, "Set1", Set2, "Set2", Set3, "Set3"))
++                          MakeEnumChecker(Custom,
++                                          "Custom",
++                                          Set1,
++                                          "Set1",
++                                          Set2,
++                                          "Set2",
++                                          Set3,
++                                          "Set3"))
+             .AddAttribute("EtaMode",
+                           "PA efficiency mode: single constant 1.0 or dual 0.76/1.0.",
+                           EnumValue(EtaSingle),
+@@ -80,12 +137,19 @@ NrGnbEnergyModel::GetTypeId()
+                           MakeDoubleAccessor(&NrGnbEnergyModel::m_antennaRatioA),
+                           MakeDoubleChecker<double>(0.0, 1.0))
+             .AddAttribute("PowerUnit",
+-                          "Absolute power of one TR 38.864 relative power-unit, in W.",
++                          "Absolute power of one TR 38.864 relative power-unit, in W. "
++                          "PowerUnit is a user-supplied calibration assumption. 3GPP "
++                          "provides only relative power, and does not provide the default "
++                          "value for the absolute value of the unit. Hence the result "
++                          "obtained with this default value do not represent the absolute "
++                          "energy consumption per 3GPP model.",
+                           DoubleValue(1.0),
+                           MakeDoubleAccessor(&NrGnbEnergyModel::m_powerUnitW),
+                           MakeDoubleChecker<double>(0.0))
+             .AddAttribute("ReferenceTxPowerDbm",
+-                          "Reference total Tx power for sp [dBm] (TR 38.864 Section 5.1).",
++                          "Reference total Tx power for sp [dBm] (TR 38.864 Table 5.1-1). "
++                          "Ignored unless RefConfigSet is Custom, where a value that "
++                          "contradicts the selected set is rejected.",
+                           DoubleValue(55.0),
+                           MakeDoubleAccessor(&NrGnbEnergyModel::m_refTxPowerDbm),
+                           MakeDoubleChecker<double>())
+@@ -107,7 +171,7 @@ NrGnbEnergyModel::GetTypeId()
+ NrGnbEnergyModel::NrGnbEnergyModel()
+     : m_source(nullptr),
+       m_bsCategory(BsCat1),
+-      m_refConfig(Set1),
++      m_refConfig(Custom),
+       m_etaMode(EtaSingle),
+       m_antennaRatioA(0.4),
+       m_powerUnitW(1.0),
+@@ -133,24 +197,60 @@ NrGnbEnergyModel::~NrGnbEnergyModel()
+     NS_LOG_FUNCTION(this);
+ }
+ 
++void
++NrGnbEnergyModel::DoInitialize()
++{
++    ApplyReferenceConfigSet();
++    energy::DeviceEnergyModel::DoInitialize();
++}
++
++void
++NrGnbEnergyModel::ApplyReferenceConfigSet()
++{
++    NS_LOG_FUNCTION(this);
++    if (m_refConfig == Custom)
++    {
++        return;
++    }
++    const GnbRefConfig& cfg = GNB_REF_CONFIG[m_refConfig - 1];
++    // The set is authoritative for the reference Tx power: it is the rated power
++    // of the BS class, which nothing in the scenario supplies.
++    m_refTxPowerDbm = cfg.refTxPowerDbm;
++
++    // The symbol duration, by contrast, comes from the PHY and describes what is
++    // actually simulated. Check it against the set's SCS instead of overwriting
++    // it, so a scenario that does not match the chosen reference is reported
++    // rather than silently reinterpreted.
++    if (!m_symbolDurationFromPhy)
++    {
++        return;
++    }
++    Time expected = Seconds((1e-3 / (cfg.scsKhz / 15.0)) / 14.0);
++    // Time is quantized to integer nanoseconds; numerologies differ by factors of
++    // two, so a 1% band separates them while tolerating that rounding.
++    double got = m_symbolDuration.GetSeconds();
++    NS_ABORT_MSG_IF(std::abs(got - expected.GetSeconds()) > 0.01 * expected.GetSeconds(),
++                    "PHY symbol duration " << got << " s does not match the selected TR 38.864 "
++                                           << "reference set (" << cfg.scsKhz << " kHz SCS, "
++                                           << expected.GetSeconds() << " s). The scenario and the "
++                                           << "reference set describe different base stations; use "
++                                           << "RefConfigSet=Custom to configure them separately.");
++}
++
+ double
+ NrGnbEnergyModel::GetRelativePower(NrGnbPowerState state) const
+ {
+     NS_LOG_FUNCTION(this << static_cast<int>(state));
+-    GnbPowerRow row = CAT1_SET1;
++    // A P1..P5 row is always required, so Custom (no named set) uses the Set 1
++    // row, which is what the model used before named sets became opt-in.
++    GnbPowerRow row;
+     if (m_bsCategory == BsCat1)
+     {
+-        row = (m_refConfig == Set1) ? CAT1_SET1 : (m_refConfig == Set2) ? CAT1_SET2 : CAT1_SET3;
++        row = (m_refConfig == Set2) ? CAT1_SET2 : (m_refConfig == Set3) ? CAT1_SET3 : CAT1_SET1;
+     }
+     else
+     {
+-        // TR 38.864 Table 5.1-3 only tabulates BS Category 2 for Set 1; reuse it
+-        // for the other sets until per-set Cat2 values are added.
+-        if (m_refConfig != Set1)
+-        {
+-            NS_LOG_WARN("BS Category 2 only has Set 1 power values; reusing them");
+-        }
+-        row = CAT2_SET1;
++        row = (m_refConfig == Set2) ? CAT2_SET2 : (m_refConfig == Set3) ? CAT2_SET3 : CAT2_SET1;
+     }
+ 
+     switch (state)
+@@ -165,14 +265,49 @@ NrGnbEnergyModel::GetRelativePower(NrGnbPowerState state) const
+         return row.p4;
+     case NrGnbPowerState::ActiveUl:
+         return row.p5;
+-    case NrGnbPowerState::Transitioning:
+-        // Transition power approximated as micro sleep (P3).
++    case NrGnbPowerState::Guard:
++        // A DL/UL turnaround symbol carries no transmission or reception, so it is
++        // charged at the micro-sleep level. This is NOT the TR 38.864 Table 5.1-4 /
++        // 5.1-5 sleep transition, which is an energy transient, not a power level.
+         return row.p3;
+     default:
+         NS_ABORT_MSG("Invalid gNB power state");
+     }
+ }
+ 
++bool
++NrGnbEnergyModel::IsSleepState(NrGnbPowerState state)
++{
++    return state == NrGnbPowerState::DeepSleep || state == NrGnbPowerState::LightSleep ||
++           state == NrGnbPowerState::MicroSleep;
++}
++
++double
++NrGnbEnergyModel::GetTransitionEnergyJ(NrGnbPowerState state) const
++{
++    NS_LOG_FUNCTION(this << static_cast<int>(state));
++    if (!IsSleepState(state))
++    {
++        return 0.0;
++    }
++    const GnbTransition* table = (m_bsCategory == BsCat1) ? CAT1_TRANSITION : CAT2_TRANSITION;
++    // Table 5.1-5 energy is [relative power x ms]. Convert to Joules: relative x
++    // PowerUnit_W -> W, then W x ms -> W.ms -> J (factor 1e-3).
++    return table[static_cast<int>(state)].energyRelMs * m_powerUnitW * 1e-3;
++}
++
++Time
++NrGnbEnergyModel::GetTransitionTime(NrGnbPowerState state) const
++{
++    NS_LOG_FUNCTION(this << static_cast<int>(state));
++    if (!IsSleepState(state))
++    {
++        return Seconds(0);
++    }
++    const GnbTransition* table = (m_bsCategory == BsCat1) ? CAT1_TRANSITION : CAT2_TRANSITION;
++    return table[static_cast<int>(state)].totalTime;
++}
++
+ double
+ NrGnbEnergyModel::ToWatts(double relative) const
+ {
+@@ -220,6 +355,7 @@ NrGnbEnergyModel::SetSymbolDuration(Time symbolDuration)
+ {
+     NS_LOG_FUNCTION(this << symbolDuration);
+     m_symbolDuration = symbolDuration;
++    m_symbolDurationFromPhy = true;
+ }
+ 
+ Time
+@@ -319,6 +455,12 @@ NrGnbEnergyModel::SetTxPowerDbm(double txPowerDbm)
+     m_sp = (refLin > 0.0) ? std::clamp(curLin / refLin, 0.0, 1.0) : 1.0;
+ }
+ 
++double
++NrGnbEnergyModel::GetSp() const
++{
++    return m_sp;
++}
++
+ void
+ NrGnbEnergyModel::ChangeState(int newState)
+ {
+@@ -330,7 +472,15 @@ NrGnbEnergyModel::ChangeState(int newState)
+     double durationS = (now - m_lastUpdateTime).GetSeconds();
+     m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
+     m_lastUpdateTime = now;
++    NrGnbPowerState oldState = m_currentState;
+     m_currentState = static_cast<NrGnbPowerState>(newState);
++    // TR 38.864 Table 5.1-5: charge the additional transition energy once when a
++    // sleep state is entered from a non-sleep state. The tabulated value already
++    // covers ramping down and up, so it is not charged again on wake-up.
++    if (IsSleepState(m_currentState) && !IsSleepState(oldState))
++    {
++        m_totalEnergyJ = m_totalEnergyJ + GetTransitionEnergyJ(m_currentState);
++    }
+ 
+     m_stateTrace = newState;
+     m_powerTrace = GetCurrentPowerW();
+diff --git a/model/nr-gnb-energy-model.h b/model/nr-gnb-energy-model.h
+index 8ebef1fe..9871a4c5 100644
+--- a/model/nr-gnb-energy-model.h
++++ b/model/nr-gnb-energy-model.h
+@@ -29,10 +29,13 @@ enum class NrGnbPowerState
+     DeepSleep,     //!< TR 38.864: Deep sleep  (P1)
+     LightSleep,    //!< TR 38.864: Light sleep (P2)
+     MicroSleep,    //!< TR 38.864: Micro sleep (P3) - static baseline
+-    ActiveDl,      //!< TR 38.864: Active DL   (P_DL formula)
+-    ActiveUl,      //!< TR 38.864: Active UL   (P_UL formula)
+-    Transitioning, //!< Wake-up transition (T)
+-    NumStates      //!< sentinel
++    ActiveDl,   //!< TR 38.864: Active DL   (P_DL formula)
++    ActiveUl,   //!< TR 38.864: Active UL   (P_UL formula)
++    Guard,      //!< DL/UL turnaround inside a slot. NOT a 3GPP sleep transition:
++                //!< the symbol carries neither transmission nor reception, so it
++                //!< is approximated at P3. Sleep transitions are charged as an
++                //!< energy transient instead, see GetTransitionEnergyJ().
++    NumStates   //!< sentinel
+ };
+ 
+ /**
+@@ -72,8 +75,9 @@ enum class NrGnbSymbolType
+  *     for symbol-accurate active slots; do not mix it with ChangeState() over
+  *     the same time interval or energy will be double counted.
+  *
+- * P1..P5 are stored as spec-derived tables keyed by (BsCategory, RefConfig);
+- * a single attribute default cannot encode the per-category/set values.
++ * P1..P5 are stored as spec-derived tables keyed by (BsCategory, RefConfigSet).
++ * These are two independent axes of TR 38.864 Table 5.1-3 and every combination
++ * is tabulated; a single attribute default cannot encode them.
+  */
+ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+ {
+@@ -83,8 +87,8 @@ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+      */
+     enum BsCategory
+     {
+-        BsCat1, //!< Macro / large-scale BS (e.g. 64 TxRU, 55 dBm)
+-        BsCat2  //!< Small cell / distributed unit (e.g. 2 TxRU, 33 dBm)
++        BsCat1, //!< BS Category 1 per TR 38.864 Tables 5.1-3 to 5.1-5
++        BsCat2  //!< BS Category 2 per TR 38.864 Tables 5.1-3 to 5.1-5
+     };
+ 
+     /**
+@@ -92,9 +96,10 @@ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+      */
+     enum RefConfigSet
+     {
+-        Set1, //!< FR1 TDD, 100 MHz, 30 kHz SCS, 64 DL TxRU
+-        Set2, //!< FR1 FDD, 20 MHz, 15 kHz SCS, 32 DL TxRU
+-        Set3  //!< FR2 TDD, 100 MHz, 120 kHz SCS, 2 DL TxRU
++        Custom, //!< No preset: every reference parameter as configured directly
++        Set1,   //!< FR1 TDD, 100 MHz, 30 kHz SCS, 64 DL TxRU, 55 dBm
++        Set2,   //!< FR1 FDD, 20 MHz, 15 kHz SCS, 32 DL TxRU, 49 dBm
++        Set3    //!< FR2 TDD, 100 MHz, 120 kHz SCS, 2 DL TxRU, 33 dBm
+     };
+ 
+     /**
+@@ -244,6 +249,49 @@ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+      * @return Cumulative energy in Joules (includes the open state interval).
+      */
+     double GetTotalEnergyJ() const;
++
++    /**
++     * @brief True if a state is one of the three TR 38.864 sleep levels.
++     * @param state The state to classify.
++     * @return True for DeepSleep / LightSleep / MicroSleep.
++     */
++    static bool IsSleepState(NrGnbPowerState state);
++
++    /**
++     * @brief Additional transition energy for a sleep state [J].
++     *
++     * TR 38.864 Table 5.1-5, in (relative power) x (duration in ms), scaled by
++     * PowerUnit. The tabulated value covers ramping down and ramping up together,
++     * so it is charged once when the sleep state is entered rather than at both
++     * ends. Micro sleep is immediate and costs nothing. This mirrors how
++     * NrUeEnergyModel applies the TR 38.840 Table 19 transients.
++     *
++     * @param state The sleep state being entered (0 for non-sleep states).
++     * @return Transition energy in Joules.
++     */
++    double GetTransitionEnergyJ(NrGnbPowerState state) const;
++
++    /**
++     * @brief Total transition time for a sleep state (TR 38.864 Table 5.1-4).
++     *
++     * Also covers ramping down and up together. A sleep interval shorter than
++     * this does not pay for itself, so a DRX-style controller can use it to pick
++     * a sleep depth.
++     *
++     * @param state The sleep state (zero for non-sleep states).
++     * @return Total transition time.
++     */
++    Time GetTransitionTime(NrGnbPowerState state) const;
++
++    /**
++     * @brief Get the most recently computed Tx power ratio sp.
++     *
++     * sp = currentTxPower_linear / referenceTxPower_linear, computed by
++     * SetTxPowerDbm() against the configured ReferenceTxPowerDbm attribute.
++     *
++     * @return Last sp value in [0.0, 1.0].
++     */
++    double GetSp() const;
+     /**
+      * @brief Set the OFDM symbol duration (sourced from the PHY by the listener).
+      * @param symbolDuration Duration of one OFDM symbol.
+@@ -260,6 +308,7 @@ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+ 
+   protected:
+     void DoDispose() override;
++    void DoInitialize() override;
+ 
+   private:
+     /**
+@@ -275,6 +324,18 @@ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+      */
+     double ToWatts(double relative) const;
+ 
++    /**
++     * @brief Reconcile the model with the selected TR 38.864 Table 5.1-1 set.
++     *
++     * No-op for Custom. Otherwise the set is authoritative for the reference Tx
++     * power, which nothing else in the scenario supplies. The symbol duration is
++     * validated against the set's SCS rather than overwritten: the PHY is the
++     * source of truth for what is actually simulated, so a disagreement means the
++     * scenario and the selected reference set describe different base stations,
++     * and overwriting it would hide that.
++     */
++    void ApplyReferenceConfigSet();
++
+     Ptr<energy::EnergySource> m_source; //!< Attached energy source (may be null)
+ 
+     BsCategory m_bsCategory;  //!< BS hardware category
+@@ -284,6 +345,7 @@ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+     double m_powerUnitW;      //!< Absolute scale: W per relative power-unit
+     Time m_symbolDuration;    //!< OFDM symbol duration (set from NrGnbPhy::GetSymbolPeriod)
+     double m_refTxPowerDbm;   //!< Reference Tx power for sp [dBm]
++    bool m_symbolDurationFromPhy{false}; //!< SetSymbolDuration() was called by the listener
+     double m_sa;              //!< Active TRxRU ratio; fixed at 1.0 until antenna muting is modelled
+     double m_sf;              //!< Current bandwidth utilization factor
+     double m_sp;              //!< Current Tx power ratio
+diff --git a/model/nr-gnb-phy-energy-listener.cc b/model/nr-gnb-phy-energy-listener.cc
+index 6e884cba..4a0f0077 100644
+--- a/model/nr-gnb-phy-energy-listener.cc
++++ b/model/nr-gnb-phy-energy-listener.cc
+@@ -18,7 +18,7 @@
+ #include "ns3/simulator.h"
+ 
+ #include <algorithm>
+-#include <cmath>
++
+ 
+ namespace ns3
+ {
+@@ -26,11 +26,6 @@ namespace ns3
+ NS_LOG_COMPONENT_DEFINE("NrGnbPhyEnergyListener");
+ NS_OBJECT_ENSURE_REGISTERED(NrGnbPhyEnergyListener);
+ 
+-namespace
+-{
+-constexpr uint32_t SYMBOLS_PER_SLOT = 14; //!< OFDM symbols per NR slot (normal CP)
+-} // namespace
+-
+ TypeId
+ NrGnbPhyEnergyListener::GetTypeId()
+ {
+@@ -47,7 +42,7 @@ NrGnbPhyEnergyListener::NrGnbPhyEnergyListener()
+       m_lastSp(1.0), // Default: full power (sp=1)
+       m_lastSa(1.0), // Default: all antennas active (sa=1)
+       m_totalBwpRbs(0),
+-      m_referenceTxPowerDbm(55.0) // TR 38.864 Set 1 reference; refreshed at attach
++      m_symbolsPerSlot(14) // Pre-attach default, matching NrPhy's own
+ {
+     NS_LOG_FUNCTION(this);
+ }
+@@ -64,7 +59,9 @@ NrGnbPhyEnergyListener::SetPhy(Ptr<NrGnbPhy> phy)
+     NS_ASSERT_MSG(phy, "NrGnbPhy pointer must not be null");
+     m_phy = phy;
+     m_totalBwpRbs = phy->GetRbNum();
+-    m_referenceTxPowerDbm = phy->GetTxPower();
++    // NrGnbPhy builds the slot's symbol-class map from GetSymbolsPerSlot(), so the
++    // idle count below must be derived against the same value (12 or 14).
++    m_symbolsPerSlot = phy->GetSymbolsPerSlot();
+     if (m_model)
+     {
+         m_model->SetSymbolDuration(phy->GetSymbolPeriod());
+@@ -136,7 +133,7 @@ NrGnbPhyEnergyListener::SlotEnergyStatsCallback(const SfnSf& sfnSf,
+     // use P_UL. Symbols carrying no allocation are idle (micro-sleep, P3). sa is
+     // held at 1.0 until antenna muting is modelled.
+     uint32_t scheduled = dlDataSym + ulDataSym + dlCtrlSym + ulCtrlSym;
+-    uint32_t idleSym = (scheduled < SYMBOLS_PER_SLOT) ? (SYMBOLS_PER_SLOT - scheduled) : 0;
++    uint32_t idleSym = (scheduled < m_symbolsPerSlot) ? (m_symbolsPerSlot - scheduled) : 0;
+     for (uint32_t s = 0; s < dlDataSym; ++s)
+     {
+         m_model->UpdateSymbolPower(m_lastSa, sfData, m_lastSp, NrGnbSymbolType::Dl);
+@@ -164,17 +161,14 @@ void
+ NrGnbPhyEnergyListener::RefreshSp()
+ {
+     NS_LOG_FUNCTION(this);
+-    if (!m_phy)
++    if (!m_phy || !m_model)
+     {
+         return;
+     }
+-    // sp = current Tx power / reference Tx power (linear). The reference is
+-    // captured from m_phy->GetTxPower() at attach time in SetPhy(); the
+-    // current value below is re-read each slot so runtime Tx-power changes
+-    // (e.g. power control) are reflected.
+-    double curLin = std::pow(10.0, m_phy->GetTxPower() / 10.0);
+-    double refLin = std::pow(10.0, m_referenceTxPowerDbm / 10.0);
+-    m_lastSp = (refLin > 0.0) ? std::min(1.0, curLin / refLin) : 1.0;
++    // The energy model owns the configured 3GPP reference Tx power, so it
++    // computes sp; the listener only reports the current Tx power.
++    m_model->SetTxPowerDbm(m_phy->GetTxPower());
++    m_lastSp = m_model->GetSp();
+ }
+ 
+ double
+diff --git a/model/nr-gnb-phy-energy-listener.h b/model/nr-gnb-phy-energy-listener.h
+index d35d572f..dc0544d8 100644
+--- a/model/nr-gnb-phy-energy-listener.h
++++ b/model/nr-gnb-phy-energy-listener.h
+@@ -67,7 +67,7 @@ class NrGnbPhyEnergyListener : public Object
+      * @brief Attach this listener to a gNB PHY instance.
+      *
+      * Subscribes to the NrGnbPhy "SlotEnergyStats" trace and caches the total
+-     * BWP RBs and the reference Tx power for the sp computation.
++     * BWP RBs and the slot symbol count used to classify the reported symbols.
+      *
+      * @param phy Pointer to the NrGnbPhy on the gNB node.
+      */
+@@ -158,10 +158,11 @@ class NrGnbPhyEnergyListener : public Object
+                                  uint16_t cellId);
+ 
+     /**
+-     * @brief Recompute m_lastSp from the gNB's current Tx power.
++     * @brief Push the gNB's current Tx power to the energy model and cache sp.
+      *
+-     * sp = currentTxPower_lin / referenceTxPower_lin. Tx power can change at
+-     * runtime, so this is called per slot rather than computed once.
++     * The energy model owns the configured 3GPP reference Tx power, so it
++     * computes sp; this only reports the current Tx power and reads sp back.
++     * Tx power can change at runtime, so this is called per slot.
+      */
+     void RefreshSp();
+ 
+@@ -174,8 +175,8 @@ class NrGnbPhyEnergyListener : public Object
+     double m_lastSa;   //!< Last sa: activeTRxRUs / totalTRxRUs. Fixed at 1.0
+                        //!< until antenna muting is added (no source in PHY yet).
+ 
+-    uint32_t m_totalBwpRbs;       //!< Total RBs in active BWP (from NrGnbPhy)
+-    double m_referenceTxPowerDbm; //!< Reference Tx power for sp computation
++    uint32_t m_totalBwpRbs;    //!< Total RBs in active BWP (from NrGnbPhy)
++    uint32_t m_symbolsPerSlot; //!< OFDM symbols per slot (from NrGnbPhy, 12 or 14)
+ };
+ 
+ } // namespace ns3
+diff --git a/model/nr-ue-drx-model.cc b/model/nr-ue-drx-model.cc
+index aaf9d631..16062350 100644
+--- a/model/nr-ue-drx-model.cc
++++ b/model/nr-ue-drx-model.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "nr-ue-energy-model.h"
+ 
++#include "ns3/enum.h"
+ #include "ns3/log.h"
+ #include "ns3/nstime.h"
+ #include "ns3/simulator.h"
+@@ -71,7 +72,7 @@ NrUeDrxModel::GetTypeId()
+                           "micro sleep (zero transition, TR 38.840 Table 19) is used instead.",
+                           TimeValue(MilliSeconds(6)),
+                           MakeTimeAccessor(&NrUeDrxModel::m_lightSleepThreshold),
+-                          MakeTimeChecker());
++                          MakeTimeChecker())
+             .AddAttribute("FreqRange",
+                           "Frequency range, used to pick the FR-appropriate onDuration "
+                           "when ReferenceConfig is not CUSTOM (TR 38.840 Section 8.2).",
+@@ -91,8 +92,7 @@ NrUeDrxModel::GetTypeId()
+                                           INSTANT_MSG_320MS,
+                                           "INSTANT_MSG_320MS",
+                                           VOIP_40MS,
+-                                          "VOIP_40MS"))
+-
++                                          "VOIP_40MS"));
+     return tid;
+ }
+ 
+diff --git a/model/nr-ue-energy-model.cc b/model/nr-ue-energy-model.cc
+index 4ea77608..1a487ec7 100644
+--- a/model/nr-ue-energy-model.cc
++++ b/model/nr-ue-energy-model.cc
+@@ -93,16 +93,30 @@ NrUeEnergyModel::GetTypeId()
+                           MakeEnumAccessor<FreqRange>(&NrUeEnergyModel::m_freqRange),
+                           MakeEnumChecker(FR1, "FR1", FR2, "FR2"))
+             .AddAttribute("PowerUnit",
+-                          "Absolute power of one TR 38.840 relative power-unit, in mW.",
++                          "Absolute power of one TR 38.840 relative power-unit, in mW. "
++                          "PowerUnit is a user-supplied calibration assumption. 3GPP "
++                          "provides only relative power, and does not provide the default "
++                          "value for the absolute value of the unit. Hence the result "
++                          "obtained with this default value do not represent the absolute "
++                          "energy consumption per 3GPP model.",
+                           DoubleValue(1.0),
+                           MakeDoubleAccessor(&NrUeEnergyModel::m_powerUnitMw),
+                           MakeDoubleChecker<double>(0.0))
+             .AddAttribute("ReferenceRxAntennas",
+                           "Reference receive-chain count (TR 38.840 Table 21). 0 = derive "
+                           "from FreqRange (4 for FR1, 2 for FR2).",
+-                          UintegerValue(0)
++                          UintegerValue(0),
+                           MakeUintegerAccessor(&NrUeEnergyModel::m_refRxAntennas),
+-                          MakeUintegerChecker<uint32_t>(1))
++                          MakeUintegerChecker<uint32_t>())
++            .AddAttribute("ActiveRxChains",
++                          "Powered UE receive chains for the TR 38.840 Table 21 antenna "
++                          "scaling (one 0.7 factor per halving relative to "
++                          "ReferenceRxAntennas). 0 = equal to ReferenceRxAntennas, i.e. no "
++                          "scaling. 5G-LENA does not model receive-chain adaptation, so this "
++                          "is a static configuration, not a simulated quantity.",
++                          UintegerValue(0),
++                          MakeUintegerAccessor(&NrUeEnergyModel::m_activeRxChains),
++                          MakeUintegerChecker<uint32_t>())
+             .AddAttribute("ReferenceBwpBandwidth",
+                           "Reference BWP bandwidth in MHz (TR 38.840 Section 8.1.3).",
+                           UintegerValue(100),
+@@ -141,6 +155,7 @@ NrUeEnergyModel::NrUeEnergyModel()
+       m_freqRange(FR1),
+       m_powerUnitMw(1.0),
+       m_refRxAntennas(4),
++      m_activeRxChains(0),
+       m_refBwpMhz(100),
+       m_currentState(NR_UE_DEEP_SLEEP),
+       m_lastUpdateTime(Seconds(0)),
+@@ -169,13 +184,25 @@ NrUeEnergyModel::~NrUeEnergyModel()
+ void
+ NrUeEnergyModel::DoInitialize()
+ {
+-    if (m_refRxAntennas == 0)
++    m_refRxAntennas = GetRefRxAntennas();
++    // Chain adaptation is not modelled, so unset means all reference chains on.
++    if (m_activeRxChains == 0)
+     {
+-        m_refRxAntennas = (m_freqRange == FR2) ? 2 : 4; // TR 38.840 Table 21
++        m_activeRxChains = m_refRxAntennas;
+     }
++    ApplyAntennaScaling(m_activeRxChains);
+     energy::DeviceEnergyModel::DoInitialize();
+ }
+ 
++uint32_t
++NrUeEnergyModel::GetRefRxAntennas() const
++{
++    // The attribute default is a 0 sentinel meaning "derive from FreqRange".
++    // Resolve it on demand so the scaling is correct even before DoInitialize().
++    return (m_refRxAntennas != 0) ? m_refRxAntennas
++                                  : ((m_freqRange == FR2) ? 2 : 4); // TR 38.840 Table 21
++}
++
+ double
+ NrUeEnergyModel::GetRelativePower(NrUePowerState state) const
+ {
+@@ -232,6 +259,7 @@ void
+ NrUeEnergyModel::ApplyBwpScaling(uint32_t bandwidthMhz)
+ {
+     NS_LOG_FUNCTION(this << bandwidthMhz);
++    CommitOpenInterval(); // the scaling changes the current state's power
+     m_bwpScale = ScaleBwp(bandwidthMhz);
+ }
+ 
+@@ -239,11 +267,12 @@ void
+ NrUeEnergyModel::ApplyAntennaScaling(uint32_t activeAntennas)
+ {
+     NS_LOG_FUNCTION(this << activeAntennas);
+-    NS_ASSERT_MSG(activeAntennas >= 1, "At least one receive antenna required");
++    NS_ASSERT_MSG(activeAntennas >= 1, "At least one receive chain required");
++    CommitOpenInterval(); // the scaling changes the current state's power
+     // Each halving of the receive chains relative to the reference applies one
+     // 0.7 factor (TR 38.840 Section 8.1.3: P_2Rx = 0.7 * P_4Rx, etc.).
+     double factor = 1.0;
+-    uint32_t ant = m_refRxAntennas;
++    uint32_t ant = GetRefRxAntennas();
+     while (ant > activeAntennas && ant > 1)
+     {
+         factor *= 0.7;
+@@ -257,6 +286,7 @@ NrUeEnergyModel::ApplyBdReduction(double alpha)
+ {
+     NS_LOG_FUNCTION(this << alpha);
+     NS_ASSERT_MSG(alpha > 0.0 && alpha <= 1.0, "alpha must be in (0, 1]");
++    CommitOpenInterval(); // the reduction changes the current state's power
+     // TR 38.840 Section 8.1.3: P(alpha) = alpha*Pt + (1-alpha)*0.7*Pt.
+     m_bdScale = alpha + (1.0 - alpha) * 0.7;
+ }
+@@ -265,6 +295,7 @@ void
+ NrUeEnergyModel::SetUlTxPowerDbm(double txPowerDbm)
+ {
+     NS_LOG_FUNCTION(this << txPowerDbm);
++    CommitOpenInterval(); // the level changes the UL state's power
+     if (m_freqRange == FR2)
+     {
+         m_ulRelativePower = UE_POWER_FR2[NR_UE_UL_TX];
+@@ -276,6 +307,25 @@ NrUeEnergyModel::SetUlTxPowerDbm(double txPowerDbm)
+         UE_UL_POWER_FR1_0DBM + frac * (UE_UL_POWER_FR1_23DBM - UE_UL_POWER_FR1_0DBM);
+ }
+ 
++void
++NrUeEnergyModel::CommitOpenInterval()
++{
++    NS_LOG_FUNCTION(this);
++    // Close the interval that has been running at the current power, before
++    // anything changes that power. Callers must invoke this *before* mutating the
++    // state or any scaling factor, so the elapsed time is charged at the power
++    // that was actually in effect over it.
++    Time now = Simulator::Now();
++    double durationS = (now - m_lastUpdateTime).GetSeconds();
++    m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
++    m_stateTimeS[m_currentState] += durationS;
++    m_lastUpdateTime = now;
++    if (m_source)
++    {
++        m_source->UpdateEnergySource();
++    }
++}
++
+ bool
+ NrUeEnergyModel::IsSleepState(NrUePowerState state)
+ {
+@@ -296,16 +346,13 @@ NrUeEnergyModel::ChangeState(int newState)
+     NS_LOG_FUNCTION(this << newState);
+     NS_ASSERT_MSG(newState >= 0 && newState < NR_UE_NUM_STATES, "Invalid UE state");
+ 
+-    Time now = Simulator::Now();
+-    double durationS = (now - m_lastUpdateTime).GetSeconds();
+-    // Accrue the energy and the occupancy time of the state we are leaving.
+-    m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
+-    m_stateTimeS[m_currentState] += durationS;
+-    m_lastUpdateTime = now;
+-    if (m_source)
++    if (static_cast<NrUePowerState>(newState) == m_currentState)
+     {
+-        m_source->UpdateEnergySource();
++        return;
+     }
++
++    // Accrue the energy and the occupancy time of the state we are leaving.
++    CommitOpenInterval();
+     NrUePowerState oldState = m_currentState;
+     m_currentState = static_cast<NrUePowerState>(newState);
+     // TR 38.840 Table 19: charge the additional transition energy once when
+@@ -329,7 +376,11 @@ NrUeEnergyModel::GetCurrentPowerW() const
+ {
+     NS_LOG_FUNCTION(this);
+     double w = GetStatePowerW(m_currentState);
+-    if (Simulator::Now() < m_transitionEndTime)
++    // The transient covers [trigger, end]. This value charges the interval that
++    // ends at "now", so the bound is inclusive: an accrual landing exactly on the
++    // end time still had the transient active for the whole interval it commits.
++    // EndTransition() splits the interval there, so no interval ever straddles.
++    if (Simulator::Now() <= m_transitionEndTime)
+     {
+         w += m_transitionExtraW; // transition transient riding on top of the state
+     }
+@@ -357,7 +408,11 @@ NrUeEnergyModel::TriggerTransition(double extraPowerW, Time duration)
+     m_transitionExtraW = extraPowerW;
+     m_transitionEndTime = now + duration;
+     m_powerTrace = GetCurrentPowerW();
+-    Simulator::Schedule(duration, &NrUeEnergyModel::EndTransition, this);
++    // Re-triggering while a transient is in flight extends it. Drop the pending
++    // end event first: otherwise it would fire at the original end time and clear
++    // the extended transient early.
++    m_transitionEvent.Cancel();
++    m_transitionEvent = Simulator::Schedule(duration, &NrUeEnergyModel::EndTransition, this);
+ }
+ 
+ void
+@@ -486,6 +541,7 @@ void
+ NrUeEnergyModel::DoDispose()
+ {
+     NS_LOG_FUNCTION(this);
++    m_transitionEvent.Cancel();
+     m_source = nullptr;
+     energy::DeviceEnergyModel::DoDispose();
+ }
+diff --git a/model/nr-ue-energy-model.h b/model/nr-ue-energy-model.h
+index 9fc62b61..8cce2929 100644
+--- a/model/nr-ue-energy-model.h
++++ b/model/nr-ue-energy-model.h
+@@ -12,6 +12,7 @@
+ #define NR_UE_ENERGY_MODEL_H
+ 
+ #include "ns3/device-energy-model.h"
++#include "ns3/event-id.h"
+ #include "ns3/nstime.h"
+ #include "ns3/traced-value.h"
+ 
+@@ -116,16 +117,21 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+      * with linear interpolation between. Result is not allowed to scale the
+      * active power below the BWP transition floor (50 power-units).
+      *
++     * This is the spec curve on its own: const and free of side effects, so the
++     * formula can be asserted directly against the TR 38.840 anchors without
++     * mutating the model. ApplyBwpScaling() is the command that caches it.
++     *
+      * @param bandwidthMhz Active BWP bandwidth in MHz.
+      * @return Multiplicative scaling factor in (0, 1].
+      */
+     double ScaleBwp(uint32_t bandwidthMhz) const;
+ 
+     /**
+-     * @brief Cache the BWP scaling factor for the active reception states.
++     * @brief Cache the ScaleBwp() factor for the active reception states.
+      *
+-     * Called by NrUePhyEnergyListener whenever the active BWP bandwidth
+-     * changes, so a BWP switch is reflected in the UE power draw.
++     * The command half of the pair above: called by NrUePhyEnergyListener
++     * whenever the active BWP bandwidth changes, so a BWP switch is reflected in
++     * the UE power draw.
+      *
+      * @param bandwidthMhz New active BWP bandwidth in MHz.
+      */
+@@ -137,7 +143,10 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+      * FR1: P_2Rx = 0.7 * P_4Rx. FR2: P_1Rx = 0.7 * P_2Rx. Each halving of the
+      * active receive chains relative to the reference applies one 0.7 factor.
+      *
+-     * @param activeAntennas Number of active receive antennas.
++     * Takes powered RF receive chains, NOT the MIMO rank: spatial layers are
++     * unrelated to how many chains are on, and Table 21 scales with the latter.
++     *
++     * @param activeAntennas Number of powered receive chains (>= 1).
+      */
+     void ApplyAntennaScaling(uint32_t activeAntennas);
+ 
+@@ -219,23 +228,14 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+ 
+     // ----- Transition transients -----
+ 
+-    /**
+-     * @brief Charge a transition transient (e.g. the RRC connection-setup spike).
+-     *
+-     * Adds @p extraPowerW on top of the current state power for @p duration,
+-     * then settles back, modelling the high-power burst hardware shows on a
+-     * sleep->active transition.
+-     *
+-     * @param extraPowerW Additional transient power [W].
+-     * @param duration    How long the transient lasts.
+-     */
+-    void TriggerTransition(double extraPowerW, Time duration);
+-
+     /**
+      * @brief Fire the configured setup/RRC transient (SetupTransitionPower/Time).
+      *
+-     * Convenience wrapper used by NrUePhyEnergyListener when the UE wakes from
+-     * deep sleep on a transport block. No-op if SetupTransitionPower is 0.
++     * Called by NrUePhyEnergyListener when the UE wakes from deep sleep on a
++     * transport block. This is the public entry point: the transient is
++     * configured through the SetupTransitionPower / SetupTransitionTime
++     * attributes, so callers do not supply the values themselves. No-op if
++     * SetupTransitionPower is 0.
+      */
+     void TriggerSetupTransition();
+ 
+@@ -257,6 +257,12 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+      */
+     double DoGetCurrentA() const override;
+ 
++    /**
++     * @brief Reference receive-chain count, resolving the 0 = derive sentinel.
++     * @return m_refRxAntennas, or the FreqRange default if it is still unset.
++     */
++    uint32_t GetRefRxAntennas() const;
++
+     /**
+      * @brief True if a state is an active DL reception state (gets scaled).
+      * @param state The state to classify.
+@@ -264,6 +270,30 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+      */
+     static bool IsActiveDlState(NrUePowerState state);
+ 
++    /**
++     * @brief Charge a transition transient (e.g. the RRC connection-setup spike).
++     *
++     * Adds @p extraPowerW on top of the current state power for @p duration,
++     * then settles back, modelling the high-power burst hardware shows on a
++     * sleep->active transition. This is the general mechanism; the transients
++     * the model actually fires are driven through TriggerSetupTransition(), so
++     * that the values stay owned by the attributes rather than by callers.
++     *
++     * @param extraPowerW Additional transient power [W].
++     * @param duration    How long the transient lasts.
++     */
++    void TriggerTransition(double extraPowerW, Time duration);
++
++    /**
++     * @brief Commit the interval running at the current power, and advance.
++     *
++     * Must be called *before* changing the state or any scaling factor, so the
++     * elapsed time is charged at the power actually in effect over it. Without
++     * it, a mid-state change to a scaling factor would retroactively re-price the
++     * whole open interval, and GetTotalEnergyJ() could even decrease.
++     */
++    void CommitOpenInterval();
++
+     /**
+      * @brief End the current transition transient: commit its energy, settle.
+      */
+@@ -287,7 +317,8 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+ 
+     FreqRange m_freqRange;    //!< FR1 or FR2 power table selector
+     double m_powerUnitMw;     //!< Absolute scale: mW per relative power-unit
+-    uint32_t m_refRxAntennas; //!< Reference receive antennas (TR 38.840 8.1.3)
++    uint32_t m_refRxAntennas;  //!< Reference receive antennas (TR 38.840 8.1.3)
++    uint32_t m_activeRxChains; //!< Powered receive chains; 0 = same as reference
+     uint32_t m_refBwpMhz;     //!< Reference BWP bandwidth in MHz (100)
+ 
+     NrUePowerState m_currentState; //!< Current power state
+@@ -303,6 +334,7 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+ 
+     double m_transitionExtraW;      //!< Transient extra power during a transition [W]
+     Time m_transitionEndTime;       //!< End time of the current transition transient
++    EventId m_transitionEvent;      //!< Pending EndTransition event (cancelled on re-trigger)
+     double m_setupTransitionPowerW; //!< Default setup/RRC transient power [W] (0 = off)
+     Time m_setupTransitionTime;     //!< Default setup/RRC transient duration
+ 
+diff --git a/model/nr-ue-phy-energy-listener.cc b/model/nr-ue-phy-energy-listener.cc
+index 0d6ee165..da8685e0 100644
+--- a/model/nr-ue-phy-energy-listener.cc
++++ b/model/nr-ue-phy-energy-listener.cc
+@@ -14,12 +14,12 @@
+ #include "nr-ue-energy-model.h"
+ #include "nr-ue-phy.h"
+ 
++#include "ns3/boolean.h"
+ #include "ns3/log.h"
+ #include "ns3/simulator.h"
+ 
+ namespace ns3
+ {
+-constexpr int64_t NR_SYMBOLS_PER_SLOT = 14; //!< OFDM symbols per NR slot
+ NS_LOG_COMPONENT_DEFINE("NrUePhyEnergyListener");
+ NS_OBJECT_ENSURE_REGISTERED(NrUePhyEnergyListener);
+ 
+@@ -29,13 +29,26 @@ NrUePhyEnergyListener::GetTypeId()
+     static TypeId tid = TypeId("ns3::NrUePhyEnergyListener")
+                             .SetParent<Object>()
+                             .SetGroupName("Nr")
+-                            .AddConstructor<NrUePhyEnergyListener>();
++                            .AddConstructor<NrUePhyEnergyListener>()
++                            .AddAttribute("UseRankAsRxChains",
++                                          "OPTIONAL non-3GPP approximation: treat the reported "
++                                          "MIMO rank as the number of powered receive chains and "
++                                          "re-apply the TR 38.840 Table 21 antenna scaling on each "
++                                          "downlink transport block. Spatial layers and RF chains "
++                                          "are different quantities and the spec defines no such "
++                                          "mapping, so this is off by default; the 3GPP behaviour "
++                                          "is the static NrUeEnergyModel::ActiveRxChains.",
++                                          BooleanValue(false),
++                                          MakeBooleanAccessor(
++                                              &NrUePhyEnergyListener::m_useRankAsRxChains),
++                                          MakeBooleanChecker());
+     return tid;
+ }
+ 
+ NrUePhyEnergyListener::NrUePhyEnergyListener()
+     : m_slotDuration(MilliSeconds(1)),
+-      m_lastBwpMhz(0)
++      m_lastBwpMhz(0),
++      m_useRankAsRxChains(false)
+ {
+     NS_LOG_FUNCTION(this);
+ }
+@@ -122,10 +135,10 @@ NrUePhyEnergyListener::DlTbReceivedCallback(uint64_t imsi,
+         m_model->TriggerSetupTransition();
+     }
+     RefreshBwpScaling();
+-    // Scale active-reception power by the spatial layers actually in use.
+-    // TR 38.840 Section 8.1.3 antenna scaling is over Rx branches; rank <= Rx
+-    // branches, so this refines the existing antenna knob (active-layer scaling).
+-    if (rank >= 1)
++    // Table 21 scales with powered receive chains, which 5G-LENA does not model;
++    // that count is a static configuration on the energy model. Rank counts
++    // spatial layers, so it drives the scaling only if the user opts in.
++    if (m_useRankAsRxChains && rank >= 1)
+     {
+         m_model->ApplyAntennaScaling(rank);
+     }
+@@ -134,13 +147,11 @@ NrUePhyEnergyListener::DlTbReceivedCallback(uint64_t imsi,
+     {
+         m_drx->NotifyDataActivity();
+     }
+-    // Hold full DL reception only for the allocated symbols, then fall back
+-    // to PDCCH-only monitoring for the rest of the slot.
+-    Time active = (numSym > 0) ? m_slotDuration * static_cast<int64_t>(numSym) / NR_SYMBOLS_PER_SLOT
+-                               : m_slotDuration;
+-    Time end = Simulator::Now() + active;
++    // TR 38.840 Table 18/20 values are averaged over the operations within a slot
++    // (Release 16, p.63), so the active value is charged for the whole slot.
++    Time end = Simulator::Now() + m_slotDuration;
+     m_activeUntil = std::max(m_activeUntil, end);
+-    Simulator::Schedule(active, &NrUePhyEnergyListener::ReturnToMonitoring, this);
++    Simulator::Schedule(m_slotDuration, &NrUePhyEnergyListener::ReturnToMonitoring, this);
+ }
+ 
+ void
+@@ -165,12 +176,9 @@ NrUePhyEnergyListener::UlTbSentCallback(uint64_t imsi,
+     {
+         m_drx->NotifyDataActivity();
+     }
+-    // Active only for the allocated UL symbols.
+-    Time active = (numSym > 0) ? m_slotDuration * static_cast<int64_t>(numSym) / NR_SYMBOLS_PER_SLOT
+-                               : m_slotDuration;
+-    Time end = Simulator::Now() + active;
++    Time end = Simulator::Now() + m_slotDuration;
+     m_activeUntil = std::max(m_activeUntil, end);
+-    Simulator::Schedule(active, &NrUePhyEnergyListener::ReturnToMonitoring, this);
++    Simulator::Schedule(m_slotDuration, &NrUePhyEnergyListener::ReturnToMonitoring, this);
+ }
+ 
+ void
+diff --git a/model/nr-ue-phy-energy-listener.h b/model/nr-ue-phy-energy-listener.h
+index c22c0c20..96558e3e 100644
+--- a/model/nr-ue-phy-energy-listener.h
++++ b/model/nr-ue-phy-energy-listener.h
+@@ -25,8 +25,9 @@ namespace ns3
+ class NrUePhy;
+ class NrUeEnergyModel;
+ class NrUeDrxModel;
+-class NrUePhyEnergyListenerDlDurationTestCase;
+-class NrUePhyEnergyListenerRankScalingTestCase;
++class NrUePhyEnergyListenerSlotAveragedDurationTestCase;
++class NrUePhyEnergyListenerRankDefaultOffTestCase;
++class NrUePhyEnergyListenerRankOptInTestCase;
+ 
+ /**
+  * @ingroup nr
+@@ -46,6 +47,11 @@ class NrUePhyEnergyListenerRankScalingTestCase;
+  * bandwidth and re-applies NrUeEnergyModel::ApplyBwpScaling() when it
+  * changed, so BWP switches are reflected in the UE power draw.
+  *
++ * The TR 38.840 Table 21 receive-chain scaling is NOT driven from here by
++ * default: 5G-LENA has no receive-chain adaptation, so the powered-chain count
++ * is the static NrUeEnergyModel::ActiveRxChains configuration. UseRankAsRxChains
++ * enables an optional, explicitly non-3GPP mapping of MIMO rank onto it instead.
++ *
+  * Design rationale:
+  *   - This class must NOT be aware of the energy formula internals.
+  *     It only knows: event occurred, extract parameters, notify model.
+@@ -111,8 +117,9 @@ class NrUePhyEnergyListener : public Object
+ 
+   private:
+     // Unit tests drive the private PHY callbacks directly.
+-    friend class NrUePhyEnergyListenerDlDurationTestCase;
+-    friend class NrUePhyEnergyListenerRankScalingTestCase;
++    friend class NrUePhyEnergyListenerSlotAveragedDurationTestCase;
++    friend class NrUePhyEnergyListenerRankDefaultOffTestCase;
++    friend class NrUePhyEnergyListenerRankOptInTestCase;
+ 
+     /**
+      * @brief UE DL driver, connected to NrUePhy "ReportDownlinkTbSize".
+@@ -125,8 +132,9 @@ class NrUePhyEnergyListener : public Object
+      * @param imsi     UE IMSI.
+      * @param tbSize   Downlink transport block size in bytes (0 = nothing).
+      * @param symStart First OFDM symbol of the DL allocation.
+-     * @param numSym   Number of OFDM symbols in the DL allocation.
+-     * @param rank     Number of MIMO layers (receive chains) in use.
++     * @param numSym   OFDM symbols in the DL allocation. Not used for the active
++     *                 duration: Table 18/20 powers are already slot-averaged.
++     * @param rank     Number of MIMO layers in use.
+      */
+     void DlTbReceivedCallback(uint64_t imsi,
+                               uint32_t tbSize,
+@@ -145,8 +153,9 @@ class NrUePhyEnergyListener : public Object
+      * @param imsi     UE IMSI.
+      * @param tbSize   Uplink transport block size in bytes (0 = nothing).
+      * @param symStart First OFDM symbol of the UL allocation.
+-     * @param numSym   Number of OFDM symbols in the UL allocation.
+-     * @param rank     Number of MIMO layers (transmit chains) in use.
++     * @param numSym   OFDM symbols in the UL allocation. Not used for the active
++     *                 duration: Table 18/20 powers are already slot-averaged.
++     * @param rank     Number of MIMO layers in use.
+      */
+     void UlTbSentCallback(uint64_t imsi,
+                           uint32_t tbSize,
+@@ -177,7 +186,8 @@ class NrUePhyEnergyListener : public Object
+ 
+     Time m_slotDuration; //!< Cached slot period (for the return timer)
+     Time m_activeUntil{Seconds(0)};
+-    uint32_t m_lastBwpMhz; //!< Last BWP bandwidth applied to the model [MHz]
++    uint32_t m_lastBwpMhz;    //!< Last BWP bandwidth applied to the model [MHz]
++    bool m_useRankAsRxChains; //!< Opt-in: map MIMO rank onto the Table 21 scaling
+ };
+ 
+ } // namespace ns3
+diff --git a/test/nr-test-energy-models.cc b/test/nr-test-energy-models.cc
+index 9a3f68bf..95032bb5 100644
+--- a/test/nr-test-energy-models.cc
++++ b/test/nr-test-energy-models.cc
+@@ -5,13 +5,16 @@
+ //
+ // Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ 
++#include "ns3/double.h"
+ #include "ns3/enum.h"
+ #include "ns3/nr-gnb-energy-model.h"
+ #include "ns3/nr-ue-drx-model.h"
+ #include "ns3/nr-ue-energy-model.h"
+ #include "ns3/nstime.h"
+ #include "ns3/simulator.h"
++#include "ns3/string.h"
+ #include "ns3/test.h"
++#include "ns3/uinteger.h"
+ 
+ #include <string>
+ #include <vector>
+@@ -106,7 +109,7 @@ NrUeEnergyModelPowerTestCase::DoRun()
+     Ptr<NrUeEnergyModel> fr2 = CreateObject<NrUeEnergyModel>();
+     fr2->SetAttribute("FreqRange", EnumValue(NrUeEnergyModel::FR2));
+     NS_TEST_ASSERT_MSG_EQ_TOL(fr2->GetRelativePower(NR_UE_PDCCH_ONLY), 175.0, 1e-9, "FR2 PDCCH");
+-    NS_TEST_ASSERT_MSG_EQ_TOL(fr2->GetRelativePower(NR_UE_MICRO_SLEEP), 38.0, 1e-9, "FR2 micro");
++    NS_TEST_ASSERT_MSG_EQ_TOL(fr2->GetRelativePower(NR_UE_MICRO_SLEEP), 45.0, 1e-9, "FR2 micro");
+     fr2->SetUlTxPowerDbm(5.0);
+     NS_TEST_ASSERT_MSG_EQ_TOL(fr2->GetRelativePower(NR_UE_UL_TX),
+                               350.0,
+@@ -114,6 +117,127 @@ NrUeEnergyModelPowerTestCase::DoRun()
+                               "FR2 UL is level-independent");
+ }
+ 
++/**
++ * @brief TR 38.840 Table 21 receive-chain scaling from an explicit configuration.
++ *
++ * Halving the powered chains relative to the reference applies one 0.7 factor,
++ * so FR1 with 2 of the reference 4 chains draws 0.7 of the 4Rx power.
++ */
++class NrUeEnergyModelRxChainScalingTestCase : public TestCase
++{
++  public:
++    NrUeEnergyModelRxChainScalingTestCase()
++        : TestCase("NrUeEnergyModel Table 21 scaling from ActiveRxChains")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrUeEnergyModelRxChainScalingTestCase::DoRun()
++{
++    // Unset ActiveRxChains means all reference chains powered -> no scaling.
++    Ptr<NrUeEnergyModel> full = CreateObject<NrUeEnergyModel>();
++    full->Initialize();
++    double p4Rx = full->GetStatePowerW(NR_UE_PDCCH_PDSCH);
++
++    Ptr<NrUeEnergyModel> half = CreateObject<NrUeEnergyModel>();
++    half->SetAttribute("ActiveRxChains", UintegerValue(2));
++    half->Initialize();
++    double p2Rx = half->GetStatePowerW(NR_UE_PDCCH_PDSCH);
++
++    NS_TEST_ASSERT_MSG_GT(p4Rx, 0.0, "reference active power must be positive");
++    NS_TEST_ASSERT_MSG_EQ_TOL(p2Rx / p4Rx, 0.7, 1e-9, "FR1 P_2Rx must be 0.7 * P_4Rx");
++}
++
++/**
++ * @brief A transition transient costs extraPower x duration, once.
++ *
++ * The transient rides on top of the state power, so every power query inside its
++ * window includes it. That must not turn into extra energy: interleaved state
++ * changes only split the interval, they do not re-charge it. Re-triggering while
++ * one is in flight extends the window rather than being cut short by the pending
++ * end event.
++ */
++class NrUeEnergyModelTransientTestCase : public TestCase
++{
++  public:
++    NrUeEnergyModelTransientTestCase()
++        : TestCase("NrUeEnergyModel transition transient charges exactly once")
++    {
++    }
++
++  private:
++    void DoRun() override;
++    /// Run one scenario and return the total energy [J].
++    double Run(uint32_t nChanges, bool transient, bool reTrigger);
++};
++
++double
++NrUeEnergyModelTransientTestCase::Run(uint32_t nChanges, bool transient, bool reTrigger)
++{
++    Ptr<NrUeEnergyModel> ue = CreateObject<NrUeEnergyModel>();
++    if (transient)
++    {
++        ue->SetAttribute("SetupTransitionPower", DoubleValue(1.0)); // 1 W extra
++        ue->SetAttribute("SetupTransitionTime", TimeValue(MilliSeconds(5)));
++    }
++    Simulator::Schedule(MilliSeconds(100), [ue, transient]() {
++        if (transient)
++        {
++            ue->TriggerSetupTransition();
++        }
++        ue->ChangeState(NR_UE_PDCCH_PDSCH);
++    });
++    // Redundant state changes across and past the transient window. The last of
++    // these lands exactly on the transition end time, which is the case that used
++    // to lose the final sliver of transient energy.
++    for (uint32_t i = 1; i <= nChanges; ++i)
++    {
++        Simulator::Schedule(MilliSeconds(100) + MicroSeconds(100 * i),
++                            [ue]() { ue->ChangeState(NR_UE_PDCCH_PDSCH); });
++    }
++    if (reTrigger)
++    {
++        Simulator::Schedule(MilliSeconds(102), [ue]() { ue->TriggerSetupTransition(); });
++    }
++    Simulator::Stop(MilliSeconds(200));
++    Simulator::Run();
++    double energyJ = ue->GetTotalEnergyJ();
++    Simulator::Destroy();
++    return energyJ;
++}
++
++void
++NrUeEnergyModelTransientTestCase::DoRun()
++{
++    double base = Run(0, false, false);
++
++    // 1 W for 5 ms = 5 mJ on top of the state energy, however the interval is cut.
++    NS_TEST_ASSERT_MSG_EQ_TOL(Run(0, true, false) - base,
++                              0.005,
++                              1e-12,
++                              "transient alone must cost extraPower x duration");
++    NS_TEST_ASSERT_MSG_EQ_TOL(Run(60, true, false) - base,
++                              0.005,
++                              1e-12,
++                              "interleaved state changes must not change the transient cost");
++
++    // Re-triggering at 102 ms extends the window to 107 ms: 7 ms in total.
++    NS_TEST_ASSERT_MSG_EQ_TOL(Run(0, true, true) - base,
++                              0.007,
++                              1e-12,
++                              "re-triggering must extend the transient, not truncate it");
++
++    // Interleaved state changes must not change the no-transient baseline either.
++    NS_TEST_ASSERT_MSG_EQ_TOL(Run(60, false, false),
++                              base,
++                              1e-12,
++                              "state changes alone must not create energy");
++}
++
+ /**
+  * @brief State-change energy integration and occupancy accounting.
+  */
+@@ -149,8 +273,10 @@ NrUeEnergyModelAccountingTestCase::DoRun()
+     Simulator::Stop(Seconds(3));
+     Simulator::Run();
+ 
+-    // E = 1e-3*1 + 0.1*1 + 1e-3*1 = 0.102 J (open interval included).
+-    NS_TEST_ASSERT_MSG_EQ_TOL(m_ue->GetTotalEnergyJ(), 0.102, 1e-9, "integrated energy");
++    // State energy: 1e-3*1 + 0.1*1 + 1e-3*1 = 0.102 J (open interval included),
++    // plus the TR 38.840 Table 19 deep-sleep transition charged on entering deep
++    // sleep at t=2: 450 [relative power x ms] x 1 mW/unit = 4.5e-4 J.
++    NS_TEST_ASSERT_MSG_EQ_TOL(m_ue->GetTotalEnergyJ(), 0.10245, 1e-9, "integrated energy");
+     NS_TEST_ASSERT_MSG_EQ_TOL(m_ue->GetStateTimeFraction(NR_UE_DEEP_SLEEP),
+                               2.0 / 3.0,
+                               1e-9,
+@@ -165,6 +291,216 @@ NrUeEnergyModelAccountingTestCase::DoRun()
+     Simulator::Destroy();
+ }
+ 
++/**
++ * @brief Full TR 38.864 Table 5.1-3 coverage over both table axes.
++ *
++ * BS category and reference configuration set are independent axes and every
++ * combination is tabulated, so all six rows must be distinct and ordered
++ * P1 < P2 < P3 < P5 < P4. Deep and light sleep are merged cells in the table:
++ * one value per category, shared by all three sets.
++ */
++class NrGnbEnergyModelPowerTableTestCase : public TestCase
++{
++  public:
++    NrGnbEnergyModelPowerTableTestCase()
++        : TestCase("NrGnbEnergyModel TR 38.864 Table 5.1-3 for every category and set")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrGnbEnergyModelPowerTableTestCase::DoRun()
++{
++    // TR 38.864 Table 5.1-3, indexed [category][set] as {P1, P2, P3, P4, P5}.
++    const double table[2][3][5] = {
++        {{1.0, 25.0, 55.0, 280.0, 110.0},
++         {1.0, 25.0, 50.0, 200.0, 90.0},
++         {1.0, 25.0, 38.0, 152.0, 80.0}},
++        {{1.0, 2.1, 5.5, 32.0, 6.5}, {1.0, 2.1, 5.0, 26.0, 5.8}, {1.0, 2.1, 3.0, 17.6, 4.2}},
++    };
++    const std::string cats[2] = {"BsCat1", "BsCat2"};
++    const std::string sets[3] = {"Set1", "Set2", "Set3"};
++
++    for (uint32_t c = 0; c < 2; ++c)
++    {
++        for (uint32_t s = 0; s < 3; ++s)
++        {
++            Ptr<NrGnbEnergyModel> gnb = CreateObject<NrGnbEnergyModel>();
++            gnb->SetAttribute("BsCategory", StringValue(cats[c]));
++            gnb->SetAttribute("RefConfigSet", StringValue(sets[s]));
++            std::string ctx = cats[c] + "/" + sets[s];
++
++            double p1 = gnb->GetRelativePower(NrGnbPowerState::DeepSleep);
++            double p2 = gnb->GetRelativePower(NrGnbPowerState::LightSleep);
++            double p3 = gnb->GetRelativePower(NrGnbPowerState::MicroSleep);
++            double p4 = gnb->GetRelativePower(NrGnbPowerState::ActiveDl);
++            double p5 = gnb->GetRelativePower(NrGnbPowerState::ActiveUl);
++
++            NS_TEST_ASSERT_MSG_EQ_TOL(p1, table[c][s][0], 1e-9, "P1 " << ctx);
++            NS_TEST_ASSERT_MSG_EQ_TOL(p2, table[c][s][1], 1e-9, "P2 " << ctx);
++            NS_TEST_ASSERT_MSG_EQ_TOL(p3, table[c][s][2], 1e-9, "P3 " << ctx);
++            NS_TEST_ASSERT_MSG_EQ_TOL(p4, table[c][s][3], 1e-9, "P4 " << ctx);
++            NS_TEST_ASSERT_MSG_EQ_TOL(p5, table[c][s][4], 1e-9, "P5 " << ctx);
++
++            // Sleep depths and the DL/UL split must stay ordered in every row.
++            NS_TEST_ASSERT_MSG_LT(p1, p2, "P1 must be below P2 for " << ctx);
++            NS_TEST_ASSERT_MSG_LT(p2, p3, "P2 must be below P3 for " << ctx);
++            NS_TEST_ASSERT_MSG_LT(p3, p5, "P3 must be below P5 for " << ctx);
++            NS_TEST_ASSERT_MSG_LT(p5, p4, "P5 must be below P4 for " << ctx);
++        }
++    }
++}
++
++/**
++ * @brief A named TR 38.864 Table 5.1-1 set fixes the reference Tx power.
++ *
++ * The set is authoritative for the reference power, which nothing in the
++ * scenario supplies; Custom (the default) leaves it as configured, so existing
++ * configurations keep their meaning.
++ */
++class NrGnbEnergyModelRefConfigBundleTestCase : public TestCase
++{
++  public:
++    NrGnbEnergyModelRefConfigBundleTestCase()
++        : TestCase("NrGnbEnergyModel named reference set fixes the reference Tx power")
++    {
++    }
++
++  private:
++    void DoRun() override;
++    /// sp at a given actual Tx power, for the model under test.
++    double SpAt(Ptr<NrGnbEnergyModel> gnb, double txDbm);
++};
++
++double
++NrGnbEnergyModelRefConfigBundleTestCase::SpAt(Ptr<NrGnbEnergyModel> gnb, double txDbm)
++{
++    gnb->SetTxPowerDbm(txDbm);
++    return gnb->GetSp();
++}
++
++void
++NrGnbEnergyModelRefConfigBundleTestCase::DoRun()
++{
++    // Set 3 is the FR2 small cell: 33 dBm reference. A gNB transmitting at its
++    // own reference power must report sp = 1, not the ~0.006 it would get if the
++    // reference were left at the Set 1 macro value of 55 dBm.
++    Ptr<NrGnbEnergyModel> set3 = CreateObject<NrGnbEnergyModel>();
++    set3->SetAttribute("RefConfigSet", StringValue("Set3"));
++    set3->Initialize();
++    NS_TEST_ASSERT_MSG_EQ_TOL(SpAt(set3, 33.0), 1.0, 1e-9, "Set 3 reference must be 33 dBm");
++
++    Ptr<NrGnbEnergyModel> set2 = CreateObject<NrGnbEnergyModel>();
++    set2->SetAttribute("RefConfigSet", StringValue("Set2"));
++    set2->Initialize();
++    NS_TEST_ASSERT_MSG_EQ_TOL(SpAt(set2, 49.0), 1.0, 1e-9, "Set 2 reference must be 49 dBm");
++
++    Ptr<NrGnbEnergyModel> set1 = CreateObject<NrGnbEnergyModel>();
++    set1->SetAttribute("RefConfigSet", StringValue("Set1"));
++    set1->Initialize();
++    NS_TEST_ASSERT_MSG_EQ_TOL(SpAt(set1, 55.0), 1.0, 1e-9, "Set 1 reference must be 55 dBm");
++
++    // Custom is the default and must not touch a user-supplied reference.
++    Ptr<NrGnbEnergyModel> custom = CreateObject<NrGnbEnergyModel>();
++    custom->SetAttribute("ReferenceTxPowerDbm", DoubleValue(40.0));
++    custom->Initialize();
++    NS_TEST_ASSERT_MSG_EQ_TOL(SpAt(custom, 40.0), 1.0, 1e-9, "Custom must keep the set value");
++
++    // Custom must also keep the pre-existing Set 1 power row, so that defaulting
++    // to Custom does not change what an existing configuration computes.
++    NS_TEST_ASSERT_MSG_EQ_TOL(custom->GetRelativePower(NrGnbPowerState::ActiveDl),
++                              280.0,
++                              1e-9,
++                              "Custom must keep the Set 1 power row");
++}
++
++/**
++ * @brief TR 38.864 Table 5.1-4 / 5.1-5 sleep transitions, and the Guard state.
++ *
++ * The transition is an energy and a time charged when a sleep state is entered,
++ * not a power level. Guard is the DL/UL turnaround and is unrelated to it.
++ */
++class NrGnbEnergyModelTransitionTestCase : public TestCase
++{
++  public:
++    NrGnbEnergyModelTransitionTestCase()
++        : TestCase("NrGnbEnergyModel TR 38.864 sleep transition energy and Guard state")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrGnbEnergyModelTransitionTestCase::DoRun()
++{
++    Ptr<NrGnbEnergyModel> cat1 = CreateObject<NrGnbEnergyModel>();
++
++    // Table 5.1-5, BS Category 1, PowerUnit = 1 W: energy is [relative x ms].
++    NS_TEST_ASSERT_MSG_EQ_TOL(cat1->GetTransitionEnergyJ(NrGnbPowerState::DeepSleep),
++                              1.0,
++                              1e-12,
++                              "Cat 1 deep sleep: 1000 x 1 W x 1 ms");
++    NS_TEST_ASSERT_MSG_EQ_TOL(cat1->GetTransitionEnergyJ(NrGnbPowerState::LightSleep),
++                              0.09,
++                              1e-12,
++                              "Cat 1 light sleep: 90 x 1 W x 1 ms");
++    NS_TEST_ASSERT_MSG_EQ_TOL(cat1->GetTransitionEnergyJ(NrGnbPowerState::MicroSleep),
++                              0.0,
++                              1e-12,
++                              "micro sleep is immediate");
++    // Table 5.1-4 total transition times.
++    NS_TEST_ASSERT_MSG_EQ(cat1->GetTransitionTime(NrGnbPowerState::DeepSleep),
++                          MilliSeconds(50),
++                          "Cat 1 deep sleep transition time");
++    NS_TEST_ASSERT_MSG_EQ(cat1->GetTransitionTime(NrGnbPowerState::LightSleep),
++                          MilliSeconds(6),
++                          "Cat 1 light sleep transition time");
++
++    Ptr<NrGnbEnergyModel> cat2 = CreateObject<NrGnbEnergyModel>();
++    cat2->SetAttribute("BsCategory", StringValue("BsCat2"));
++    NS_TEST_ASSERT_MSG_EQ_TOL(cat2->GetTransitionEnergyJ(NrGnbPowerState::DeepSleep),
++                              17.0,
++                              1e-12,
++                              "Cat 2 deep sleep: 17000 x 1 W x 1 ms");
++    NS_TEST_ASSERT_MSG_EQ(cat2->GetTransitionTime(NrGnbPowerState::DeepSleep),
++                          Seconds(10),
++                          "Cat 2 deep sleep transition time");
++
++    // Guard is the DL/UL turnaround: charged at P3, and it is not a sleep state,
++    // so entering it must not charge any transition energy.
++    NS_TEST_ASSERT_MSG_EQ_TOL(cat1->GetRelativePower(NrGnbPowerState::Guard),
++                              cat1->GetRelativePower(NrGnbPowerState::MicroSleep),
++                              1e-12,
++                              "Guard is charged at P3");
++    NS_TEST_ASSERT_MSG_EQ_TOL(cat1->GetTransitionEnergyJ(NrGnbPowerState::Guard),
++                              0.0,
++                              1e-12,
++                              "Guard is not a 3GPP sleep transition");
++
++    // Entering deep sleep from active charges the transition once; waking does not
++    // charge it again, since the tabulated value covers both ramp directions.
++    Ptr<NrGnbEnergyModel> gnb = CreateObject<NrGnbEnergyModel>();
++    gnb->ChangeState(static_cast<int>(NrGnbPowerState::ActiveDl));
++    double before = gnb->GetTotalEnergyJ();
++    gnb->ChangeState(static_cast<int>(NrGnbPowerState::DeepSleep));
++    double afterSleep = gnb->GetTotalEnergyJ();
++    NS_TEST_ASSERT_MSG_EQ_TOL(afterSleep - before,
++                              1.0,
++                              1e-12,
++                              "entering deep sleep charges the Table 5.1-5 energy once");
++    gnb->ChangeState(static_cast<int>(NrGnbPowerState::ActiveDl));
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetTotalEnergyJ() - afterSleep,
++                              0.0,
++                              1e-12,
++                              "waking must not charge the transition energy a second time");
++    Simulator::Destroy();
++}
++
+ /**
+  * @brief TR 38.864 Section 5.1 gNB power formulas.
+  */
+@@ -229,12 +565,26 @@ class NrGnbEnergyModelSlotAccumTestCase : public TestCase
+ 
+   private:
+     void DoRun() override;
++    /// Assert the committed slot energy once the slot has actually elapsed.
++    void CheckCommitted(double expectedJ);
++
++    Ptr<NrGnbEnergyModel> m_gnb; //!< Model under test
+ };
+ 
++void
++NrGnbEnergyModelSlotAccumTestCase::CheckCommitted(double expectedJ)
++{
++    NS_TEST_ASSERT_MSG_EQ_TOL(m_gnb->GetTotalEnergyJ(),
++                              expectedJ,
++                              1e-12,
++                              "full DL slot energy committed");
++}
++
+ void
+ NrGnbEnergyModelSlotAccumTestCase::DoRun()
+ {
+-    Ptr<NrGnbEnergyModel> gnb = CreateObject<NrGnbEnergyModel>();
++    Ptr<NrGnbEnergyModel>& gnb = m_gnb;
++    gnb = CreateObject<NrGnbEnergyModel>();
+ 
+     // Numerology 1: slot = 0.5 ms, symbol = 0.5 ms / 14. GetSymbolDuration()
+     // returns an ns-3 Time, which is quantized to the simulator resolution
+@@ -258,12 +608,21 @@ NrGnbEnergyModelSlotAccumTestCase::DoRun()
+         gnb->UpdateSymbolPower(1.0, 1.0, 1.0, NrGnbSymbolType::Dl);
+     }
+     gnb->FinalizeSlotEnergy();
++    // FinalizeSlotEnergy() converts the accumulated symbols into an average power
++    // for the slot that follows, rather than adding the energy up front, so the
++    // total is only observable once that slot has actually elapsed.
+     NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetTotalEnergyJ(),
+-                              280.0 * slotS,
++                              0.0,
+                               1e-12,
+-                              "full DL slot energy committed");
+-
++                              "no energy is committed in advance of the slot");
++    Simulator::Schedule(Seconds(slotS),
++                        &NrGnbEnergyModelSlotAccumTestCase::CheckCommitted,
++                        this,
++                        280.0 * slotS);
++    Simulator::Stop(Seconds(slotS));
++    Simulator::Run();
+     Simulator::Destroy();
++    m_gnb = nullptr;
+ }
+ 
+ /**
+@@ -356,7 +715,12 @@ class NrEnergyModelsTestSuite : public TestSuite
+         : TestSuite("nr-energy-models", Type::UNIT)
+     {
+         AddTestCase(new NrUeEnergyModelPowerTestCase(), Duration::QUICK);
++        AddTestCase(new NrUeEnergyModelRxChainScalingTestCase(), Duration::QUICK);
++        AddTestCase(new NrUeEnergyModelTransientTestCase(), Duration::QUICK);
+         AddTestCase(new NrUeEnergyModelAccountingTestCase(), Duration::QUICK);
++        AddTestCase(new NrGnbEnergyModelPowerTableTestCase(), Duration::QUICK);
++        AddTestCase(new NrGnbEnergyModelRefConfigBundleTestCase(), Duration::QUICK);
++        AddTestCase(new NrGnbEnergyModelTransitionTestCase(), Duration::QUICK);
+         AddTestCase(new NrGnbEnergyModelFormulaTestCase(), Duration::QUICK);
+         AddTestCase(new NrGnbEnergyModelSlotAccumTestCase(), Duration::QUICK);
+         AddTestCase(new NrUeDrxModelCycleTestCase(), Duration::QUICK);
+diff --git a/test/nr-test-ue-phy-energy-listener.cc b/test/nr-test-ue-phy-energy-listener.cc
+index f8aa1fc5..43724db4 100644
+--- a/test/nr-test-ue-phy-energy-listener.cc
++++ b/test/nr-test-ue-phy-energy-listener.cc
+@@ -5,6 +5,7 @@
+ //
+ // Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ 
++#include "ns3/boolean.h"
+ #include "ns3/nr-ue-energy-model.h"
+ #include "ns3/nr-ue-phy-energy-listener.h"
+ #include "ns3/simulator.h"
+@@ -18,14 +19,14 @@
+  * events and the UE energy model.
+  *
+  * Besides the registration / disposal contract, these tests drive the private
+- * DL callback directly (the two behavioural test cases are declared friends of
+- * the listener) to cover the two spec-consistent refinements added on top of
+- * the plain TR 38.840 mapping:
+- *   - symbol-accurate active duration: a DL transport block keeps the UE in
+- *     full PDCCH+PDSCH reception only for its allocated OFDM symbols, not the
+- *     whole slot
+- *   - MIMO-rank scaling: the active-reception power is scaled by the number of
+- *     spatial layers actually in use (TR 38.840 Section 8.1.3 antenna scaling).
++ * DL callback directly (the behavioural test cases are declared friends of the
++ * listener) to cover two properties of the TR 38.840 mapping:
++ *   - slot-averaged active duration: Table 18/20 powers are already averaged over
++ *     the operations within a slot, so a transport block holds the active state
++ *     for the whole slot rather than for its allocated OFDM symbols
++ *   - receive-chain scaling: the Table 21 antenna scaling comes from the static
++ *     NrUeEnergyModel::ActiveRxChains configuration, and the reported MIMO rank
++ *     does not touch it unless UseRankAsRxChains is set.
+  */
+ namespace ns3
+ {
+@@ -89,57 +90,54 @@ NrUePhyEnergyListenerDisposeTestCase::DoRun()
+ }
+ 
+ /**
+- * @brief A DL transport block must keep the UE in PDCCH+PDSCH reception only for
+- *        its allocated OFDM symbols, then fall back to PDCCH-only monitoring.
++ * @brief A DL transport block holds the active state for the whole slot.
+  *
+- * With no PHY attached the listener uses the 1 ms default slot period, so a
+- * 2-of-14-symbol allocation stays active for 2/14 ms (~142.857 us). A whole-slot
+- * model would still be active at 500 us; the symbol-accurate one is not.
++ * TR 38.840 Table 18 powers are averaged over the operations within a slot
++ * (Release 16, p.63)
+  */
+-class NrUePhyEnergyListenerDlDurationTestCase : public TestCase
++class NrUePhyEnergyListenerSlotAveragedDurationTestCase : public TestCase
+ {
+   public:
+-    NrUePhyEnergyListenerDlDurationTestCase()
+-        : TestCase("NrUePhyEnergyListener holds DL reception for the allocated symbols only")
++    NrUePhyEnergyListenerSlotAveragedDurationTestCase()
++        : TestCase("NrUePhyEnergyListener holds the slot-averaged power for the whole slot")
+     {
+     }
+ 
+   private:
+     void DoRun() override;
+-    /// Assert the UE is still in full DL reception (sampled mid-allocation).
++    /// Assert the UE is still in full DL reception (sampled inside the slot).
+     void CheckActive();
+-    /// Assert the UE has fallen back to PDCCH-only (sampled after the allocation).
++    /// Assert the UE has fallen back to PDCCH-only (sampled after the slot).
+     void CheckReturned();
+ 
+     Ptr<NrUeEnergyModel> m_model; //!< model driven by the listener under test
+ };
+ 
+ void
+-NrUePhyEnergyListenerDlDurationTestCase::CheckActive()
++NrUePhyEnergyListenerSlotAveragedDurationTestCase::CheckActive()
+ {
+     NS_TEST_ASSERT_MSG_EQ(m_model->GetCurrentState(),
+                           NR_UE_PDCCH_PDSCH,
+-                          "UE must stay in PDCCH+PDSCH for the allocated symbols");
++                          "slot-averaged Table 18 power must be held for the whole slot");
+ }
+ 
+ void
+-NrUePhyEnergyListenerDlDurationTestCase::CheckReturned()
++NrUePhyEnergyListenerSlotAveragedDurationTestCase::CheckReturned()
+ {
+     NS_TEST_ASSERT_MSG_EQ(m_model->GetCurrentState(),
+                           NR_UE_PDCCH_ONLY,
+-                          "UE must return to PDCCH-only after the allocated symbols, "
+-                          "not hold the whole slot");
++                          "UE must return to PDCCH-only after the slot");
+ }
+ 
+ void
+-NrUePhyEnergyListenerDlDurationTestCase::DoRun()
++NrUePhyEnergyListenerSlotAveragedDurationTestCase::DoRun()
+ {
+     m_model = CreateObject<NrUeEnergyModel>();
+     Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
+     listener->SetEnergyModel(m_model);
+     // No SetPhy(): slot period stays at the 1 ms default and BWP refresh is a no-op.
+ 
+-    // DL TB using 2 of the 14 symbols at t = 0 -> active for 2/14 ms (~142.857 us).
++    // DL TB using 2 of the 14 symbols at t = 0 -> active for the whole 1 ms slot.
+     listener->DlTbReceivedCallback(/*imsi*/ 1,
+                                    /*tbSize*/ 100,
+                                    /*symStart*/ 0,
+@@ -149,14 +147,14 @@ NrUePhyEnergyListenerDlDurationTestCase::DoRun()
+                           NR_UE_PDCCH_PDSCH,
+                           "DL TB should move the UE to full PDCCH+PDSCH reception");
+ 
+-    // 50 us: inside the 2-symbol window -> still active.
+-    Simulator::Schedule(NanoSeconds(50000),
+-                        &NrUePhyEnergyListenerDlDurationTestCase::CheckActive,
+-                        this);
+-    // 500 us: past the 2-symbol window but still inside the 1 ms slot -> a
+-    // whole-slot model would be active here, the symbol-accurate one is not.
++    // 500 us: past the 2-symbol window but inside the slot -> still active. A
++    // numSym-proportional model would already have returned to monitoring here.
+     Simulator::Schedule(NanoSeconds(500000),
+-                        &NrUePhyEnergyListenerDlDurationTestCase::CheckReturned,
++                        &NrUePhyEnergyListenerSlotAveragedDurationTestCase::CheckActive,
++                        this);
++    // 1.001 ms: just past the slot -> back to PDCCH-only monitoring.
++    Simulator::Schedule(NanoSeconds(1001000),
++                        &NrUePhyEnergyListenerSlotAveragedDurationTestCase::CheckReturned,
+                         this);
+     Simulator::Run();
+     Simulator::Destroy();
+@@ -164,18 +162,56 @@ NrUePhyEnergyListenerDlDurationTestCase::DoRun()
+ }
+ 
+ /**
+- * @brief A DL transport block must scale the UE active-reception power by the
+- *        number of MIMO layers (rank) actually in use.
++ * @brief By default the reported MIMO rank must NOT change the UE active power.
++ *
++ * TR 38.840 Table 21 scales with powered receive chains, not spatial layers, so
++ * a rank-1 TB must draw exactly what a rank-4 one draws.
++ */
++class NrUePhyEnergyListenerRankDefaultOffTestCase : public TestCase
++{
++  public:
++    NrUePhyEnergyListenerRankDefaultOffTestCase()
++        : TestCase("NrUePhyEnergyListener leaves the antenna scaling alone by default")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrUePhyEnergyListenerRankDefaultOffTestCase::DoRun()
++{
++    Ptr<NrUeEnergyModel> model = CreateObject<NrUeEnergyModel>();
++    Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
++    listener->SetEnergyModel(model);
++    model->Initialize();
++
++    listener->DlTbReceivedCallback(1, 100, 0, 14, /*rank*/ 4);
++    double pRank4 = model->GetStatePowerW(NR_UE_PDCCH_PDSCH);
++
++    listener->DlTbReceivedCallback(1, 100, 0, 14, /*rank*/ 1);
++    double pRank1 = model->GetStatePowerW(NR_UE_PDCCH_PDSCH);
++
++    NS_TEST_ASSERT_MSG_GT(pRank4, 0.0, "active power must be positive");
++    NS_TEST_ASSERT_MSG_EQ_TOL(pRank1,
++                              pRank4,
++                              1e-12,
++                              "rank must not scale the active power by default");
++    Simulator::Destroy();
++}
++
++/**
++ * @brief With UseRankAsRxChains set, rank drives the Table 21 scaling.
+  *
+- * With the reference receive-antenna count at its default of 4, a full-rank
+- * (rank 4) TB draws the reference power, and a rank-1 TB draws 0.7^2 = 0.49 of
+- * it (one 0.7 factor per halving of the active receive chains, 4 -> 2 -> 1).
++ * Opt-in, explicitly non-3GPP: against the FR1 reference of 4 chains, rank 1
++ * applies two 0.7 factors (4 -> 2 -> 1).
+  */
+-class NrUePhyEnergyListenerRankScalingTestCase : public TestCase
++class NrUePhyEnergyListenerRankOptInTestCase : public TestCase
+ {
+   public:
+-    NrUePhyEnergyListenerRankScalingTestCase()
+-        : TestCase("NrUePhyEnergyListener scales UE active power by MIMO rank")
++    NrUePhyEnergyListenerRankOptInTestCase()
++        : TestCase("NrUePhyEnergyListener maps rank onto Table 21 when opted in")
+     {
+     }
+ 
+@@ -184,25 +220,25 @@ class NrUePhyEnergyListenerRankScalingTestCase : public TestCase
+ };
+ 
+ void
+-NrUePhyEnergyListenerRankScalingTestCase::DoRun()
++NrUePhyEnergyListenerRankOptInTestCase::DoRun()
+ {
+     Ptr<NrUeEnergyModel> model = CreateObject<NrUeEnergyModel>();
+     Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
++    listener->SetAttribute("UseRankAsRxChains", BooleanValue(true));
+     listener->SetEnergyModel(model);
++    model->Initialize();
+ 
+-    // Full-rank DL TB: ApplyAntennaScaling(4) with the reference of 4 -> factor 1.0.
+     listener->DlTbReceivedCallback(1, 100, 0, 14, /*rank*/ 4);
+-    double pFull = model->GetStatePowerW(NR_UE_PDCCH_PDSCH);
++    double pRank4 = model->GetStatePowerW(NR_UE_PDCCH_PDSCH);
+ 
+-    // Rank-1 DL TB: ApplyAntennaScaling(1) -> two halvings from 4 -> 0.7^2 = 0.49.
+     listener->DlTbReceivedCallback(1, 100, 0, 14, /*rank*/ 1);
+     double pRank1 = model->GetStatePowerW(NR_UE_PDCCH_PDSCH);
+ 
+-    NS_TEST_ASSERT_MSG_GT(pFull, 0.0, "reference active power must be positive");
+-    NS_TEST_ASSERT_MSG_EQ_TOL(pRank1 / pFull,
++    NS_TEST_ASSERT_MSG_GT(pRank4, 0.0, "active power must be positive");
++    NS_TEST_ASSERT_MSG_EQ_TOL(pRank1 / pRank4,
+                               0.49,
+                               1e-9,
+-                              "rank-1 active power must be 0.7^2 of the full-rank power");
++                              "opted-in rank-1 power must be 0.7^2 of the rank-4 power");
+     Simulator::Destroy();
+ }
+ 
+@@ -217,8 +253,9 @@ class NrUePhyEnergyListenerTestSuite : public TestSuite
+     {
+         AddTestCase(new NrUePhyEnergyListenerCreationTestCase(), Duration::QUICK);
+         AddTestCase(new NrUePhyEnergyListenerDisposeTestCase(), Duration::QUICK);
+-        AddTestCase(new NrUePhyEnergyListenerDlDurationTestCase(), Duration::QUICK);
+-        AddTestCase(new NrUePhyEnergyListenerRankScalingTestCase(), Duration::QUICK);
++        AddTestCase(new NrUePhyEnergyListenerSlotAveragedDurationTestCase(), Duration::QUICK);
++        AddTestCase(new NrUePhyEnergyListenerRankDefaultOffTestCase(), Duration::QUICK);
++        AddTestCase(new NrUePhyEnergyListenerRankOptInTestCase(), Duration::QUICK);
+     }
+ };
+ 
+-- 
+2.43.0
+

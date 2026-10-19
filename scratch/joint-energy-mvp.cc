@@ -7,6 +7,12 @@
 #include "ns3/flow-monitor-module.h"
 #include "ns3/lte-module.h"
 #include "ns3/nr-module.h"
+#include "ns3/basic-energy-source-helper.h"
+#include "ns3/device-energy-model-container.h"
+#include "ns3/energy-source-container.h"
+#include "ns3/nr-energy-helper.h"
+#include "ns3/nr-ue-drx-model.h"
+#include "ns3/nr-ue-energy-model.h"
 #include <iomanip>
 #include <fstream>
 #include <vector>
@@ -28,16 +34,14 @@ enum BwpState {
     BWP_WIDE_100MHZ  = 1
 };
 
-struct BwpPowerProfile {
-    double pRxMw;
-    double pMicroSleepMw;
+struct BwpResourceProfile {
     uint32_t prbCount;
     double channelBwMhz;
 };
 
-const BwpPowerProfile g_bwpPowerProfiles[] = {
-    {120.0, 20.0, 51,  20.0},
-    {250.0, 45.0, 273, 100.0}
+const BwpResourceProfile g_bwpResourceProfiles[] = {
+    {51,  20.0},
+    {273, 100.0}
 };
 
 class RlIpcClient
@@ -325,7 +329,7 @@ private:
         uint32_t usableRbgs = totalRbgs;
         if (m_bwp == BWP_NARROW_20MHZ)
         {
-            uint32_t requestedPrbs = g_bwpPowerProfiles[m_bwp].prbCount;
+            uint32_t requestedPrbs = g_bwpResourceProfiles[m_bwp].prbCount;
             usableRbgs = std::min(totalRbgs,
                                   static_cast<uint32_t>(std::ceil(
                                       static_cast<double>(requestedPrbs) / rbPerRbg)));
@@ -347,13 +351,12 @@ private:
     BwpState m_bwp;
 };
 
-class UeEnergyTracker;
-class GnbSlotEnergyTracker;
+class OfficialEnergyMetrics;
 
 class DynamicDtxController
 {
 public:
-    DynamicDtxController(PacketDelayTracker* tracker, UeEnergyTracker* ueTracker, GnbSlotEnergyTracker* gnbTracker,
+    DynamicDtxController(PacketDelayTracker* tracker, OfficialEnergyMetrics* energyMetrics,
                          RadioResourceController* radioController, double totalDataRateMbps,
                          bool enableDciDynamic = false,
                          bool enableBwpDynamic = false, bool enableRlIpc = false, int ipcPort = 5555,
@@ -364,8 +367,7 @@ public:
                          std::string timelineCsvName = "active_window_timeline.csv",
                          double warmupMs = 200.0)
         : m_tracker(tracker),
-          m_ueTracker(ueTracker),
-          m_gnbTracker(gnbTracker),
+          m_energyMetrics(energyMetrics),
           m_radioController(radioController),
           m_totalDataRateMbps(totalDataRateMbps),
           m_enableDciDynamic(enableDciDynamic),
@@ -441,8 +443,7 @@ private:
     }
 
     PacketDelayTracker* m_tracker;
-    UeEnergyTracker* m_ueTracker;
-    GnbSlotEnergyTracker* m_gnbTracker;
+    OfficialEnergyMetrics* m_energyMetrics;
     RadioResourceController* m_radioController;
     double m_totalDataRateMbps;
     bool m_enableDciDynamic;
@@ -468,6 +469,7 @@ private:
     RlIpcClient* m_ipcClient;
 };
 
+#if 0 // Archived in custom-energy-v4-checkpoint-2026-10-19; never compiled in v5.
 class GnbSlotEnergyTracker
 {
 public:
@@ -727,12 +729,136 @@ private:
     std::vector<uint64_t> m_lastRxBytesPerUe;
     std::vector<double> m_ueEnergyJoules;
 };
+#endif
+
+// Read-only metrics adapter around the official 5G-LENA energy models.  It does
+// not estimate power: every value comes from NrGnbEnergyModel/NrUeEnergyModel.
+class OfficialEnergyMetrics
+{
+public:
+    OfficialEnergyMetrics(energy::DeviceEnergyModelContainer gnbModels,
+                          energy::DeviceEnergyModelContainer ueModels,
+                          NodeContainer ueNodes,
+                          BwpState initialBwp)
+        : m_gnbModels(gnbModels),
+          m_ueModels(ueModels),
+          m_ueNodes(ueNodes),
+          m_windowStart(Seconds(0)),
+          m_windowGnbEnergyJ(0.0),
+          m_windowUeEnergyJ(0.0)
+    {
+        UpdateBwpState(initialBwp);
+        ResetWindowStats();
+    }
+
+    double GetTotalGnbEnergyJ() const
+    {
+        double total = 0.0;
+        for (uint32_t i = 0; i < m_gnbModels.GetN(); ++i)
+        {
+            total += m_gnbModels.Get(i)->GetTotalEnergyConsumption();
+        }
+        return total;
+    }
+
+    double GetTotalUeEnergyJ() const
+    {
+        double total = 0.0;
+        for (uint32_t i = 0; i < m_ueModels.GetN(); ++i)
+        {
+            total += m_ueModels.Get(i)->GetTotalEnergyConsumption();
+        }
+        return total;
+    }
+
+    double GetAvgGnbPowerW() const
+    {
+        const double elapsed = Simulator::Now().GetSeconds();
+        return elapsed > 0.0 ? GetTotalGnbEnergyJ() / elapsed : 0.0;
+    }
+
+    double GetAvgUePowerMwPerUe() const
+    {
+        const double elapsed = Simulator::Now().GetSeconds();
+        return elapsed > 0.0 && m_ueModels.GetN() > 0
+                   ? GetTotalUeEnergyJ() / elapsed / m_ueModels.GetN() * 1000.0
+                   : 0.0;
+    }
+
+    double GetWindowAvgGnbPowerW() const
+    {
+        const double elapsed = (Simulator::Now() - m_windowStart).GetSeconds();
+        return elapsed > 0.0
+                   ? (GetTotalGnbEnergyJ() - m_windowGnbEnergyJ) / elapsed
+                   : 0.0;
+    }
+
+    double GetWindowAvgUePowerMwPerUe() const
+    {
+        const double elapsed = (Simulator::Now() - m_windowStart).GetSeconds();
+        return elapsed > 0.0 && m_ueModels.GetN() > 0
+                   ? (GetTotalUeEnergyJ() - m_windowUeEnergyJ) / elapsed /
+                         m_ueModels.GetN() * 1000.0
+                   : 0.0;
+    }
+
+    void ResetWindowStats()
+    {
+        m_windowStart = Simulator::Now();
+        m_windowGnbEnergyJ = GetTotalGnbEnergyJ();
+        m_windowUeEnergyJ = GetTotalUeEnergyJ();
+    }
+
+    void UpdateDynamicOnDurationMs(double onDurationMs)
+    {
+        for (uint32_t i = 0; i < m_ueNodes.GetN(); ++i)
+        {
+            Ptr<NrUeDrxModel> drx = m_ueNodes.Get(i)->GetObject<NrUeDrxModel>();
+            if (drx)
+            {
+                drx->SetAttribute("OnDuration", TimeValue(MilliSeconds(onDurationMs)));
+            }
+        }
+    }
+
+    void UpdateBwpState(BwpState bwp)
+    {
+        const uint32_t bandwidthMhz = bwp == BWP_WIDE_100MHZ ? 100 : 20;
+        for (uint32_t i = 0; i < m_ueModels.GetN(); ++i)
+        {
+            Ptr<NrUeEnergyModel> model = DynamicCast<NrUeEnergyModel>(m_ueModels.Get(i));
+            NS_ABORT_MSG_IF(!model, "NrEnergyHelper returned a non-NR UE energy model");
+            model->ApplyBwpScaling(bandwidthMhz);
+        }
+    }
+
+    double GetUeEnergyJ(uint32_t ueIndex) const
+    {
+        return ueIndex < m_ueModels.GetN()
+                   ? m_ueModels.Get(ueIndex)->GetTotalEnergyConsumption()
+                   : 0.0;
+    }
+
+    double GetBatteryConsumptionMah(double batteryVoltageV = 3.7) const
+    {
+        return batteryVoltageV > 0.0
+                   ? GetTotalUeEnergyJ() / (batteryVoltageV * 3.6)
+                   : 0.0;
+    }
+
+private:
+    energy::DeviceEnergyModelContainer m_gnbModels;
+    energy::DeviceEnergyModelContainer m_ueModels;
+    NodeContainer m_ueNodes;
+    Time m_windowStart;
+    double m_windowGnbEnergyJ;
+    double m_windowUeEnergyJ;
+};
 
 void DynamicDtxController::BeginControl()
 {
     if (m_tracker) m_tracker->ResetWindowStats();
-    if (m_gnbTracker) m_gnbTracker->ResetWindowStats();
-    if (m_ueTracker) m_ueTracker->ResetWindowStats();
+    if (m_energyMetrics) m_energyMetrics->ResetWindowStats();
 
     if (m_enableRlIpc)
     {
@@ -803,22 +929,17 @@ void DynamicDtxController::EvaluateAndAdjust()
 
         if (m_enableDciDynamic)
         {
-            if (m_ueTracker) m_ueTracker->UpdateDynamicOnDurationMs(m_currentActiveMs);
+            if (m_energyMetrics) m_energyMetrics->UpdateDynamicOnDurationMs(m_currentActiveMs);
         }
-        if (m_enableBwpDynamic && m_ueTracker)
+        if (m_enableBwpDynamic && m_energyMetrics)
         {
-            m_ueTracker->UpdateBwpState(m_currentBwp);
-        }
-        if (m_enableBwpDynamic && m_gnbTracker)
-        {
-            m_gnbTracker->UpdateBwpState(m_currentBwp);
+            m_energyMetrics->UpdateBwpState(m_currentBwp);
         }
     }
 
     AppendTimeline(totalPending, rlcBacklogBytes);
     if (m_tracker) m_tracker->ResetWindowStats();
-    if (m_gnbTracker) m_gnbTracker->ResetWindowStats();
-    if (m_ueTracker) m_ueTracker->ResetWindowStats();
+    if (m_energyMetrics) m_energyMetrics->ResetWindowStats();
 
     Simulator::Schedule(Seconds(m_evalIntervalSec), &DynamicDtxController::EvaluateAndAdjust, this);
 }
@@ -841,13 +962,12 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
                                    ? m_tracker->GetWindowDeliveredRateMbps(m_evalIntervalSec)
                                    : 0.0;
     double p99DelayMs = m_tracker ? m_tracker->GetWindowP99Latency() : 0.0;
-    double gnbPowerW = m_gnbTracker ? m_gnbTracker->GetWindowAvgPower() : 24.5;
-    double uePowerMw = m_ueTracker ? m_ueTracker->GetWindowAvgPowerMwPerUe() : 55.0;
+    double gnbPowerW = m_energyMetrics ? m_energyMetrics->GetWindowAvgGnbPowerW() : 0.0;
+    double uePowerMw = m_energyMetrics ? m_energyMetrics->GetWindowAvgUePowerMwPerUe() : 0.0;
     double jainFairness = 0.74;
 
     if (m_tracker) m_tracker->ResetWindowStats();
-    if (m_gnbTracker) m_gnbTracker->ResetWindowStats();
-    if (m_ueTracker) m_ueTracker->ResetWindowStats();
+    if (m_energyMetrics) m_energyMetrics->ResetWindowStats();
 
     int actionIdx = m_ipcClient->StepIpc((double)rlcBacklogBytes,
                                          (double)dlStats.maxUeBufferBytes,
@@ -886,15 +1006,11 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
 
         if (m_enableDciDynamic)
         {
-            if (m_ueTracker) m_ueTracker->UpdateDynamicOnDurationMs(m_currentActiveMs);
+            if (m_energyMetrics) m_energyMetrics->UpdateDynamicOnDurationMs(m_currentActiveMs);
         }
-        if (m_enableBwpDynamic && m_ueTracker)
+        if (m_enableBwpDynamic && m_energyMetrics)
         {
-            m_ueTracker->UpdateBwpState(m_currentBwp);
-        }
-        if (m_enableBwpDynamic && m_gnbTracker)
-        {
-            m_gnbTracker->UpdateBwpState(m_currentBwp);
+            m_energyMetrics->UpdateBwpState(m_currentBwp);
         }
     }
 
@@ -964,14 +1080,12 @@ int main(int argc, char *argv[])
     double burstMeanOnMs = 80.0;
     double burstMeanOffMs = 120.0;
     double gnbTxPowerDbm = 30.0;
-    double gnbP0ActiveW = 150.0;
-    double gnbPMicroSleepW = 15.0;
-    double gnbPTxMaxW = 40.0;
-    double gnbDeltaP = 4.7;
-    double gnbNarrowCapacityMbps = 100.0;
-    double gnbWideCapacityMbps = 100.0;
-    double gnbWideActivePowerOverheadW = 0.0;
-    double gnbWideSleepPowerOverheadW = 0.0;
+    std::string gnbEnergyBsCategory = "BsCat1";
+    std::string gnbEnergyRefConfig = "Set1";
+    std::string gnbEnergyEtaMode = "Dual";
+    double gnbEnergyAntennaRatio = 0.4;
+    double gnbEnergyPowerUnitW = 1.0;
+    double ueEnergyPowerUnitMw = 1.0;
     bool enableGating = true;
     bool enableQueueAware = false;
     bool enableCdrx = false;
@@ -1010,14 +1124,12 @@ int main(int argc, char *argv[])
     cmd.AddValue("burstMeanOnMs", "Mean burst On duration in ms", burstMeanOnMs);
     cmd.AddValue("burstMeanOffMs", "Mean burst Off duration in ms", burstMeanOffMs);
     cmd.AddValue("gnbTxPowerDbm", "gNB downlink transmission power in dBm", gnbTxPowerDbm);
-    cmd.AddValue("gnbP0ActiveW", "gNB active baseline power in watts", gnbP0ActiveW);
-    cmd.AddValue("gnbPMicroSleepW", "gNB micro-sleep power in watts", gnbPMicroSleepW);
-    cmd.AddValue("gnbPTxMaxW", "gNB maximum RF transmit-power term in watts", gnbPTxMaxW);
-    cmd.AddValue("gnbDeltaP", "gNB load-dependent power slope", gnbDeltaP);
-    cmd.AddValue("gnbNarrowCapacityMbps", "Energy-model reference capacity for 20 MHz BWP", gnbNarrowCapacityMbps);
-    cmd.AddValue("gnbWideCapacityMbps", "Energy-model reference capacity for 100 MHz BWP", gnbWideCapacityMbps);
-    cmd.AddValue("gnbWideActivePowerOverheadW", "Additional active power for 100 MHz BWP", gnbWideActivePowerOverheadW);
-    cmd.AddValue("gnbWideSleepPowerOverheadW", "Additional sleep power for 100 MHz BWP", gnbWideSleepPowerOverheadW);
+    cmd.AddValue("gnbEnergyBsCategory", "TR 38.864 BS category (BsCat1 or BsCat2)", gnbEnergyBsCategory);
+    cmd.AddValue("gnbEnergyRefConfig", "TR 38.864 reference set (Set1 for this 100 MHz mu=1 scenario)", gnbEnergyRefConfig);
+    cmd.AddValue("gnbEnergyEtaMode", "TR 38.864 PA efficiency mode (Single or Dual)", gnbEnergyEtaMode);
+    cmd.AddValue("gnbEnergyAntennaRatio", "TR 38.864 antenna dynamic-power fraction A", gnbEnergyAntennaRatio);
+    cmd.AddValue("gnbEnergyPowerUnitW", "Absolute watts per TR 38.864 relative power unit", gnbEnergyPowerUnitW);
+    cmd.AddValue("ueEnergyPowerUnitMw", "Absolute mW per TR 38.840 relative power unit", ueEnergyPowerUnitMw);
     cmd.AddValue("enableGating", "Enable Cell-DTX Scheduler Gating", enableGating);
     cmd.AddValue("enableQueueAware", "Enable Closed-Loop Dynamic Controller", enableQueueAware);
     cmd.AddValue("enableCdrx", "Enable UE C-DRX Energy Saving Mode", enableCdrx);
@@ -1057,14 +1169,12 @@ int main(int argc, char *argv[])
     NS_ABORT_MSG_IF(controllerInitialActiveMs < controllerMinActiveMs ||
                         controllerInitialActiveMs > controllerMaxActiveMs,
                     "controllerInitialActiveMs must be inside the controller min/max range");
-    NS_ABORT_MSG_IF(gnbP0ActiveW < 0.0 || gnbPMicroSleepW < 0.0 ||
-                        gnbPTxMaxW < 0.0 || gnbDeltaP < 0.0,
-                    "gNB power-model parameters cannot be negative");
-    NS_ABORT_MSG_IF(gnbNarrowCapacityMbps <= 0.0 || gnbWideCapacityMbps <= 0.0,
-                    "gNB energy-model capacities must be greater than zero");
-    NS_ABORT_MSG_IF(gnbWideActivePowerOverheadW < 0.0 ||
-                        gnbWideSleepPowerOverheadW < 0.0,
-                    "gNB wide-BWP power overheads cannot be negative");
+    NS_ABORT_MSG_IF(gnbEnergyPowerUnitW <= 0.0 || ueEnergyPowerUnitMw <= 0.0,
+                    "Official Energy model PowerUnit values must be greater than zero");
+    NS_ABORT_MSG_IF(gnbEnergyAntennaRatio < 0.0 || gnbEnergyAntennaRatio > 1.0,
+                    "gnbEnergyAntennaRatio must be inside [0, 1]");
+    NS_ABORT_MSG_IF(enableCdrx && phaseOffsetMs != 0.0,
+                    "NrEnergyHelper v5 does not expose a DRX start phase offset; use phaseOffsetMs=0");
 
     RngSeedManager::SetSeed(rngSeed);
     RngSeedManager::SetRun(rngRun);
@@ -1242,30 +1352,40 @@ int main(int argc, char *argv[])
     BwpState initialBwp = enableBwpDynamic || fixedBwpMHz == 20
                               ? BWP_NARROW_20MHZ
                               : BWP_WIDE_100MHZ;
-    GnbSlotEnergyTracker gnbSlotTracker(1.0,
-                                       gnbP0ActiveW,
-                                       gnbPMicroSleepW,
-                                       gnbPTxMaxW,
-                                       gnbDeltaP,
-                                       gnbNarrowCapacityMbps,
-                                       gnbWideCapacityMbps,
-                                       gnbWideActivePowerOverheadW,
-                                       gnbWideSleepPowerOverheadW,
-                                       initialBwp);
-    Simulator::Schedule(MilliSeconds(1),
-                        &GnbSlotEnergyTracker::TrackSlot,
-                        &gnbSlotTracker,
-                        monitor);
 
-    UeEnergyTracker ueSlotTracker(numUes,
-                                  1.0,
-                                  enableCdrx,
-                                  enableDciDynamic,
-                                  enableBwpDynamic,
-                                  initialBwp,
-                                  phaseOffsetMs,
-                                  cdrxOnDurationMs,
-                                  1.5);
+    // Official 5G-LENA energy framework: PHY traces drive the TR 38.864 gNB
+    // and TR 38.840 UE models at the real OFDM symbol/slot timing.  No custom
+    // periodic energy-accounting event is scheduled in this scenario.
+    BasicEnergySourceHelper energySourceHelper;
+    energySourceHelper.Set("BasicEnergySourceInitialEnergyJ", DoubleValue(1e9));
+    energy::EnergySourceContainer gnbEnergySources = energySourceHelper.Install(gnbNodes);
+    energy::EnergySourceContainer ueEnergySources = energySourceHelper.Install(ueNodes);
+
+    NrEnergyHelper nrEnergyHelper;
+    nrEnergyHelper.SetGnbEnergyModelAttribute("BsCategory", StringValue(gnbEnergyBsCategory));
+    nrEnergyHelper.SetGnbEnergyModelAttribute("RefConfigSet", StringValue(gnbEnergyRefConfig));
+    nrEnergyHelper.SetGnbEnergyModelAttribute("EtaMode", StringValue(gnbEnergyEtaMode));
+    nrEnergyHelper.SetGnbEnergyModelAttribute("AntennaRatio_A",
+                                               DoubleValue(gnbEnergyAntennaRatio));
+    nrEnergyHelper.SetGnbEnergyModelAttribute("PowerUnit",
+                                               DoubleValue(gnbEnergyPowerUnitW));
+    nrEnergyHelper.SetGnbEnergyModelAttribute("ReferenceRbCount",
+                                               UintegerValue(gnbPhy->GetRbNum()));
+    nrEnergyHelper.SetUeEnergyModelAttribute("FreqRange", StringValue("FR1"));
+    nrEnergyHelper.SetUeEnergyModelAttribute("PowerUnit", DoubleValue(ueEnergyPowerUnitMw));
+    nrEnergyHelper.SetUeEnergyModelAttribute("ReferenceBwpBandwidth", UintegerValue(100));
+    nrEnergyHelper.EnableDrx(enableCdrx);
+    nrEnergyHelper.SetDrxModelAttribute("ReferenceConfig", StringValue("CUSTOM"));
+    nrEnergyHelper.SetDrxModelAttribute("LongCycle", TimeValue(MilliSeconds(cellDtxPeriodMs)));
+    nrEnergyHelper.SetDrxModelAttribute("OnDuration", TimeValue(MilliSeconds(cdrxOnDurationMs)));
+    nrEnergyHelper.SetDrxModelAttribute("InactivityTimer",
+                                        TimeValue(MilliSeconds(cdrxInactivityMs)));
+
+    energy::DeviceEnergyModelContainer gnbEnergyModels =
+        nrEnergyHelper.InstallGnb(gnbNetDev, gnbEnergySources);
+    energy::DeviceEnergyModelContainer ueEnergyModels =
+        nrEnergyHelper.InstallUe(ueNetDev, ueEnergySources);
+    OfficialEnergyMetrics energyMetrics(gnbEnergyModels, ueEnergyModels, ueNodes, initialBwp);
 
     const double burstDutyCycle = enableBurstTraffic
                                       ? burstMeanOnMs / (burstMeanOnMs + burstMeanOffMs)
@@ -1273,7 +1393,7 @@ int main(int argc, char *argv[])
     const double meanRatePerUeMbps =
         udpPacketRateMbps + burstDutyCycle * udpBurstRateMbps;
     double totalTrafficRateMbps = meanRatePerUeMbps * numUes;
-    DynamicDtxController dynamicController(&delayTracker, &ueSlotTracker, &gnbSlotTracker,
+    DynamicDtxController dynamicController(&delayTracker, &energyMetrics,
                                            &radioController,
                                            totalTrafficRateMbps, enableDciDynamic, enableBwpDynamic,
                                            enableRlIpc, ipcPort, 0.010, controllerEvalIntervalMs,
@@ -1289,8 +1409,6 @@ int main(int argc, char *argv[])
         dynamicController.Start();
     }
 
-    Simulator::Schedule(MilliSeconds(1), &UeEnergyTracker::TrackSlot, &ueSlotTracker, monitor, &dynamicController);
-
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
 
@@ -1303,8 +1421,8 @@ int main(int argc, char *argv[])
     }
 
     double finalActiveMs = dynamicControlEnabled ? dynamicController.GetCurrentActiveMs() : cellDtxActiveMs;
-    double avgPower = gnbSlotTracker.GetAvgPower();
-    double totalEnergy = gnbSlotTracker.GetTotalEnergy();
+    double avgPower = energyMetrics.GetAvgGnbPowerW();
+    double totalEnergy = energyMetrics.GetTotalGnbEnergyJ();
     double totalRxMbits = (totalRxBytes * 8.0) / 1e6;
     double energyEff = (totalEnergy > 0) ? (totalRxMbits / totalEnergy) : 0.0;
     double p99Latency = delayTracker.GetP99Latency();
@@ -1314,10 +1432,16 @@ int main(int argc, char *argv[])
               << ", PendingBytes=" << delayTracker.GetPendingBytes()
               << ", AppRxBytes=" << delayTracker.GetTotalRxBytes() << std::endl;
 
-    double ueAvgPowerMw = ueSlotTracker.GetAvgPowerMwPerUe();
-    double ueTotalEnergy = ueSlotTracker.GetTotalEnergyJoules();
-    double ueBatteryMah = ueSlotTracker.GetBatteryConsumptionMah();
-    double ue3EnergyJoules = ueSlotTracker.GetUeEnergyJoules(2);
+    double ueAvgPowerMw = energyMetrics.GetAvgUePowerMwPerUe();
+    double ueTotalEnergy = energyMetrics.GetTotalUeEnergyJ();
+    double ueBatteryMah = energyMetrics.GetBatteryConsumptionMah();
+    double ue3EnergyJoules = energyMetrics.GetUeEnergyJ(2);
+
+    std::cout << "EnergyModel=5G-LENA-Official-TR38.864/TR38.840"
+              << ", GnbRefConfig=" << gnbEnergyRefConfig
+              << ", GnbBsCategory=" << gnbEnergyBsCategory
+              << ", GnbPowerUnitW=" << gnbEnergyPowerUnitW
+              << ", UePowerUnitMw=" << ueEnergyPowerUnitMw << std::endl;
 
     ExportStatsToCsv(csvFileName, Simulator::Now().GetSeconds(), enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules);
 

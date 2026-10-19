@@ -74,14 +74,12 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                  burst_mean_on_ms=80.0,
                  burst_mean_off_ms=120.0,
                  gnb_tx_power_dbm=30.0,
-                 gnb_p0_active_w=150.0,
-                 gnb_p_micro_sleep_w=15.0,
-                 gnb_p_tx_max_w=40.0,
-                 gnb_delta_p=4.7,
-                 gnb_narrow_capacity_mbps=100.0,
-                 gnb_wide_capacity_mbps=100.0,
-                 gnb_wide_active_power_overhead_w=0.0,
-                 gnb_wide_sleep_power_overhead_w=0.0,
+                 gnb_energy_bs_category="BsCat1",
+                 gnb_energy_ref_config="Set1",
+                 gnb_energy_eta_mode="Dual",
+                 gnb_energy_antenna_ratio=0.4,
+                 gnb_energy_power_unit_w=1.0,
+                 ue_energy_power_unit_mw=1.0,
                  sim_time=20.0,
                  enable_mock=False,
                  port=5555,
@@ -106,14 +104,12 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.burst_mean_on_ms = burst_mean_on_ms
         self.burst_mean_off_ms = burst_mean_off_ms
         self.gnb_tx_power_dbm = gnb_tx_power_dbm
-        self.gnb_p0_active_w = gnb_p0_active_w
-        self.gnb_p_micro_sleep_w = gnb_p_micro_sleep_w
-        self.gnb_p_tx_max_w = gnb_p_tx_max_w
-        self.gnb_delta_p = gnb_delta_p
-        self.gnb_narrow_capacity_mbps = gnb_narrow_capacity_mbps
-        self.gnb_wide_capacity_mbps = gnb_wide_capacity_mbps
-        self.gnb_wide_active_power_overhead_w = gnb_wide_active_power_overhead_w
-        self.gnb_wide_sleep_power_overhead_w = gnb_wide_sleep_power_overhead_w
+        self.gnb_energy_bs_category = gnb_energy_bs_category
+        self.gnb_energy_ref_config = gnb_energy_ref_config
+        self.gnb_energy_eta_mode = gnb_energy_eta_mode
+        self.gnb_energy_antenna_ratio = gnb_energy_antenna_ratio
+        self.gnb_energy_power_unit_w = gnb_energy_power_unit_w
+        self.ue_energy_power_unit_mw = ue_energy_power_unit_mw
         self.sim_time = sim_time
         self.enable_mock = enable_mock
         self.port = port
@@ -133,13 +129,22 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.DL_MCS_MAX = 28.0
         self.W_MIN_MS = 10.0
         self.W_MAX_MS = controller_max_active_ms
-        self.P_GNB_MAX_W = max(
-            gnb_p0_active_w + gnb_delta_p * gnb_p_tx_max_w,
-            gnb_p0_active_w + gnb_wide_active_power_overhead_w
-            + gnb_delta_p * gnb_p_tx_max_w,
-            1.0,
-        )
-        self.P_UE_MAX_MW = 250.0
+        official_gnb_power_sets = {
+            "BsCat1": {"Set1": (55.0, 280.0), "Set2": (50.0, 200.0), "Set3": (38.0, 152.0)},
+            "BsCat2": {"Set1": (5.5, 32.0), "Set2": (5.0, 26.0), "Set3": (3.0, 17.6)},
+        }
+        try:
+            p3_relative, p4_relative = official_gnb_power_sets[
+                gnb_energy_bs_category
+            ][gnb_energy_ref_config]
+        except KeyError as exc:
+            raise ValueError(
+                "Unsupported official gNB energy category/reference set: "
+                f"{gnb_energy_bs_category}/{gnb_energy_ref_config}"
+            ) from exc
+        self.P_GNB_IDLE_W = p3_relative * gnb_energy_power_unit_w
+        self.P_GNB_MAX_W = max(p4_relative * gnb_energy_power_unit_w, 1.0)
+        self.P_UE_MAX_MW = max(300.0 * ue_energy_power_unit_mw, 1.0)
         self.QOS_SLA_TARGET_MS = qos_target_ms
 
         self.W_GNB_POWER = weight_gnb_power
@@ -255,14 +260,12 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             f"--burstMeanOnMs={self.burst_mean_on_ms}",
             f"--burstMeanOffMs={self.burst_mean_off_ms}",
             f"--gnbTxPowerDbm={self.gnb_tx_power_dbm}",
-            f"--gnbP0ActiveW={self.gnb_p0_active_w}",
-            f"--gnbPMicroSleepW={self.gnb_p_micro_sleep_w}",
-            f"--gnbPTxMaxW={self.gnb_p_tx_max_w}",
-            f"--gnbDeltaP={self.gnb_delta_p}",
-            f"--gnbNarrowCapacityMbps={self.gnb_narrow_capacity_mbps}",
-            f"--gnbWideCapacityMbps={self.gnb_wide_capacity_mbps}",
-            f"--gnbWideActivePowerOverheadW={self.gnb_wide_active_power_overhead_w}",
-            f"--gnbWideSleepPowerOverheadW={self.gnb_wide_sleep_power_overhead_w}",
+            f"--gnbEnergyBsCategory={self.gnb_energy_bs_category}",
+            f"--gnbEnergyRefConfig={self.gnb_energy_ref_config}",
+            f"--gnbEnergyEtaMode={self.gnb_energy_eta_mode}",
+            f"--gnbEnergyAntennaRatio={self.gnb_energy_antenna_ratio}",
+            f"--gnbEnergyPowerUnitW={self.gnb_energy_power_unit_w}",
+            f"--ueEnergyPowerUnitMw={self.ue_energy_power_unit_mw}",
             "--enableGating=true",
             "--enableQueueAware=false",
             "--enableCdrx=true",
@@ -515,17 +518,21 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             max_delay_ms = max(5.0, 80.0 / capacity_factor + np.random.normal(0, 2.0))
             delivered_rate_mbps = min(
                 offered_rate_mbps,
-                self.gnb_narrow_capacity_mbps
-                if self.current_bwp_state == 0
-                else self.gnb_wide_capacity_mbps,
+                20.0 if self.current_bwp_state == 0 else 100.0,
             )
             avg_cqi = 12.0 + np.random.uniform(-0.5, 0.5)
             p10_cqi = max(0.0, avg_cqi - 2.0)
             min_cqi = max(0.0, avg_cqi - 3.0)
             avg_dl_mcs = np.clip(2.0 * avg_cqi - 4.0, 0.0, self.DL_MCS_MAX)
 
-            gnb_power_w = 20.0 + 15.0 * (self.current_w_active_ms / 30.0) + 10.0 * self.current_bwp_state
-            ue_power_mw = 15.0 + 40.0 * (self.current_w_active_ms / 30.0) + 20.0 * self.current_bwp_state
+            activity = np.clip(self.current_w_active_ms / 30.0, 0.0, 1.0)
+            bandwidth_scale = 0.2 if self.current_bwp_state == 0 else 1.0
+            gnb_power_w = self.P_GNB_IDLE_W + (
+                self.P_GNB_MAX_W - self.P_GNB_IDLE_W
+            ) * activity * bandwidth_scale
+            ue_power_mw = self.ue_energy_power_unit_mw * (
+                45.0 + (300.0 - 45.0) * activity * bandwidth_scale
+            )
             p99_latency_ms = max_delay_ms * 1.3
             jain_fairness = 0.74 + 0.02 * np.random.uniform(-1, 1)
 

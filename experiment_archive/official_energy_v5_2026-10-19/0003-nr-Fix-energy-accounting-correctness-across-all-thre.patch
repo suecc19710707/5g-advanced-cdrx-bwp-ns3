@@ -1,0 +1,570 @@
+From 7f5ad970eab6117e287cfdd6dfce74e852a8b355 Mon Sep 17 00:00:00 2001
+From: "nipuna.dulara" <pererannd.21@uom.lk>
+Date: Fri, 28 Aug 2026 13:05:42 +0530
+Subject: [PATCH 3/9] nr: Fix energy-accounting correctness across all three
+ models
+
+Correct several accounting bugs found while exercising the models: the
+UE energy source was not updated before a power-state switch, and
+NrGnbEnergyModel was double-counting each slot in GetTotalEnergyJ. Cite
+TR 38.840 Table 18/20 and take the FR2 power values from Table 20, and
+derive the UE reference Rx-antenna count from FreqRange (Table 21)
+instead of assuming FR1. On the DRX side, charge Table 19
+sleep-transition energy on sleep entry, gate light sleep on the Table
+19 transition time, add named TR 38.840 8.2 reference configurations,
+and fix the inactivity timer sleeping the UE mid-onDuration.
+---
+ model/nr-gnb-energy-model.cc |  18 +++++-
+ model/nr-gnb-energy-model.h  |   4 +-
+ model/nr-ue-drx-model.cc     |  84 +++++++++++++++++++++++++--
+ model/nr-ue-drx-model.h      |  41 +++++++++++++-
+ model/nr-ue-energy-model.cc  | 106 ++++++++++++++++++++++++++++-------
+ model/nr-ue-energy-model.h   |  16 ++++++
+ 6 files changed, 238 insertions(+), 31 deletions(-)
+
+diff --git a/model/nr-gnb-energy-model.cc b/model/nr-gnb-energy-model.cc
+index 51b31555..3a3f1613 100644
+--- a/model/nr-gnb-energy-model.cc
++++ b/model/nr-gnb-energy-model.cc
+@@ -119,6 +119,8 @@ NrGnbEnergyModel::NrGnbEnergyModel()
+       m_currentState(NrGnbPowerState::MicroSleep),
+       m_lastUpdateTime(Seconds(0)),
+       m_slotEnergyAccumJ(0.0),
++      m_currentSlotPowerW(0.0),
++      m_slotAccumDurationS(0.0),
+       m_stateTrace(static_cast<int>(NrGnbPowerState::MicroSleep)),
+       m_powerTrace(0.0),
+       m_totalEnergyJ(0.0)
+@@ -278,14 +280,23 @@ NrGnbEnergyModel::UpdateSymbolPower(double sa, double sf, double sp, NrGnbSymbol
+         NS_ABORT_MSG("Invalid symbol type");
+     }
+     m_slotEnergyAccumJ += powerW * tSym;
++    m_slotAccumDurationS += tSym;
+ }
+ 
+ void
+ NrGnbEnergyModel::FinalizeSlotEnergy()
+ {
+     NS_LOG_FUNCTION(this << m_slotEnergyAccumJ);
+-    m_totalEnergyJ = m_totalEnergyJ + m_slotEnergyAccumJ;
++    Time now = Simulator::Now();
++    // Commit only the interval that has actually elapsed since the last update,
++    // charged at the power of the slot that was in progress. never in advance.
++    m_totalEnergyJ = m_totalEnergyJ + m_currentSlotPowerW * (now - m_lastUpdateTime).GetSeconds();
++    m_lastUpdateTime = now;
++    m_currentSlotPowerW =
++        (m_slotAccumDurationS > 0.0) ? (m_slotEnergyAccumJ / m_slotAccumDurationS) : 0.0;
+     m_slotEnergyAccumJ = 0.0;
++    m_slotAccumDurationS = 0.0;
++
+     if (m_source)
+     {
+         m_source->UpdateEnergySource();
+@@ -354,8 +365,11 @@ double
+ NrGnbEnergyModel::GetTotalEnergyJ() const
+ {
+     NS_LOG_FUNCTION(this);
++    // Energy for already-elapsed slots, plus the fraction of the in-progress slot
++    // that has elapsed so far. m_slotEnergyAccumJ is deliberately NOT added: it is
++    // the next slot's energy, committed at its own FinalizeSlotEnergy().
+     double durationS = (Simulator::Now() - m_lastUpdateTime).GetSeconds();
+-    return m_totalEnergyJ + GetCurrentPowerW() * durationS + m_slotEnergyAccumJ;
++    return m_totalEnergyJ + m_currentSlotPowerW * durationS;
+ }
+ 
+ void
+diff --git a/model/nr-gnb-energy-model.h b/model/nr-gnb-energy-model.h
+index 5d401f29..8ebef1fe 100644
+--- a/model/nr-gnb-energy-model.h
++++ b/model/nr-gnb-energy-model.h
+@@ -291,7 +291,9 @@ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+     NrGnbPowerState m_currentState; //!< Current discrete power state
+     Time m_lastUpdateTime;          //!< Time of last state change
+ 
+-    double m_slotEnergyAccumJ; //!< Per-symbol energy accumulated for current slot
++    double m_slotEnergyAccumJ;   //!< Energy being accumulated for the slot about to start [J]
++    double m_slotAccumDurationS; //!< Time span accumulated for that slot [s]
++    double m_currentSlotPowerW;  //!< Average power of the slot currently elapsing [W]
+ 
+     TracedValue<int> m_stateTrace;      //!< Fires on each discrete state change
+     TracedValue<double> m_powerTrace;   //!< Fires with instantaneous power [W] on each change
+diff --git a/model/nr-ue-drx-model.cc b/model/nr-ue-drx-model.cc
+index 38a39481..aaf9d631 100644
+--- a/model/nr-ue-drx-model.cc
++++ b/model/nr-ue-drx-model.cc
+@@ -18,7 +18,21 @@
+ 
+ namespace ns3
+ {
+-
++struct DrxRefConfig
++{
++    Time cycle;
++    Time onDurationFr1;
++    Time onDurationFr2;
++    Time inactivityTimer;
++};
++
++// TR 38.840 Section 8.2 traffic-model reference configurations, indexed to
++// NrUeDrxModel::ReferenceConfig - 1 (CUSTOM has no entry).
++const DrxRefConfig DRX_REF_CONFIG[] = {
++    {MilliSeconds(160), MilliSeconds(8), MilliSeconds(4), MilliSeconds(100)},  // FTP_160MS
++    {MilliSeconds(320), MilliSeconds(10), MilliSeconds(5), MilliSeconds(80)},  // INSTANT_MSG_320MS
++    {MilliSeconds(40), MilliSeconds(4), MilliSeconds(2), MilliSeconds(10)},    // VOIP_40MS
++};
+ NS_LOG_COMPONENT_DEFINE("NrUeDrxModel");
+ NS_OBJECT_ENSURE_REGISTERED(NrUeDrxModel);
+ 
+@@ -46,10 +60,39 @@ NrUeDrxModel::GetTypeId()
+                           MakeTimeAccessor(&NrUeDrxModel::m_inactivityTimer),
+                           MakeTimeChecker())
+             .AddAttribute("DeepSleepThreshold",
+-                          "Gap to next onDuration at/above which deep sleep is used.",
++                          "Gap to next onDuration at/above which deep sleep is used "
++                          "(TR 38.840 Table 19 deep-sleep total transition time = 20 ms).",
+                           TimeValue(MilliSeconds(20)),
+                           MakeTimeAccessor(&NrUeDrxModel::m_deepSleepThreshold),
++                          MakeTimeChecker())
++            .AddAttribute("LightSleepThreshold",
++                          "Gap to next onDuration at/above which light sleep is used. Below "
++                          "this the gap cannot cover light sleep's own transition cost, so "
++                          "micro sleep (zero transition, TR 38.840 Table 19) is used instead.",
++                          TimeValue(MilliSeconds(6)),
++                          MakeTimeAccessor(&NrUeDrxModel::m_lightSleepThreshold),
+                           MakeTimeChecker());
++            .AddAttribute("FreqRange",
++                          "Frequency range, used to pick the FR-appropriate onDuration "
++                          "when ReferenceConfig is not CUSTOM (TR 38.840 Section 8.2).",
++                          EnumValue(FR1),
++                          MakeEnumAccessor<FreqRange>(&NrUeDrxModel::m_freqRange),
++                          MakeEnumChecker(FR1, "FR1", FR2, "FR2"))
++            .AddAttribute("ReferenceConfig",
++                          "Named TR 38.840 Section 8.2 reference DRX configuration. "
++                          "Non-CUSTOM values override LongCycle/OnDuration/InactivityTimer "
++                          "with one coherent, spec-cited combination at Start().",
++                          EnumValue(CUSTOM),
++                          MakeEnumAccessor<ReferenceConfig>(&NrUeDrxModel::m_referenceConfig),
++                          MakeEnumChecker(CUSTOM,
++                                          "CUSTOM",
++                                          FTP_160MS,
++                                          "FTP_160MS",
++                                          INSTANT_MSG_320MS,
++                                          "INSTANT_MSG_320MS",
++                                          VOIP_40MS,
++                                          "VOIP_40MS"))
++
+     return tid;
+ }
+ 
+@@ -59,8 +102,10 @@ NrUeDrxModel::NrUeDrxModel()
+       m_onDuration(MilliSeconds(8)),
+       m_inactivityTimer(MilliSeconds(10)),
+       m_deepSleepThreshold(MilliSeconds(20)),
++      m_lightSleepThreshold(MilliSeconds(6)),
+       m_nextCycleTime(Seconds(0)),
+-      m_inactivityRunning(false)
++      m_inactivityRunning(false),
++      m_onDurationRunning(false)
+ {
+     NS_LOG_FUNCTION(this);
+ }
+@@ -70,6 +115,20 @@ NrUeDrxModel::~NrUeDrxModel()
+     NS_LOG_FUNCTION(this);
+ }
+ 
++void
++NrUeDrxModel::ApplyReferenceConfig()
++{
++    NS_LOG_FUNCTION(this);
++    if (m_referenceConfig == CUSTOM)
++    {
++        return;
++    }
++    const DrxRefConfig& cfg = DRX_REF_CONFIG[m_referenceConfig - 1];
++    m_longCycle = cfg.cycle;
++    m_onDuration = (m_freqRange == FR2) ? cfg.onDurationFr2 : cfg.onDurationFr1;
++    m_inactivityTimer = cfg.inactivityTimer;
++}
++
+ void
+ NrUeDrxModel::SetEnergyModel(Ptr<NrUeEnergyModel> model)
+ {
+@@ -82,6 +141,7 @@ void
+ NrUeDrxModel::Start(Time startAt)
+ {
+     NS_LOG_FUNCTION(this << startAt);
++    ApplyReferenceConfig();
+     m_cycleEvent = Simulator::Schedule(startAt - Simulator::Now(), &NrUeDrxModel::StartCycle, this);
+ }
+ 
+@@ -95,6 +155,7 @@ NrUeDrxModel::StartCycle()
+         m_energyModel->ChangeState(NR_UE_PDCCH_ONLY);
+     }
+     m_inactivityRunning = false;
++    m_onDurationRunning = true;
+     m_nextCycleTime = Simulator::Now() + m_longCycle;
+     m_onDurationEvent = Simulator::Schedule(m_onDuration, &NrUeDrxModel::EndOnDuration, this);
+     m_cycleEvent = Simulator::Schedule(m_longCycle, &NrUeDrxModel::StartCycle, this);
+@@ -104,6 +165,7 @@ void
+ NrUeDrxModel::EndOnDuration()
+ {
+     NS_LOG_FUNCTION(this);
++    m_onDurationRunning = false;
+     // If no activity extended the awake window, sleep now.
+     if (!m_inactivityRunning)
+     {
+@@ -127,7 +189,10 @@ NrUeDrxModel::InactivityExpired()
+ {
+     NS_LOG_FUNCTION(this);
+     m_inactivityRunning = false;
+-    GoToSleep();
++    if (!m_onDurationRunning)
++    {
++        GoToSleep();
++    }
+ }
+ 
+ void
+@@ -138,16 +203,23 @@ NrUeDrxModel::GoToSleep()
+     {
+         return;
+     }
+-    // Deeper sleep only pays off over a long inactive gap (TR 38.840 Section 8.1).
++    // TR 38.840: a sleep interval must exceed that state's total transition time
++    // (Table 19), otherwise the transition cost outweighs the saving.
+     Time gap = m_nextCycleTime - Simulator::Now();
+     if (gap >= m_deepSleepThreshold)
+     {
+         m_energyModel->ChangeState(NR_UE_DEEP_SLEEP);
+     }
+-    else
++    else if (gap >= m_lightSleepThreshold)
+     {
+         m_energyModel->ChangeState(NR_UE_LIGHT_SLEEP);
+     }
++    else
++    {
++        // Too short even for light sleep's 6 ms transition. Micro sleep has zero
++        // transition time so it is always valid regardless of gap length.
++        m_energyModel->ChangeState(NR_UE_MICRO_SLEEP);
++    }
+ }
+ 
+ void
+diff --git a/model/nr-ue-drx-model.h b/model/nr-ue-drx-model.h
+index 3b7fd3b5..fabc5df5 100644
+--- a/model/nr-ue-drx-model.h
++++ b/model/nr-ue-drx-model.h
+@@ -83,6 +83,32 @@ class NrUeDrxModel : public Object
+      */
+     void NotifyDataActivity();
+ 
++    /**
++     * @brief Frequency range selector (TR 38.840 Section 8.2), used to pick the
++     * FR-appropriate onDuration for a named reference configuration.
++     */
++    enum FreqRange
++    {
++        FR1, //!< Sub-6 GHz
++        FR2  //!< mmWave
++    };
++    /**
++     * @brief Named TR 38.840 Section 8.2 reference DRX configurations.
++     *
++     * Each non-CUSTOM entry atomically fixes LongCycle, OnDuration (FR-aware)
++     * and InactivityTimer to one coherent, spec-cited combination (TR 38.840
++     * Section 8.2 traffic-model table). CUSTOM leaves LongCycle/OnDuration/
++     * InactivityTimer exactly as configured. The caller is then responsible
++     * for supplying a self-consistent set.
++     */
++    enum ReferenceConfig
++    {
++        CUSTOM,            //!< No preset; LongCycle/OnDuration/InactivityTimer as set directly
++        FTP_160MS,         //!< TR 38.840 8.2: cycle 160 ms, inactivity 100 ms (FTP traffic)
++        INSTANT_MSG_320MS, //!< TR 38.840 8.2: cycle 320 ms, inactivity 80 ms (instant messaging)
++        VOIP_40MS          //!< TR 38.840 8.2: cycle 40 ms, inactivity 10 ms (VoIP)
++    };
++
+   protected:
+     void DoDispose() override;
+ 
+@@ -107,19 +133,32 @@ class NrUeDrxModel : public Object
+      */
+     void GoToSleep();
+ 
++    /**
++     * @brief Apply the selected named ReferenceConfig (no-op if CUSTOM).
++     *
++     * Overwrites m_longCycle, m_onDuration (FR-aware) and m_inactivityTimer with
++     * one coherent TR 38.840 Section 8.2 combination.
++     */
++    void ApplyReferenceConfig();
++
+     Ptr<NrUeEnergyModel> m_energyModel; //!< Driven UE energy model (may be null)
+ 
+     Time m_longCycle;          //!< DRX long cycle period
+     Time m_onDuration;         //!< onDuration window length
+     Time m_inactivityTimer;    //!< drx-InactivityTimer length
+-    Time m_deepSleepThreshold; //!< Gap >= this -> deep sleep, else light sleep
++    Time m_deepSleepThreshold;  //!< Gap >= this -> deep sleep (TR 38.840 Table 19: 20 ms)
++    Time m_lightSleepThreshold; //!< Gap >= this -> light sleep, else micro sleep
+ 
+     Time m_nextCycleTime;     //!< Absolute time of the next onDuration start
+     bool m_inactivityRunning; //!< True while the inactivity timer is armed
++    bool m_onDurationRunning;  //!< True while the onDuration window is open
+ 
+     EventId m_cycleEvent;      //!< Next StartCycle event
+     EventId m_onDurationEvent; //!< EndOnDuration event
+     EventId m_inactivityEvent; //!< InactivityExpired event
++
++    FreqRange m_freqRange; //!< FR1/FR2, selects OnDuration for ReferenceConfig
++    ReferenceConfig m_referenceConfig; //!< Selected named reference config (CUSTOM = none)
+ };
+ 
+ } // namespace ns3
+diff --git a/model/nr-ue-energy-model.cc b/model/nr-ue-energy-model.cc
+index 935c00b9..4ea77608 100644
+--- a/model/nr-ue-energy-model.cc
++++ b/model/nr-ue-energy-model.cc
+@@ -33,6 +33,7 @@ NS_OBJECT_ENSURE_REGISTERED(NrUeEnergyModel);
+ namespace
+ {
+ // Index by NrUePowerState (excluding the NR_UE_NUM_STATES sentinel).
++// TR 38.840 Table 18 (FR1) relative power values
+ constexpr double UE_POWER_FR1[NR_UE_NUM_STATES] = {
+     1.0,   // NR_UE_DEEP_SLEEP
+     20.0,  // NR_UE_LIGHT_SLEEP
+@@ -42,10 +43,11 @@ constexpr double UE_POWER_FR1[NR_UE_NUM_STATES] = {
+     300.0, // NR_UE_PDCCH_PDSCH
+     250.0  // NR_UE_UL_TX (0 dBm anchor; 23 dBm anchor = 700, see SetUlTxPowerDbm)
+ };
++// TR 38.840 Table 20 (FR2) relative power value
+ constexpr double UE_POWER_FR2[NR_UE_NUM_STATES] = {
+     1.0,   // NR_UE_DEEP_SLEEP
+     20.0,  // NR_UE_LIGHT_SLEEP
+-    38.0,  // NR_UE_MICRO_SLEEP
++    45.0,  // NR_UE_MICRO_SLEEP
+     175.0, // NR_UE_PDCCH_ONLY
+     175.0, // NR_UE_SSB_CSI_RS
+     350.0, // NR_UE_PDCCH_PDSCH
+@@ -55,6 +57,26 @@ constexpr double UE_POWER_FR2[NR_UE_NUM_STATES] = {
+ constexpr double UE_UL_POWER_FR1_0DBM = 250.0;   // TR 38.840 Table 18
+ constexpr double UE_UL_POWER_FR1_23DBM = 700.0;  // TR 38.840 Table 18
+ constexpr double UE_BWP_TRANSITION_FLOOR = 50.0; // TR 38.840 Section 8.1.3
++
++// TR 38.840 Table 19: additional transition energy [relative power x ms] and
++// total transition time, indexed by NrUePowerState. Only the three sleep states
++// carry a transition; micro sleep is immediate (zero), everything else is zero.
++// (Time is not constexpr-constructible, so this is a runtime-const array.)
++struct SleepTransition
++{
++    double energyRelMs; //!< additional transition energy [relative power x ms]
++    Time totalTime;     //!< total transition time
++};
++
++const SleepTransition UE_TRANSITION[NR_UE_NUM_STATES] = {
++    {450.0, MilliSeconds(20)}, // NR_UE_DEEP_SLEEP
++    {100.0, MilliSeconds(6)},  // NR_UE_LIGHT_SLEEP
++    {0.0, MilliSeconds(0)},    // NR_UE_MICRO_SLEEP (immediate)
++    {0.0, MilliSeconds(0)},    // NR_UE_PDCCH_ONLY
++    {0.0, MilliSeconds(0)},    // NR_UE_SSB_CSI_RS
++    {0.0, MilliSeconds(0)},    // NR_UE_PDCCH_PDSCH
++    {0.0, MilliSeconds(0)},    // NR_UE_UL_TX
++};
+ } // namespace
+ 
+ TypeId
+@@ -76,8 +98,9 @@ NrUeEnergyModel::GetTypeId()
+                           MakeDoubleAccessor(&NrUeEnergyModel::m_powerUnitMw),
+                           MakeDoubleChecker<double>(0.0))
+             .AddAttribute("ReferenceRxAntennas",
+-                          "Reference number of receive antennas (TR 38.840 Section 8.1.3).",
+-                          UintegerValue(4),
++                          "Reference receive-chain count (TR 38.840 Table 21). 0 = derive "
++                          "from FreqRange (4 for FR1, 2 for FR2).",
++                          UintegerValue(0)
+                           MakeUintegerAccessor(&NrUeEnergyModel::m_refRxAntennas),
+                           MakeUintegerChecker<uint32_t>(1))
+             .AddAttribute("ReferenceBwpBandwidth",
+@@ -86,8 +109,10 @@ NrUeEnergyModel::GetTypeId()
+                           MakeUintegerAccessor(&NrUeEnergyModel::m_refBwpMhz),
+                           MakeUintegerChecker<uint32_t>(1))
+             .AddAttribute("SetupTransitionPower",
+-                          "Transient extra power [W] for a sleep->active (RRC setup) transition. "
+-                          "0 = disabled (instantaneous, free transitions).",
++                          "OPTIONAL empirical override: extra transient power [W] on a "
++                          "sleep->active (RRC setup) transition. NOT a 3GPP value - the "
++                          "TR 38.840 Table 19 transition energy is applied automatically on "
++                          "sleep entry (see GetTransitionEnergyJ). 0 = disabled.",
+                           DoubleValue(0.0),
+                           MakeDoubleAccessor(&NrUeEnergyModel::m_setupTransitionPowerW),
+                           MakeDoubleChecker<double>(0.0))
+@@ -141,6 +166,16 @@ NrUeEnergyModel::~NrUeEnergyModel()
+     NS_LOG_FUNCTION(this);
+ }
+ 
++void
++NrUeEnergyModel::DoInitialize()
++{
++    if (m_refRxAntennas == 0)
++    {
++        m_refRxAntennas = (m_freqRange == FR2) ? 2 : 4; // TR 38.840 Table 21
++    }
++    energy::DeviceEnergyModel::DoInitialize();
++}
++
+ double
+ NrUeEnergyModel::GetRelativePower(NrUePowerState state) const
+ {
+@@ -177,12 +212,19 @@ double
+ NrUeEnergyModel::ScaleBwp(uint32_t bandwidthMhz) const
+ {
+     NS_LOG_FUNCTION(this << bandwidthMhz);
+-    // TR 38.840 Section 8.1.3: scale(X) = 0.4 + 0.6 * (X - 20) / 80.
+-    double scale = 0.4 + 0.6 * (static_cast<double>(bandwidthMhz) - 20.0) / 80.0;
+-    // The scaled active power must not fall below the BWP transition floor.
+-    // Express the floor relative to the reference PDCCH+PDSCH power so the
+-    // factor stays in (0, 1].
+-    double floorFactor = UE_BWP_TRANSITION_FLOOR / UE_POWER_FR1[NR_UE_PDCCH_PDSCH];
++    if (m_freqRange == FR2)
++    {
++        NS_LOG_WARN("ScaleBwp: the 0.4 + 0.6*(X-20)/80 anchors are the TR 38.840 "
++                    "FR1 curve; FR2 BWP scaling is not modelled - result is approximate.");
++    }
++    // Section 8.1.3 FR1 curve, expressed against the reference BWP (default 100 MHz):
++    constexpr double kMinBwpMhz = 20.0;
++    double span = static_cast<double>(m_refBwpMhz) - kMinBwpMhz; // 80 MHz for the 100 MHz ref
++    double scale = (span > 0.0)
++                       ? 0.4 + 0.6 * (static_cast<double>(bandwidthMhz) - kMinBwpMhz) / span
++                       : 1.0;
++    const double* tbl = (m_freqRange == FR2) ? UE_POWER_FR2 : UE_POWER_FR1;
++    double floorFactor = UE_BWP_TRANSITION_FLOOR / tbl[NR_UE_PDCCH_PDSCH];
+     return std::clamp(scale, floorFactor, 1.0);
+ }
+ 
+@@ -234,6 +276,20 @@ NrUeEnergyModel::SetUlTxPowerDbm(double txPowerDbm)
+         UE_UL_POWER_FR1_0DBM + frac * (UE_UL_POWER_FR1_23DBM - UE_UL_POWER_FR1_0DBM);
+ }
+ 
++bool
++NrUeEnergyModel::IsSleepState(NrUePowerState state)
++{
++    return state == NR_UE_DEEP_SLEEP || state == NR_UE_LIGHT_SLEEP || state == NR_UE_MICRO_SLEEP;
++}
++
++double
++NrUeEnergyModel::GetTransitionEnergyJ(NrUePowerState state) const
++{
++    // TR 38.840 Table 19 energy is [relative power x ms]. Convert to Joules:
++    // relative x PowerUnit_mW -> mW, then mW x ms -> mW.ms -> J (factor 1e-6).
++    return UE_TRANSITION[state].energyRelMs * m_powerUnitMw * 1e-6;
++}
++
+ void
+ NrUeEnergyModel::ChangeState(int newState)
+ {
+@@ -246,14 +302,20 @@ NrUeEnergyModel::ChangeState(int newState)
+     m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
+     m_stateTimeS[m_currentState] += durationS;
+     m_lastUpdateTime = now;
+-    m_currentState = static_cast<NrUePowerState>(newState);
+-
+-    m_stateTrace = newState;
+-    m_powerTrace = GetCurrentPowerW();
+     if (m_source)
+     {
+         m_source->UpdateEnergySource();
+     }
++    NrUePowerState oldState = m_currentState;
++    m_currentState = static_cast<NrUePowerState>(newState);
++    // TR 38.840 Table 19: charge the additional transition energy once when
++    // entering a sleep state from a non-sleep (active) state.
++    if (IsSleepState(m_currentState) && !IsSleepState(oldState))
++    {
++        m_totalEnergyJ = m_totalEnergyJ + GetTransitionEnergyJ(m_currentState);
++    }
++    m_stateTrace = newState;
++    m_powerTrace = GetCurrentPowerW();
+ }
+ 
+ NrUePowerState
+@@ -288,13 +350,13 @@ NrUeEnergyModel::TriggerTransition(double extraPowerW, Time duration)
+     m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
+     m_stateTimeS[m_currentState] += durationS;
+     m_lastUpdateTime = now;
+-    m_transitionExtraW = extraPowerW;
+-    m_transitionEndTime = now + duration;
+-    m_powerTrace = GetCurrentPowerW();
+     if (m_source)
+     {
+         m_source->UpdateEnergySource();
+     }
++    m_transitionExtraW = extraPowerW;
++    m_transitionEndTime = now + duration;
++    m_powerTrace = GetCurrentPowerW();
+     Simulator::Schedule(duration, &NrUeEnergyModel::EndTransition, this);
+ }
+ 
+@@ -316,13 +378,13 @@ NrUeEnergyModel::EndTransition()
+     m_totalEnergyJ = m_totalEnergyJ + powerW * durationS;
+     m_stateTimeS[m_currentState] += durationS;
+     m_lastUpdateTime = now;
+-    m_transitionExtraW = 0.0;
+-    m_transitionEndTime = now;
+-    m_powerTrace = GetCurrentPowerW();
+     if (m_source)
+     {
+         m_source->UpdateEnergySource();
+     }
++    m_transitionExtraW = 0.0;
++    m_transitionEndTime = now;
++    m_powerTrace = GetCurrentPowerW();
+ }
+ 
+ double
+@@ -370,6 +432,8 @@ void
+ NrUeEnergyModel::ResetOccupancy()
+ {
+     NS_LOG_FUNCTION(this);
++    double durationS = (Simulator::Now() - m_lastUpdateTime).GetSeconds();
++    m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
+     for (int s = 0; s < NR_UE_NUM_STATES; ++s)
+     {
+         m_stateTimeS[s] = 0.0;
+diff --git a/model/nr-ue-energy-model.h b/model/nr-ue-energy-model.h
+index 76e9b405..9fc62b61 100644
+--- a/model/nr-ue-energy-model.h
++++ b/model/nr-ue-energy-model.h
+@@ -269,6 +269,20 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+      */
+     void EndTransition();
+ 
++    /**
++     * @brief True if a state is one of the three TR 38.840 sleep states.
++     * @param state The state to classify.
++     * @return True for DEEP_SLEEP / LIGHT_SLEEP / MICRO_SLEEP.
++     */
++    static bool IsSleepState(NrUePowerState state);
++
++    /**
++     * @brief TR 38.840 Table 19 additional transition energy for a sleep state.
++     * @param state The sleep state being entered.
++     * @return Additional transition energy [J]; 0 for non-sleep / micro sleep.
++     */
++    double GetTransitionEnergyJ(NrUePowerState state) const;
++
+     Ptr<energy::EnergySource> m_source; //!< Attached energy source (may be null)
+ 
+     FreqRange m_freqRange;    //!< FR1 or FR2 power table selector
+@@ -295,6 +309,8 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+     TracedValue<int> m_stateTrace;      //!< Fires on each state change
+     TracedValue<double> m_powerTrace;   //!< Fires with instantaneous power [W] on each change
+     TracedValue<double> m_totalEnergyJ; //!< Accumulated energy [J], excl. open interval
++    
++    void DoInitialize() override;
+ };
+ 
+ } // namespace ns3
+-- 
+2.43.0
+

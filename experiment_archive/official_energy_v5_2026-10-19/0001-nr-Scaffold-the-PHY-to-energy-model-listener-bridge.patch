@@ -1,0 +1,1207 @@
+From 92d0f078a0ffa3799a35dc8eaa1087a231726ad7 Mon Sep 17 00:00:00 2001
+From: "nipuna.dulara" <pererannd.21@uom.lk>
+Date: Fri, 28 Aug 2026 12:56:33 +0530
+Subject: [PATCH 1/9] nr: Scaffold the PHY-to-energy-model listener bridge
+
+Add the callback bridge between NR PHY events and the energy models:
+NrPhyEnergyListener starts as a combined gNB/UE scaffold wired for the
+sf/sp/sa hooks, backed by minimal stub NrGnbEnergyModel/NrUeEnergyModel
+classes, then gets split into a separate NrGnbPhyEnergyListener and
+NrUePhyEnergyListener (dropping the scheduler/MAC coupling the combined
+version needed), which is the shape the framework keeps from here on.
+---
+ CMakeLists.txt                          |  10 ++
+ model/nr-gnb-energy-model.cc            |  38 +++++
+ model/nr-gnb-energy-model.h             |  49 +++++++
+ model/nr-gnb-phy-energy-listener.cc     | 160 +++++++++++++++++++++
+ model/nr-gnb-phy-energy-listener.h      | 180 ++++++++++++++++++++++++
+ model/nr-ue-energy-model.cc             |  38 +++++
+ model/nr-ue-energy-model.h              |  49 +++++++
+ model/nr-ue-phy-energy-listener.cc      | 145 +++++++++++++++++++
+ model/nr-ue-phy-energy-listener.h       | 141 +++++++++++++++++++
+ test/nr-test-gnb-phy-energy-listener.cc | 145 +++++++++++++++++++
+ test/nr-test-ue-phy-energy-listener.cc  | 100 +++++++++++++
+ 11 files changed, 1055 insertions(+)
+ create mode 100644 model/nr-gnb-energy-model.cc
+ create mode 100644 model/nr-gnb-energy-model.h
+ create mode 100644 model/nr-gnb-phy-energy-listener.cc
+ create mode 100644 model/nr-gnb-phy-energy-listener.h
+ create mode 100644 model/nr-ue-energy-model.cc
+ create mode 100644 model/nr-ue-energy-model.h
+ create mode 100644 model/nr-ue-phy-energy-listener.cc
+ create mode 100644 model/nr-ue-phy-energy-listener.h
+ create mode 100644 test/nr-test-gnb-phy-energy-listener.cc
+ create mode 100644 test/nr-test-ue-phy-energy-listener.cc
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8f0e6562..88615f53 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -125,8 +125,10 @@ set(source_files
+     model/nr-fh-phy-sap.cc
+     model/nr-fh-sched-sap.cc
+     model/nr-gnb-component-carrier-manager.cc
++    model/nr-gnb-energy-model.cc
+     model/nr-gnb-mac.cc
+     model/nr-gnb-net-device.cc
++    model/nr-gnb-phy-energy-listener.cc
+     model/nr-gnb-phy.cc
+     model/nr-gnb-rrc.cc
+     model/nr-handover-algorithm.cc
+@@ -211,8 +213,10 @@ set(source_files
+     model/nr-spectrum-phy.cc
+     model/nr-spectrum-signal-parameters.cc
+     model/nr-ue-component-carrier-manager.cc
++    model/nr-ue-energy-model.cc
+     model/nr-ue-mac.cc
+     model/nr-ue-net-device.cc
++    model/nr-ue-phy-energy-listener.cc
+     model/nr-ue-phy.cc
+     model/nr-ue-power-control.cc
+     model/nr-ue-rrc.cc
+@@ -329,8 +333,10 @@ set(header_files
+     model/nr-gnb-cmac-sap.h
+     model/nr-gnb-component-carrier-manager.h
+     model/nr-gnb-cphy-sap.h
++    model/nr-gnb-energy-model.h
+     model/nr-gnb-mac.h
+     model/nr-gnb-net-device.h
++    model/nr-gnb-phy-energy-listener.h
+     model/nr-gnb-phy.h
+     model/nr-gnb-rrc.h
+     model/nr-handover-algorithm.h
+@@ -431,8 +437,10 @@ set(header_files
+     model/nr-ue-cmac-sap.h
+     model/nr-ue-component-carrier-manager.h
+     model/nr-ue-cphy-sap.h
++    model/nr-ue-energy-model.h
+     model/nr-ue-mac.h
+     model/nr-ue-net-device.h
++    model/nr-ue-phy-energy-listener.h
+     model/nr-ue-phy.h
+     model/nr-ue-power-control.h
+     model/nr-ue-rrc.h
+@@ -515,6 +523,7 @@ set(test_sources
+     test/nr-test-ipv6-routing.cc
+     test/nr-test-l2sm-eesm.cc
+     test/nr-test-notching.cc
++    test/nr-test-gnb-phy-energy-listener.cc
+     test/nr-test-numerology-delay.cc
+     test/nr-test-phy.cc
+     test/nr-test-resource-assignment-matrix.cc
+@@ -546,6 +555,7 @@ set(test_sources
+     test/ul-scheduling-test.cc
+     utils/traffic-generators/test/traffic-generator-test.cc
+     test/nr-test-hexagonal-grid-scenario-helper.cc
++    test/nr-test-ue-phy-energy-listener.cc
+     test/nr-test-ue-measurements.cc
+     test/nr-test-radio-link-failure.cc
+     test/nr-test-rrc-reestablishment.cc
+diff --git a/model/nr-gnb-energy-model.cc b/model/nr-gnb-energy-model.cc
+new file mode 100644
+index 00000000..22d9d03a
+--- /dev/null
++++ b/model/nr-gnb-energy-model.cc
+@@ -0,0 +1,38 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++
++#include "nr-gnb-energy-model.h"
++
++#include "ns3/log.h"
++
++namespace ns3
++{
++
++NS_LOG_COMPONENT_DEFINE("NrGnbEnergyModel");
++NS_OBJECT_ENSURE_REGISTERED(NrGnbEnergyModel);
++
++TypeId
++NrGnbEnergyModel::GetTypeId()
++{
++    static TypeId tid = TypeId("ns3::NrGnbEnergyModel")
++                            .SetParent<Object>()
++                            .SetGroupName("Nr")
++                            .AddConstructor<NrGnbEnergyModel>();
++    return tid;
++}
++
++NrGnbEnergyModel::NrGnbEnergyModel()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++NrGnbEnergyModel::~NrGnbEnergyModel()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++} // namespace ns3
+diff --git a/model/nr-gnb-energy-model.h b/model/nr-gnb-energy-model.h
+new file mode 100644
+index 00000000..2384267f
+--- /dev/null
++++ b/model/nr-gnb-energy-model.h
+@@ -0,0 +1,49 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.864 V18.1.0 (2023-03): Section 5 - Energy consumption model for BS
++
++#ifndef NR_GNB_ENERGY_MODEL_H
++#define NR_GNB_ENERGY_MODEL_H
++
++#include "ns3/object.h"
++
++namespace ns3
++{
++
++/**
++ * @ingroup nr
++ * @brief Placeholder for the TR 38.864 gNB energy model (Week 5).
++ *
++ * Minimal stub so that NrGnbPhyEnergyListener has a complete type to hold and
++ * drive. The gNB power-state machine, DL/UL power formulas, and symbol-level
++ * energy accounting are added in a later milestone.
++ */
++class NrGnbEnergyModel : public Object
++{
++  public:
++    /**
++     * @brief Get the TypeId
++     * @return the TypeId
++     */
++    static TypeId GetTypeId();
++
++    /**
++     * @brief NrGnbEnergyModel constructor
++     */
++    NrGnbEnergyModel();
++
++    /**
++     * @brief ~NrGnbEnergyModel
++     */
++    ~NrGnbEnergyModel() override;
++};
++
++} // namespace ns3
++
++#endif // NR_GNB_ENERGY_MODEL_H
+diff --git a/model/nr-gnb-phy-energy-listener.cc b/model/nr-gnb-phy-energy-listener.cc
+new file mode 100644
+index 00000000..c155bc87
+--- /dev/null
++++ b/model/nr-gnb-phy-energy-listener.cc
+@@ -0,0 +1,160 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.864 V18.1.0 (2023-03): Section 5.1 - scaling factors sa, sf, sp definitions
++
++#include "nr-gnb-phy-energy-listener.h"
++#include "nr-gnb-phy.h"
++#include "nr-gnb-energy-model.h"
++
++#include "ns3/log.h"
++#include "ns3/simulator.h"
++
++#include <cmath>
++
++namespace ns3
++{
++
++NS_LOG_COMPONENT_DEFINE("NrGnbPhyEnergyListener");
++NS_OBJECT_ENSURE_REGISTERED(NrGnbPhyEnergyListener);
++
++TypeId
++NrGnbPhyEnergyListener::GetTypeId()
++{
++    static TypeId tid = TypeId("ns3::NrGnbPhyEnergyListener")
++                            .SetParent<Object>()
++                            .SetGroupName("Nr")
++                            .AddConstructor<NrGnbPhyEnergyListener>();
++    return tid;
++}
++
++NrGnbPhyEnergyListener::NrGnbPhyEnergyListener()
++    : m_lastDlSf(0.0),
++      m_lastUlSf(0.0),
++      m_lastSp(1.0),    // Default: full power (sp=1)
++      m_lastSa(1.0),    // Default: all antennas active (sa=1)
++      m_totalBwpRbs(0),
++      m_referenceTxPowerDbm(55.0)  // TR 38.864 Set 1 reference: 55 dBm total; per-antenna varies
++{
++    NS_LOG_FUNCTION(this);
++}
++
++NrGnbPhyEnergyListener::~NrGnbPhyEnergyListener()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++NrGnbPhyEnergyListener::SetPhy(Ptr<NrGnbPhy> phy)
++{
++    NS_LOG_FUNCTION(this << phy);
++    NS_ASSERT_MSG(phy, "NrGnbPhy pointer must not be null");
++    m_phy = phy;
++    m_totalBwpRbs = phy->GetRbNum();
++    m_referenceTxPowerDbm = phy->GetTxPower();
++    // TODO Week 7: connect trace sources once added to NrGnbPhy:
++    // phy->TraceConnectWithoutContext("SlotIndication",
++    //     MakeCallback(&NrGnbPhyEnergyListener::SlotIndicationCallback, this));
++    // phy->TraceConnectWithoutContext("PacketBurstSent",
++    //     MakeCallback(&NrGnbPhyEnergyListener::DlBurstSentCallback, this));
++}
++
++void
++NrGnbPhyEnergyListener::SetEnergyModel(Ptr<NrGnbEnergyModel> model)
++{
++    NS_LOG_FUNCTION(this << model);
++    NS_ASSERT_MSG(model, "NrGnbEnergyModel pointer must not be null");
++    m_model = model;
++}
++
++void
++NrGnbPhyEnergyListener::DoDispose()
++{
++    NS_LOG_FUNCTION(this);
++    m_phy = nullptr;
++    m_model = nullptr;
++    Object::DoDispose();
++}
++
++void
++NrGnbPhyEnergyListener::SlotIndicationCallback(const SfnSf& sfnSf)
++{
++    NS_LOG_FUNCTION(this << sfnSf);
++    if (!m_model)
++    {
++        return;
++    }
++    // TODO Week 7 (revisit here in Week 3 to stub):
++    //
++    // Key computation per TR 38.864 §5.1:
++    //
++    // For each symbol (0..13) in this slot:
++    //   1. Classify symbol type: DL / UL / Guard from the TDD pattern.
++    //      NrGnbPhy currently exposes only SetTddPattern() (no getter), so
++    //      this needs a getter added, or the pattern cached at attach time.
++    //      Decision (caching vs. per-slot query) to be made before Week 7.
++    //
++    //   2. sa = activeTRxRUs / totalTRxRUs. No source in PHY yet, so use
++    //      m_lastSa (fixed at 1.0) until antenna muting is added.
++    //
++    //   3. Compute sf = allocatedDlRBs / m_totalBwpRbs
++    //      (updated by DlBurstSentCallback, use m_lastDlSf)
++    //
++    //   4. RefreshSp() to update m_lastSp from current Tx power.
++    //
++    //   5. Call m_model->UpdateSymbolPower(sa, sf, sp, symbolType)
++    //      for each symbol
++    //
++    // After all 14 symbols processed:
++    //   6. Call m_model->FinalizeSlotEnergy()
++}
++
++void
++NrGnbPhyEnergyListener::DlBurstSentCallback(uint32_t allocatedRbs)
++{
++    // TODO Week 7:
++    //
++    // sf = allocatedRbs / m_totalBwpRbs
++    // Source: TR 38.864 §5.1 — sf = fraction of BW carrying DL data
++    //
++    // Guard: if m_totalBwpRbs == 0, log a warning and return
++    // m_lastDlSf = static_cast<double>(allocatedRbs) / m_totalBwpRbs;
++    NS_LOG_FUNCTION(this << allocatedRbs);
++}
++
++void
++NrGnbPhyEnergyListener::UlReceiveCallback(uint32_t allocatedRbs)
++{
++    // TODO Week 7:
++    // m_lastUlSf = static_cast<double>(allocatedRbs) / m_totalBwpRbs;
++    NS_LOG_FUNCTION(this << allocatedRbs);
++}
++
++void
++NrGnbPhyEnergyListener::RefreshSp()
++{
++    NS_LOG_FUNCTION(this);
++    if (!m_phy)
++    {
++        return;
++    }
++    // sp = current Tx power / reference Tx power (linear).
++    // m_referenceTxPowerDbm is captured from m_phy->GetTxPower() at attach
++    // time in SetPhy(); the current value below is re-read each slot so
++    // runtime Tx-power changes (e.g. power control) are reflected.
++    double curLin = std::pow(10.0, m_phy->GetTxPower() / 10.0);
++    double refLin = std::pow(10.0, m_referenceTxPowerDbm / 10.0);
++    m_lastSp = (refLin > 0.0) ? (curLin / refLin) : 1.0;
++}
++
++double NrGnbPhyEnergyListener::GetLastDlSf() const { return m_lastDlSf; }
++double NrGnbPhyEnergyListener::GetLastUlSf() const { return m_lastUlSf; }
++double NrGnbPhyEnergyListener::GetLastSp()   const { return m_lastSp; }
++double NrGnbPhyEnergyListener::GetLastSa()   const { return m_lastSa; }
++
++} // namespace ns3
+diff --git a/model/nr-gnb-phy-energy-listener.h b/model/nr-gnb-phy-energy-listener.h
+new file mode 100644
+index 00000000..d5bfac26
+--- /dev/null
++++ b/model/nr-gnb-phy-energy-listener.h
+@@ -0,0 +1,180 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.864 V18.1.0 (2023-03): Section 5.1 - Energy consumption model for BS
++
++#ifndef NR_GNB_PHY_ENERGY_LISTENER_H
++#define NR_GNB_PHY_ENERGY_LISTENER_H
++
++#include "ns3/object.h"
++#include "ns3/ptr.h"
++#include "ns3/callback.h"
++#include "ns3/nstime.h"
++#include "ns3/sfnsf.h"
++namespace ns3
++{
++
++// Forward declarations
++class NrGnbPhy;
++class NrGnbEnergyModel;
++
++
++/**
++ * @ingroup nr
++ * @brief Callback bridge between NR gNB PHY layer events and the gNB energy model.
++ *
++ * This class is the decoupling layer between the gNB's PHY event stream and the
++ * gNB energy model state machine. It subscribes to trace sources on NrGnbPhy,
++ * extracts the dynamic scaling factors (sa, sf, sp) required by the 3GPP
++ * TR 38.864 power formula, and forwards energy model state-change calls to
++ * NrGnbEnergyModel.
++ *
++ * Design rationale:
++ *   - This class must NOT be aware of the energy formula internals.
++ *     It only knows: "event occurred, extract parameters, notify model."
++ *   - It must be usable both with and without an energy model installed
++ *     (if no model is attached, callbacks are no-ops).
++ *   - It has a single responsibility: the gNB side of the mapping. The UE side
++ *     lives in a separate listener.
++ *
++ */
++class NrGnbPhyEnergyListener : public Object
++{
++  public:
++    /**
++     * @brief Get the TypeId
++     * @return the TypeId
++     */
++    static TypeId GetTypeId();
++
++    /**
++     * @brief NrGnbPhyEnergyListener constructor
++     */
++    NrGnbPhyEnergyListener();
++    /**
++     * @brief ~NrGnbPhyEnergyListener
++     */
++    ~NrGnbPhyEnergyListener() override;
++
++    /**
++     * @brief Attach this listener to a gNB PHY instance.
++     *
++     * Subscribes to the following trace sources on phy:
++     *   - SlotIndication     - fires each slot start. extract TDD structure here
++     *   - PacketBurstSent    - DL burst sent; extract active RBs for sf
++     *   - UlRxSuccess        - UL reception; triggers UL power state
++     *
++     * @param phy Pointer to the NrGnbPhy on the gNB node.
++     */
++    void SetPhy(Ptr<NrGnbPhy> phy);
++
++    /**
++     * @brief Connect the gNB energy model that this listener will drive.
++     * @param model Pointer to the NrGnbEnergyModel instance.
++     */
++    void SetEnergyModel(Ptr<NrGnbEnergyModel> model);
++
++    /**
++     * @brief Get the most recently computed DL bandwidth utilization sf.
++     *
++     * sf = allocated_RBs_DL / total_BWP_RBs
++     * Source: TR 38.864 Section 5.1 definition of sf.
++     *
++     * @return Last sf value in [0.0, 1.0].
++     */
++    double GetLastDlSf() const;
++
++    /**
++     * @brief Get the most recently computed UL bandwidth utilization sf.
++     * @return Last UL sf value in [0.0, 1.0].
++     */
++    double GetLastUlSf() const;
++
++    /**
++     * @brief Get the most recently computed Tx power ratio sp.
++     *
++     * sp = currentTxPower_linear / referenceTxPower_linear
++     * Source: TR 38.864 Section 5.1 definition of sp.
++     *
++     * @return Last sp value in [0.0, 1.0].
++     */
++    double GetLastSp() const;
++
++    /**
++     * @brief Get the most recently computed active antenna ratio sa.
++     *
++     * sa = activeTRxRUs / totalTRxRUs
++     * Source: TR 38.864 Section 5.1 definition of sa.
++     *
++     * @return Last sa value in [0.0, 1.0].
++     */
++    double GetLastSa() const;
++
++  protected:
++    /**
++     * @brief Release attached pointers. Inherited from Object.
++     */
++    void DoDispose() override;
++
++  private:
++    /**
++     * @brief Called each time a new slot starts (gNB side).
++     *
++     * Responsibilities:
++     *   1. Extract TDD symbol pattern for this slot from NrGnbPhy.
++     *   2. Compute sf = allocated_DL_RBs / total_BWP_RBs (from scheduler output).
++     *   3. Compute sp from current Tx power setting.
++     *   4. Call NrGnbEnergyModel::UpdateSymbolPower() for each of the 14 symbols.
++     *
++     * @param sfnSf The current system frame / slot number.
++     */
++    void SlotIndicationCallback(const SfnSf& sfnSf);
++
++    /**
++     * @brief Called when a DL packet burst is sent by the gNB.
++     *
++     * Used to extract the number of allocated DL RBs for sf computation.
++     * sf = allocatedRbs / m_totalBwpRbs
++     *
++     * @param allocatedRbs Number of DL resource blocks allocated in this TTI.
++     */
++    void DlBurstSentCallback(uint32_t allocatedRbs);
++
++    /**
++     * @brief Called when a UL burst reception completes at the gNB.
++     *
++     * Used to extract the number of allocated UL RBs for the UL sf factor.
++     *
++     * @param allocatedRbs Number of UL resource blocks in this TTI.
++     */
++    void UlReceiveCallback(uint32_t allocatedRbs);
++
++    /**
++     * @brief Recompute m_lastSp from the gNB's current Tx power.
++     *
++     * sp = currentTxPower_lin / referenceTxPower_lin. Tx power can change at
++     * runtime, so this is called per slot rather than computed once.
++     */
++    void RefreshSp();
++
++    Ptr<NrGnbPhy> m_phy;             //!< Attached gNB PHY (may be null)
++    Ptr<NrGnbEnergyModel> m_model;   //!< Attached gNB energy model (may be null)
++
++    double m_lastDlSf; //!< Last DL sf computed: allocated_RBs / total_RBs
++    double m_lastUlSf; //!< Last UL sf computed
++    double m_lastSp;   //!< Last sp computed: currentTxPower_lin / refTxPower_lin
++    double m_lastSa;   //!< Last sa: activeTRxRUs / totalTRxRUs. Fixed at 1.0
++                       //!< until antenna muting is added (no source in PHY yet).
++
++    uint32_t m_totalBwpRbs;         //!< Total RBs in active BWP (from NrGnbPhy)
++    double m_referenceTxPowerDbm;   //!< Reference Tx power for sp computation
++};
++
++} // namespace ns3
++
++#endif // NR_GNB_PHY_ENERGY_LISTENER_H
+diff --git a/model/nr-ue-energy-model.cc b/model/nr-ue-energy-model.cc
+new file mode 100644
+index 00000000..13ef3e02
+--- /dev/null
++++ b/model/nr-ue-energy-model.cc
+@@ -0,0 +1,38 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++
++#include "nr-ue-energy-model.h"
++
++#include "ns3/log.h"
++
++namespace ns3
++{
++
++NS_LOG_COMPONENT_DEFINE("NrUeEnergyModel");
++NS_OBJECT_ENSURE_REGISTERED(NrUeEnergyModel);
++
++TypeId
++NrUeEnergyModel::GetTypeId()
++{
++    static TypeId tid = TypeId("ns3::NrUeEnergyModel")
++                            .SetParent<Object>()
++                            .SetGroupName("Nr")
++                            .AddConstructor<NrUeEnergyModel>();
++    return tid;
++}
++
++NrUeEnergyModel::NrUeEnergyModel()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++NrUeEnergyModel::~NrUeEnergyModel()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++} // namespace ns3
+diff --git a/model/nr-ue-energy-model.h b/model/nr-ue-energy-model.h
+new file mode 100644
+index 00000000..160e2d43
+--- /dev/null
++++ b/model/nr-ue-energy-model.h
+@@ -0,0 +1,49 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.840 V16.0.0 (2019-06): Section 8 - UE energy consumption evaluation
++
++#ifndef NR_UE_ENERGY_MODEL_H
++#define NR_UE_ENERGY_MODEL_H
++
++#include "ns3/object.h"
++
++namespace ns3
++{
++
++/**
++ * @ingroup nr
++ * @brief Placeholder for the TR 38.840 UE energy model (Week 4).
++ *
++ * Minimal stub so that NrUePhyEnergyListener has a complete type to hold and
++ * drive. The UE power-state machine, scaling rules, and energy accounting
++ * are added in a later milestone.
++ */
++class NrUeEnergyModel : public Object
++{
++  public:
++    /**
++     * @brief Get the TypeId
++     * @return the TypeId
++     */
++    static TypeId GetTypeId();
++
++    /**
++     * @brief NrUeEnergyModel constructor
++     */
++    NrUeEnergyModel();
++
++    /**
++     * @brief ~NrUeEnergyModel
++     */
++    ~NrUeEnergyModel() override;
++};
++
++} // namespace ns3
++
++#endif // NR_UE_ENERGY_MODEL_H
+diff --git a/model/nr-ue-phy-energy-listener.cc b/model/nr-ue-phy-energy-listener.cc
+new file mode 100644
+index 00000000..54b35521
+--- /dev/null
++++ b/model/nr-ue-phy-energy-listener.cc
+@@ -0,0 +1,145 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.840 V16.0.0 (2019-06): Section 8.1 - UE power state event triggers
++
++#include "nr-ue-phy-energy-listener.h"
++#include "nr-ue-phy.h"
++#include "nr-ue-energy-model.h"
++
++#include "ns3/log.h"
++#include "ns3/simulator.h"
++
++namespace ns3
++{
++
++NS_LOG_COMPONENT_DEFINE("NrUePhyEnergyListener");
++NS_OBJECT_ENSURE_REGISTERED(NrUePhyEnergyListener);
++
++TypeId
++NrUePhyEnergyListener::GetTypeId()
++{
++    static TypeId tid = TypeId("ns3::NrUePhyEnergyListener")
++                            .SetParent<Object>()
++                            .SetGroupName("Nr")
++                            .AddConstructor<NrUePhyEnergyListener>();
++    return tid;
++}
++
++NrUePhyEnergyListener::NrUePhyEnergyListener()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++NrUePhyEnergyListener::~NrUePhyEnergyListener()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++NrUePhyEnergyListener::SetPhy(Ptr<NrUePhy> phy)
++{
++    NS_LOG_FUNCTION(this << phy);
++    NS_ASSERT_MSG(phy, "NrUePhy pointer must not be null");
++    m_phy = phy;
++    // TODO Week 6: connect trace sources once added to NrUePhy:
++    // phy->TraceConnectWithoutContext("SlotIndication",
++    //     MakeCallback(&NrUePhyEnergyListener::SlotIndicationCallback, this));
++    // phy->TraceConnectWithoutContext("PhyRxCtrlEndOk",
++    //     MakeCallback(&NrUePhyEnergyListener::PdcchDecodeSuccessCallback, this));
++    // phy->TraceConnectWithoutContext("PhyTxEnd",
++    //     MakeCallback(&NrUePhyEnergyListener::UlTxEndCallback, this));
++}
++
++void
++NrUePhyEnergyListener::SetEnergyModel(Ptr<NrUeEnergyModel> model)
++{
++    NS_LOG_FUNCTION(this << model);
++    NS_ASSERT_MSG(model, "NrUeEnergyModel pointer must not be null");
++    m_model = model;
++}
++
++void
++NrUePhyEnergyListener::DoDispose()
++{
++    NS_LOG_FUNCTION(this);
++    m_phy = nullptr;
++    m_model = nullptr;
++    Object::DoDispose();
++}
++
++void
++NrUePhyEnergyListener::SlotIndicationCallback(const SfnSf& sfnSf)
++{
++    // TODO Week 6 (stub here in Week 3):
++    //
++    // Query DRX state:
++    //   If DRX_ON:  m_model->ChangeState(NR_UE_PDCCH_ONLY)
++    //   If DRX_OFF (long cycle): m_model->ChangeState(NR_UE_LIGHT_SLEEP)
++    //               or DEEP_SLEEP based on remaining inactive period vs. T_deep
++    //
++    NS_LOG_FUNCTION(this << sfnSf);
++    if (!m_model)
++    {
++        return;
++    }
++}
++
++void
++NrUePhyEnergyListener::PdcchDecodeSuccessCallback(bool hasDlGrant, bool hasUlGrant)
++{
++    // TODO Week 6:
++    //
++    // State transition per TR 38.840 §8.1 semantics:
++    //   if (hasDlGrant):
++    //     m_model->ChangeState(NR_UE_PDCCH_PDSCH)  // 300 power-units FR1
++    //   elif (hasUlGrant):
++    //     // UL starts after UL grant delay; state transitions in UlTxStartCallback
++    //     // For now remain in PDCCH_ONLY
++    //   else:
++    //     m_model->ChangeState(NR_UE_PDCCH_ONLY)   // 100 power-units FR1
++    NS_LOG_FUNCTION(this << hasDlGrant << hasUlGrant);
++    if (!m_model)
++    {
++        return;
++    }
++}
++
++void
++NrUePhyEnergyListener::UlTxStartCallback(double txPowerDbm)
++{
++    // TODO Week 6:
++    //
++    // Set UE model state to UL_TX.
++    // The power level depends on Tx power:
++    //   - txPowerDbm <= 0  → use m_model->GetUlPower0dBm()  (250 units FR1)
++    //   - txPowerDbm > 0   → interpolate linearly or clamp at 23 dBm (700 units FR1)
++    //     Source: TR 38.840 Table 18.
++    //
++    // m_model->SetUlTxPowerDbm(txPowerDbm);
++    // m_model->ChangeState(NR_UE_UL_TX);
++    NS_LOG_FUNCTION(this << txPowerDbm);
++    if (!m_model)
++    {
++        return;
++    }
++}
++
++void
++NrUePhyEnergyListener::UlTxEndCallback()
++{
++    // TODO Week 6:
++    //   m_model->ChangeState(NR_UE_MICRO_SLEEP)  // brief micro-sleep after UL burst
++    NS_LOG_FUNCTION(this);
++    if (!m_model)
++    {
++        return;
++    }
++}
++
++} // namespace ns3
+diff --git a/model/nr-ue-phy-energy-listener.h b/model/nr-ue-phy-energy-listener.h
+new file mode 100644
+index 00000000..d1168059
+--- /dev/null
++++ b/model/nr-ue-phy-energy-listener.h
+@@ -0,0 +1,141 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.840 V16.0.0 (2019-06): Section 8 - UE energy consumption evaluation
++
++#ifndef NR_UE_PHY_ENERGY_LISTENER_H
++#define NR_UE_PHY_ENERGY_LISTENER_H
++
++#include "ns3/object.h"
++#include "ns3/ptr.h"
++#include "ns3/callback.h"
++#include "ns3/nstime.h"
++#include "ns3/sfnsf.h"
++namespace ns3
++{
++
++// Forward declarations
++class NrUePhy;
++class NrUeEnergyModel;
++
++
++/**
++ * @ingroup nr
++ * @brief Callback bridge between NR UE PHY layer events and the UE energy model.
++ *
++ * This class is the decoupling layer between the UE's PHY event stream and the
++ * UE energy model state machine. It subscribes to trace sources on NrUePhy,
++ * extracts the state transitions required by the 3GPP TR 38.840 UE power
++ * states, and forwards energy model state-change calls to NrUeEnergyModel.
++ *
++ * Design rationale:
++ *   - This class must NOT be aware of the energy formula internals.
++ *     It only knows: "event occurred, extract parameters, notify model."
++ *   - It must be usable both with and without an energy model installed
++ *     (if no model is attached, callbacks are no-ops).
++ *   - It has a single responsibility: the UE side of the mapping. The gNB side
++ *     lives in a separate listener.
++ *
++ */
++class NrUePhyEnergyListener : public Object
++{
++  public:
++    /**
++     * @brief Get the TypeId
++     * @return the TypeId
++     */
++    static TypeId GetTypeId();
++
++    /**
++     * @brief NrUePhyEnergyListener constructor
++     */
++    NrUePhyEnergyListener();
++    /**
++     * @brief ~NrUePhyEnergyListener
++     */
++    ~NrUePhyEnergyListener() override;
++
++    /**
++     * @brief Attach this listener to a UE PHY instance.
++     *
++     * Subscribes to the following trace sources on phy:
++     *   - SlotIndication     - fires each slot start
++     *   - PhyRxCtrlEndOk     - PDCCH successfully decoded (state -> PDCCH_ONLY or PDCCH_PDSCH)
++     *   - PhyTxEnd           - UL transmission completed (state -> back to PDCCH or sleep)
++     *   - DlHarqFeedback     - HARQ ACK/NACK for state tracking
++     *
++     * @param phy Pointer to the NrUePhy on the UE node.
++     */
++    void SetPhy(Ptr<NrUePhy> phy);
++
++    /**
++     * @brief Connect the UE energy model that this listener will drive.
++     * @param model Pointer to the NrUeEnergyModel instance.
++     */
++    void SetEnergyModel(Ptr<NrUeEnergyModel> model);
++
++  protected:
++    /**
++     * @brief Release attached pointers. Inherited from Object.
++     */
++    void DoDispose() override;
++
++  private:
++    /**
++     * @brief Called each time a new slot starts (UE side).
++     *
++     * Responsibilities:
++     *   1. Determine UE DRX state from MAC DRX timer state.
++     *   2. Set UE energy model state to PDCCH_ONLY if in DRX ON.
++     *   3. Set UE energy model state to MICRO_SLEEP/LIGHT_SLEEP if in DRX OFF.
++     *
++     * @param sfnSf The current system frame / slot number.
++     */
++    void SlotIndicationCallback(const SfnSf& sfnSf);
++
++    /**
++     * @brief Called when PDCCH decoding succeeds on the UE.
++     *
++     * Transitions UE energy model:
++     *   - If DCI has DL grant: state -> NR_UE_PDCCH_PDSCH
++     *   - If DCI has UL grant: state will transition to NR_UE_UL_TX at grant time
++     *   - Otherwise:           state -> NR_UE_PDCCH_ONLY
++     *
++     * @param hasDownlinkGrant True if the decoded DCI contains a PDSCH grant.
++     * @param hasUplinkGrant True if the decoded DCI contains a PUSCH grant.
++     */
++    void PdcchDecodeSuccessCallback(bool hasDownlinkGrant, bool hasUplinkGrant);
++
++    /**
++     * @brief Called when UL transmission starts on the UE.
++     *
++     * Transitions UE energy model state to NR_UE_UL_TX.
++     * Power depends on Tx power level:
++     *   - If txPowerDbm <= 0 dBm  -> UlPower0dBm
++     *   - If txPowerDbm > 0 dBm   -> interpolate or use UlPower23dBm
++     *   Source: TR 38.840 Table 18.
++     *
++     * @param txPowerDbm Current UL transmission power in dBm.
++     */
++    void UlTxStartCallback(double txPowerDbm);
++
++    /**
++     * @brief Called when UL transmission ends on the UE.
++     *
++     * Transitions UE energy model state back from NR_UE_UL_TX to
++     * NR_UE_PDCCH_ONLY or NR_UE_MICRO_SLEEP depending on DRX state.
++     */
++    void UlTxEndCallback();
++
++    Ptr<NrUePhy> m_phy;             //!< Attached UE PHY (may be null)
++    Ptr<NrUeEnergyModel> m_model;   //!< Attached UE energy model (may be null)
++};
++
++} // namespace ns3
++
++#endif // NR_UE_PHY_ENERGY_LISTENER_H
+diff --git a/test/nr-test-gnb-phy-energy-listener.cc b/test/nr-test-gnb-phy-energy-listener.cc
+new file mode 100644
+index 00000000..296518b1
+--- /dev/null
++++ b/test/nr-test-gnb-phy-energy-listener.cc
+@@ -0,0 +1,145 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++
++#include "ns3/nr-gnb-phy-energy-listener.h"
++#include "ns3/test.h"
++
++/**
++ * @file nr-test-gnb-phy-energy-listener.cc
++ * @ingroup test
++ *
++ * @brief Unit tests for NrGnbPhyEnergyListener, the bridge between NR gNB PHY
++ * events and the gNB energy model.
++ *
++ * At this stage the class is scaffolding: the PHY callbacks are no-ops until
++ * the energy model and PHY trace sources are wired in (Week 7). These tests
++ * therefore cover the behaviour that is observable today: the object is
++ * registered and constructible, and the scaling factors (sa, sf, sp) start at
++ * the documented safe defaults before any PHY event has occurred.
++ */
++namespace ns3
++{
++
++/**
++ * @brief Test that the listener is registered with the TypeId system and can
++ *        be constructed both directly and by name.
++ */
++class NrGnbPhyEnergyListenerCreationTestCase : public TestCase
++{
++  public:
++    NrGnbPhyEnergyListenerCreationTestCase()
++        : TestCase("NrGnbPhyEnergyListener construction and TypeId")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrGnbPhyEnergyListenerCreationTestCase::DoRun()
++{
++    Ptr<NrGnbPhyEnergyListener> listener = CreateObject<NrGnbPhyEnergyListener>();
++    NS_TEST_ASSERT_MSG_EQ(listener != nullptr, true, "Listener should be constructible");
++
++    TypeId tid = NrGnbPhyEnergyListener::GetTypeId();
++    NS_TEST_ASSERT_MSG_EQ(tid.GetName(),
++                          "ns3::NrGnbPhyEnergyListener",
++                          "Unexpected registered TypeId name");
++
++    // The class must also resolve through the TypeId/ObjectFactory path.
++    TypeId byName = TypeId::LookupByName("ns3::NrGnbPhyEnergyListener");
++    NS_TEST_ASSERT_MSG_EQ(byName.GetUid(), tid.GetUid(), "TypeId lookup mismatch");
++}
++
++/**
++ * @brief Test the documented default scaling factors before any PHY event.
++ *
++ * Per TR 38.864 Section 5.1 the bridge must report a safe initial state:
++ *   - sf = 0  (no RBs allocated yet)
++ *   - sp = 1  (full Tx power, current == reference)
++ *   - sa = 1  (all antennas active)
++ */
++class NrGnbPhyEnergyListenerDefaultsTestCase : public TestCase
++{
++  public:
++    NrGnbPhyEnergyListenerDefaultsTestCase()
++        : TestCase("NrGnbPhyEnergyListener default sa/sf/sp values")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrGnbPhyEnergyListenerDefaultsTestCase::DoRun()
++{
++    Ptr<NrGnbPhyEnergyListener> listener = CreateObject<NrGnbPhyEnergyListener>();
++
++    NS_TEST_ASSERT_MSG_EQ_TOL(listener->GetLastDlSf(),
++                              0.0,
++                              1e-12,
++                              "Default DL sf should be 0 (no allocation yet)");
++    NS_TEST_ASSERT_MSG_EQ_TOL(listener->GetLastUlSf(),
++                              0.0,
++                              1e-12,
++                              "Default UL sf should be 0 (no allocation yet)");
++    NS_TEST_ASSERT_MSG_EQ_TOL(listener->GetLastSp(),
++                              1.0,
++                              1e-12,
++                              "Default sp should be 1 (full Tx power)");
++    NS_TEST_ASSERT_MSG_EQ_TOL(listener->GetLastSa(),
++                              1.0,
++                              1e-12,
++                              "Default sa should be 1 (all antennas active)");
++}
++
++/**
++ * @brief Test that the listener can be disposed without an attached PHY or
++ *        energy model (the "usable without a model installed" contract).
++ */
++class NrGnbPhyEnergyListenerDisposeTestCase : public TestCase
++{
++  public:
++    NrGnbPhyEnergyListenerDisposeTestCase()
++        : TestCase("NrGnbPhyEnergyListener dispose with nothing attached")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrGnbPhyEnergyListenerDisposeTestCase::DoRun()
++{
++    Ptr<NrGnbPhyEnergyListener> listener = CreateObject<NrGnbPhyEnergyListener>();
++    listener->Dispose();
++    NS_TEST_ASSERT_MSG_EQ(listener != nullptr,
++                          true,
++                          "Listener handle should remain valid after Dispose()");
++}
++
++/**
++ * @brief Test suite for NrGnbPhyEnergyListener.
++ */
++class NrGnbPhyEnergyListenerTestSuite : public TestSuite
++{
++  public:
++    NrGnbPhyEnergyListenerTestSuite()
++        : TestSuite("nr-test-gnb-phy-energy-listener", Type::UNIT)
++    {
++        AddTestCase(new NrGnbPhyEnergyListenerCreationTestCase(), Duration::QUICK);
++        AddTestCase(new NrGnbPhyEnergyListenerDefaultsTestCase(), Duration::QUICK);
++        AddTestCase(new NrGnbPhyEnergyListenerDisposeTestCase(), Duration::QUICK);
++    }
++};
++
++static NrGnbPhyEnergyListenerTestSuite g_nrGnbPhyEnergyListenerTestSuite; //!< the test suite
++
++} // namespace ns3
+diff --git a/test/nr-test-ue-phy-energy-listener.cc b/test/nr-test-ue-phy-energy-listener.cc
+new file mode 100644
+index 00000000..e59c841b
+--- /dev/null
++++ b/test/nr-test-ue-phy-energy-listener.cc
+@@ -0,0 +1,100 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++
++#include "ns3/nr-ue-phy-energy-listener.h"
++#include "ns3/test.h"
++
++/**
++ * @file nr-test-ue-phy-energy-listener.cc
++ * @ingroup test
++ *
++ * @brief Unit tests for NrUePhyEnergyListener, the bridge between NR UE PHY
++ * events and the UE energy model.
++ *
++ * At this stage the class is scaffolding: the PHY callbacks are no-ops until
++ * the energy model and PHY trace sources are wired in (Week 6). These tests
++ * therefore cover the behaviour that is observable today: the object is
++ * registered and constructible, and it can be disposed with nothing attached.
++ */
++namespace ns3
++{
++
++/**
++ * @brief Test that the listener is registered with the TypeId system and can
++ *        be constructed both directly and by name.
++ */
++class NrUePhyEnergyListenerCreationTestCase : public TestCase
++{
++  public:
++    NrUePhyEnergyListenerCreationTestCase()
++        : TestCase("NrUePhyEnergyListener construction and TypeId")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrUePhyEnergyListenerCreationTestCase::DoRun()
++{
++    Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
++    NS_TEST_ASSERT_MSG_EQ(listener != nullptr, true, "Listener should be constructible");
++
++    TypeId tid = NrUePhyEnergyListener::GetTypeId();
++    NS_TEST_ASSERT_MSG_EQ(tid.GetName(),
++                          "ns3::NrUePhyEnergyListener",
++                          "Unexpected registered TypeId name");
++
++    // The class must also resolve through the TypeId/ObjectFactory path.
++    TypeId byName = TypeId::LookupByName("ns3::NrUePhyEnergyListener");
++    NS_TEST_ASSERT_MSG_EQ(byName.GetUid(), tid.GetUid(), "TypeId lookup mismatch");
++}
++
++/**
++ * @brief Test that the listener can be disposed without an attached PHY or
++ *        energy model (the "usable without a model installed" contract).
++ */
++class NrUePhyEnergyListenerDisposeTestCase : public TestCase
++{
++  public:
++    NrUePhyEnergyListenerDisposeTestCase()
++        : TestCase("NrUePhyEnergyListener dispose with nothing attached")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrUePhyEnergyListenerDisposeTestCase::DoRun()
++{
++    Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
++    listener->Dispose();
++    NS_TEST_ASSERT_MSG_EQ(listener != nullptr,
++                          true,
++                          "Listener handle should remain valid after Dispose()");
++}
++
++/**
++ * @brief Test suite for NrUePhyEnergyListener.
++ */
++class NrUePhyEnergyListenerTestSuite : public TestSuite
++{
++  public:
++    NrUePhyEnergyListenerTestSuite()
++        : TestSuite("nr-test-ue-phy-energy-listener", Type::UNIT)
++    {
++        AddTestCase(new NrUePhyEnergyListenerCreationTestCase(), Duration::QUICK);
++        AddTestCase(new NrUePhyEnergyListenerDisposeTestCase(), Duration::QUICK);
++    }
++};
++
++static NrUePhyEnergyListenerTestSuite g_nrUePhyEnergyListenerTestSuite; //!< the test suite
++
++} // namespace ns3
+-- 
+2.43.0
+

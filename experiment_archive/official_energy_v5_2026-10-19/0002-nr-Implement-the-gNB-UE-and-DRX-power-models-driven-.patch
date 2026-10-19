@@ -1,0 +1,3480 @@
+From 04a5b3aa99f6df6ecae78a7693f4baa1b93a0eaf Mon Sep 17 00:00:00 2001
+From: "nipuna.dulara" <pererannd.21@uom.lk>
+Date: Fri, 28 Aug 2026 13:05:31 +0530
+Subject: [PATCH 2/9] nr: Implement the gNB, UE and DRX power models, driven
+ from the PHY
+
+Implement NrGnbEnergyModel (TR 38.864), NrUeEnergyModel (TR 38.840) and
+NrUeDrxModel (TS 38.321), and drive them live from the PHY: the gNB
+model from the SlotDataStats trace, the UE model with BWP-based
+scaling. Add the initial unit test suite for all three, and the first
+round of fixes found wiring them into a real simulation: gNB uplink and
+control symbols charged at the correct power, UE reception charged by
+allocated symbols and MIMO rank, several build/test failures, and
+review feedback from the initial pass.
+---
+ CMakeLists.txt                          |   4 +
+ model/nr-gnb-energy-model.cc            | 381 +++++++++++++++++++++-
+ model/nr-gnb-energy-model.h             | 268 +++++++++++++++-
+ model/nr-gnb-phy-energy-listener.cc     | 174 ++++++----
+ model/nr-gnb-phy-energy-listener.h      |  97 +++---
+ model/nr-gnb-phy.cc                     |  51 +++
+ model/nr-gnb-phy.h                      |  46 +++
+ model/nr-ue-drx-model.cc                | 164 ++++++++++
+ model/nr-ue-drx-model.h                 | 127 ++++++++
+ model/nr-ue-energy-model.cc             | 401 +++++++++++++++++++++++-
+ model/nr-ue-energy-model.h              | 267 +++++++++++++++-
+ model/nr-ue-phy-energy-listener.cc      | 145 ++++++---
+ model/nr-ue-phy-energy-listener.h       | 132 +++++---
+ model/nr-ue-phy.cc                      |  20 ++
+ model/nr-ue-phy.h                       |  18 ++
+ test/nr-test-energy-models.cc           | 368 ++++++++++++++++++++++
+ test/nr-test-gnb-phy-energy-listener.cc |   4 +-
+ test/nr-test-ue-phy-energy-listener.cc  | 137 +++++++-
+ 18 files changed, 2568 insertions(+), 236 deletions(-)
+ create mode 100644 model/nr-ue-drx-model.cc
+ create mode 100644 model/nr-ue-drx-model.h
+ create mode 100644 test/nr-test-energy-models.cc
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 88615f53..0ca988e9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -213,6 +213,7 @@ set(source_files
+     model/nr-spectrum-phy.cc
+     model/nr-spectrum-signal-parameters.cc
+     model/nr-ue-component-carrier-manager.cc
++    model/nr-ue-drx-model.cc
+     model/nr-ue-energy-model.cc
+     model/nr-ue-mac.cc
+     model/nr-ue-net-device.cc
+@@ -437,6 +438,7 @@ set(header_files
+     model/nr-ue-cmac-sap.h
+     model/nr-ue-component-carrier-manager.h
+     model/nr-ue-cphy-sap.h
++    model/nr-ue-drx-model.h
+     model/nr-ue-energy-model.h
+     model/nr-ue-mac.h
+     model/nr-ue-net-device.h
+@@ -523,6 +525,7 @@ set(test_sources
+     test/nr-test-ipv6-routing.cc
+     test/nr-test-l2sm-eesm.cc
+     test/nr-test-notching.cc
++    test/nr-test-energy-models.cc
+     test/nr-test-gnb-phy-energy-listener.cc
+     test/nr-test-numerology-delay.cc
+     test/nr-test-phy.cc
+@@ -643,6 +646,7 @@ build_lib(
+     ${libinternet-apps}
+     ${libflow-monitor}
+     ${libspectrum}
++    ${libenergy}
+     ${libbuildings}
+     ${libvirtual-net-device}
+     ${libpoint-to-point}
+diff --git a/model/nr-gnb-energy-model.cc b/model/nr-gnb-energy-model.cc
+index 22d9d03a..51b31555 100644
+--- a/model/nr-gnb-energy-model.cc
++++ b/model/nr-gnb-energy-model.cc
+@@ -3,11 +3,23 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.864 V18.1.0 (2023-03): Section 5.1 - BS power formulas and table 5.1-3
++//   TR 38.864 V18.1.0 (2023-03): Section 5.2 - symbol-level time-domain energy
+ 
+ #include "nr-gnb-energy-model.h"
+ 
++#include "ns3/double.h"
++#include "ns3/energy-source.h"
++#include "ns3/enum.h"
+ #include "ns3/log.h"
++#include "ns3/simulator.h"
++#include "ns3/uinteger.h"
++
++#include <algorithm>
++#include <cmath>
+ 
+ namespace ns3
+ {
+@@ -15,17 +27,101 @@ namespace ns3
+ NS_LOG_COMPONENT_DEFINE("NrGnbEnergyModel");
+ NS_OBJECT_ENSURE_REGISTERED(NrGnbEnergyModel);
+ 
++// TR 38.864 Table 5.1-3 relative power values, indexed [P1..P5]. The values
++// depend on both the BS category and the reference configuration set, which a
++// single ns-3 attribute default cannot express, so they live in a lookup table.
++namespace
++{
++struct GnbPowerRow
++{
++    double p1; //!< Deep sleep
++    double p2; //!< Light sleep
++    double p3; //!< Micro sleep (also the static baseline)
++    double p4; //!< Active DL
++    double p5; //!< Active UL
++};
++
++// TR 38.864 Table 5.1-3.
++constexpr GnbPowerRow CAT1_SET1 = {1.0, 25.0, 55.0, 280.0, 110.0};
++constexpr GnbPowerRow CAT1_SET2 = {1.0, 25.0, 50.0, 200.0, 90.0};
++constexpr GnbPowerRow CAT1_SET3 = {1.0, 25.0, 38.0, 152.0, 80.0};
++constexpr GnbPowerRow CAT2_SET1 = {1.0, 2.1, 5.5, 32.0, 6.5};
++} // namespace
++
+ TypeId
+ NrGnbEnergyModel::GetTypeId()
+ {
+-    static TypeId tid = TypeId("ns3::NrGnbEnergyModel")
+-                            .SetParent<Object>()
+-                            .SetGroupName("Nr")
+-                            .AddConstructor<NrGnbEnergyModel>();
++    static TypeId tid =
++        TypeId("ns3::NrGnbEnergyModel")
++            .SetParent<energy::DeviceEnergyModel>()
++            .SetGroupName("Nr")
++            .AddConstructor<NrGnbEnergyModel>()
++            .AddAttribute("BsCategory",
++                          "BS hardware category (TR 38.864 Section 5.1).",
++                          EnumValue(BsCat1),
++                          MakeEnumAccessor<BsCategory>(&NrGnbEnergyModel::m_bsCategory),
++                          MakeEnumChecker(BsCat1, "BsCat1", BsCat2, "BsCat2"))
++            .AddAttribute("RefConfigSet",
++                          "Reference configuration set (TR 38.864 Table 5.1-1).",
++                          EnumValue(Set1),
++                          MakeEnumAccessor<RefConfigSet>(&NrGnbEnergyModel::m_refConfig),
++                          MakeEnumChecker(Set1, "Set1", Set2, "Set2", Set3, "Set3"))
++            .AddAttribute("EtaMode",
++                          "PA efficiency mode: single constant 1.0 or dual 0.76/1.0.",
++                          EnumValue(EtaSingle),
++                          MakeEnumAccessor<EtaMode>(&NrGnbEnergyModel::m_etaMode),
++                          MakeEnumChecker(EtaSingle, "Single", EtaDual, "Dual"))
++            .AddAttribute("AntennaRatio_A",
++                          "Load-independent fraction A of the dynamic DL power in the "
++                          "TR 38.864 v18.1.0 Section 5.1 base-station power equation "
++                          "P_DL = P3 + sa*(P4-P3)*[A + (sf*sp/eta)*(1-A)]. Dimensionless "
++                          "coefficient (NOT an antenna count).",
++                          DoubleValue(0.4),
++                          MakeDoubleAccessor(&NrGnbEnergyModel::m_antennaRatioA),
++                          MakeDoubleChecker<double>(0.0, 1.0))
++            .AddAttribute("PowerUnit",
++                          "Absolute power of one TR 38.864 relative power-unit, in W.",
++                          DoubleValue(1.0),
++                          MakeDoubleAccessor(&NrGnbEnergyModel::m_powerUnitW),
++                          MakeDoubleChecker<double>(0.0))
++            .AddAttribute("ReferenceTxPowerDbm",
++                          "Reference total Tx power for sp [dBm] (TR 38.864 Section 5.1).",
++                          DoubleValue(55.0),
++                          MakeDoubleAccessor(&NrGnbEnergyModel::m_refTxPowerDbm),
++                          MakeDoubleChecker<double>())
++            .AddTraceSource("State",
++                            "Current discrete gNB power state (NrGnbPowerState as int).",
++                            MakeTraceSourceAccessor(&NrGnbEnergyModel::m_stateTrace),
++                            "ns3::TracedValueCallback::Int32")
++            .AddTraceSource("InstantaneousPower",
++                            "Instantaneous gNB power draw [W] at each state change.",
++                            MakeTraceSourceAccessor(&NrGnbEnergyModel::m_powerTrace),
++                            "ns3::TracedValueCallback::Double")
++            .AddTraceSource("TotalEnergyConsumption",
++                            "Total energy consumed by the gNB [J].",
++                            MakeTraceSourceAccessor(&NrGnbEnergyModel::m_totalEnergyJ),
++                            "ns3::TracedValueCallback::Double");
+     return tid;
+ }
+ 
+ NrGnbEnergyModel::NrGnbEnergyModel()
++    : m_source(nullptr),
++      m_bsCategory(BsCat1),
++      m_refConfig(Set1),
++      m_etaMode(EtaSingle),
++      m_antennaRatioA(0.4),
++      m_powerUnitW(1.0),
++      m_symbolDuration(Seconds((1e-3 / 2.0) / 14.0)), // mu=1 default until set
++      m_refTxPowerDbm(55.0),
++      m_sa(1.0),
++      m_sf(0.0),
++      m_sp(1.0),
++      m_currentState(NrGnbPowerState::MicroSleep),
++      m_lastUpdateTime(Seconds(0)),
++      m_slotEnergyAccumJ(0.0),
++      m_stateTrace(static_cast<int>(NrGnbPowerState::MicroSleep)),
++      m_powerTrace(0.0),
++      m_totalEnergyJ(0.0)
+ {
+     NS_LOG_FUNCTION(this);
+ }
+@@ -35,4 +131,279 @@ NrGnbEnergyModel::~NrGnbEnergyModel()
+     NS_LOG_FUNCTION(this);
+ }
+ 
++double
++NrGnbEnergyModel::GetRelativePower(NrGnbPowerState state) const
++{
++    NS_LOG_FUNCTION(this << static_cast<int>(state));
++    GnbPowerRow row = CAT1_SET1;
++    if (m_bsCategory == BsCat1)
++    {
++        row = (m_refConfig == Set1) ? CAT1_SET1 : (m_refConfig == Set2) ? CAT1_SET2 : CAT1_SET3;
++    }
++    else
++    {
++        // TR 38.864 Table 5.1-3 only tabulates BS Category 2 for Set 1; reuse it
++        // for the other sets until per-set Cat2 values are added.
++        if (m_refConfig != Set1)
++        {
++            NS_LOG_WARN("BS Category 2 only has Set 1 power values; reusing them");
++        }
++        row = CAT2_SET1;
++    }
++
++    switch (state)
++    {
++    case NrGnbPowerState::DeepSleep:
++        return row.p1;
++    case NrGnbPowerState::LightSleep:
++        return row.p2;
++    case NrGnbPowerState::MicroSleep:
++        return row.p3;
++    case NrGnbPowerState::ActiveDl:
++        return row.p4;
++    case NrGnbPowerState::ActiveUl:
++        return row.p5;
++    case NrGnbPowerState::Transitioning:
++        // Transition power approximated as micro sleep (P3).
++        return row.p3;
++    default:
++        NS_ABORT_MSG("Invalid gNB power state");
++    }
++}
++
++double
++NrGnbEnergyModel::ToWatts(double relative) const
++{
++    NS_LOG_FUNCTION(this << relative);
++    return relative * m_powerUnitW;
++}
++
++double
++NrGnbEnergyModel::GetEta(double sf, double sp) const
++{
++    NS_LOG_FUNCTION(this << sf << sp);
++    if (m_etaMode == EtaSingle)
++    {
++        return 1.0;
++    }
++    return (sf * sp >= 0.5) ? 1.0 : 0.76;
++}
++
++double
++NrGnbEnergyModel::CalcDlPowerW(double sa, double sf, double sp) const
++{
++    NS_LOG_FUNCTION(this << sa << sf << sp);
++    // TR 38.864 Section 5.1:
++    //   P_DL = P3 + sa*(P4 - P3) * [ A + (sf*sp / eta) * (1 - A) ]
++    double p3 = GetRelativePower(NrGnbPowerState::MicroSleep);
++    double p4 = GetRelativePower(NrGnbPowerState::ActiveDl);
++    double eta = GetEta(sf, sp);
++    double rel =
++        p3 + sa * (p4 - p3) * (m_antennaRatioA + (sf * sp / eta) * (1.0 - m_antennaRatioA));
++    return ToWatts(rel);
++}
++
++double
++NrGnbEnergyModel::CalcUlPowerW(double sa) const
++{
++    NS_LOG_FUNCTION(this << sa);
++    // TR 38.864 Section 5.1: P_UL = P3 + sa*(P5 - P3).
++    double p3 = GetRelativePower(NrGnbPowerState::MicroSleep);
++    double p5 = GetRelativePower(NrGnbPowerState::ActiveUl);
++    return ToWatts(p3 + sa * (p5 - p3));
++}
++
++void
++NrGnbEnergyModel::SetSymbolDuration(Time symbolDuration)
++{
++    NS_LOG_FUNCTION(this << symbolDuration);
++    m_symbolDuration = symbolDuration;
++}
++
++Time
++NrGnbEnergyModel::GetSymbolDuration() const
++{
++    return m_symbolDuration;
++}
++
++double
++NrGnbEnergyModel::ComputeSlotEnergyJ(const std::vector<NrGnbSymbolType>& pattern,
++                                     double sa,
++                                     double sf,
++                                     double sp) const
++{
++    NS_LOG_FUNCTION(this << sa << sf << sp);
++    double tSym = GetSymbolDuration().GetSeconds();
++    double energyJ = 0.0;
++    for (NrGnbSymbolType sym : pattern)
++    {
++        double powerW = 0.0;
++        switch (sym)
++        {
++        case NrGnbSymbolType::Dl:
++            powerW = CalcDlPowerW(sa, sf, sp);
++            break;
++        case NrGnbSymbolType::Ul:
++            powerW = CalcUlPowerW(sa);
++            break;
++        case NrGnbSymbolType::Idle:
++            powerW = ToWatts(GetRelativePower(NrGnbPowerState::MicroSleep));
++            break;
++        default:
++            NS_ABORT_MSG("Invalid symbol type");
++        }
++        energyJ += powerW * tSym;
++    }
++    return energyJ;
++}
++
++void
++NrGnbEnergyModel::UpdateSymbolPower(double sa, double sf, double sp, NrGnbSymbolType symbolType)
++{
++    NS_LOG_FUNCTION(this << sa << sf << sp << static_cast<int>(symbolType));
++    double tSym = GetSymbolDuration().GetSeconds();
++    double powerW = 0.0;
++    switch (symbolType)
++    {
++    case NrGnbSymbolType::Dl:
++        powerW = CalcDlPowerW(sa, sf, sp);
++        break;
++    case NrGnbSymbolType::Ul:
++        powerW = CalcUlPowerW(sa);
++        break;
++    case NrGnbSymbolType::Idle:
++        powerW = ToWatts(GetRelativePower(NrGnbPowerState::MicroSleep));
++        break;
++    default:
++        NS_ABORT_MSG("Invalid symbol type");
++    }
++    m_slotEnergyAccumJ += powerW * tSym;
++}
++
++void
++NrGnbEnergyModel::FinalizeSlotEnergy()
++{
++    NS_LOG_FUNCTION(this << m_slotEnergyAccumJ);
++    m_totalEnergyJ = m_totalEnergyJ + m_slotEnergyAccumJ;
++    m_slotEnergyAccumJ = 0.0;
++    if (m_source)
++    {
++        m_source->UpdateEnergySource();
++    }
++}
++
++void
++NrGnbEnergyModel::SetSf(double sf)
++{
++    NS_LOG_FUNCTION(this << sf);
++    m_sf = std::clamp(sf, 0.0, 1.0);
++}
++
++void
++NrGnbEnergyModel::SetTxPowerDbm(double txPowerDbm)
++{
++    NS_LOG_FUNCTION(this << txPowerDbm);
++    double curLin = std::pow(10.0, txPowerDbm / 10.0);
++    double refLin = std::pow(10.0, m_refTxPowerDbm / 10.0);
++    m_sp = (refLin > 0.0) ? std::clamp(curLin / refLin, 0.0, 1.0) : 1.0;
++}
++
++void
++NrGnbEnergyModel::ChangeState(int newState)
++{
++    NS_LOG_FUNCTION(this << newState);
++    NS_ASSERT_MSG(newState >= 0 && newState < static_cast<int>(NrGnbPowerState::NumStates),
++                  "Invalid gNB state");
++
++    Time now = Simulator::Now();
++    double durationS = (now - m_lastUpdateTime).GetSeconds();
++    m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
++    m_lastUpdateTime = now;
++    m_currentState = static_cast<NrGnbPowerState>(newState);
++
++    m_stateTrace = newState;
++    m_powerTrace = GetCurrentPowerW();
++    if (m_source)
++    {
++        m_source->UpdateEnergySource();
++    }
++}
++
++NrGnbPowerState
++NrGnbEnergyModel::GetCurrentState() const
++{
++    return m_currentState;
++}
++
++double
++NrGnbEnergyModel::GetCurrentPowerW() const
++{
++    NS_LOG_FUNCTION(this);
++    switch (m_currentState)
++    {
++    case NrGnbPowerState::ActiveDl:
++        return CalcDlPowerW(m_sa, m_sf, m_sp);
++    case NrGnbPowerState::ActiveUl:
++        return CalcUlPowerW(m_sa);
++    default:
++        return ToWatts(GetRelativePower(m_currentState));
++    }
++}
++
++double
++NrGnbEnergyModel::GetTotalEnergyJ() const
++{
++    NS_LOG_FUNCTION(this);
++    double durationS = (Simulator::Now() - m_lastUpdateTime).GetSeconds();
++    return m_totalEnergyJ + GetCurrentPowerW() * durationS + m_slotEnergyAccumJ;
++}
++
++void
++NrGnbEnergyModel::SetEnergySource(Ptr<energy::EnergySource> source)
++{
++    NS_LOG_FUNCTION(this << source);
++    NS_ASSERT(source);
++    m_source = source;
++}
++
++double
++NrGnbEnergyModel::GetTotalEnergyConsumption() const
++{
++    return GetTotalEnergyJ();
++}
++
++void
++NrGnbEnergyModel::HandleEnergyDepletion()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++NrGnbEnergyModel::HandleEnergyRecharged()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++NrGnbEnergyModel::HandleEnergyChanged()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++double
++NrGnbEnergyModel::DoGetCurrentA() const
++{
++    NS_LOG_FUNCTION(this);
++    double voltage = m_source ? m_source->GetSupplyVoltage() : 1.0;
++    return (voltage > 0.0) ? GetCurrentPowerW() / voltage : 0.0;
++}
++
++void
++NrGnbEnergyModel::DoDispose()
++{
++    NS_LOG_FUNCTION(this);
++    m_source = nullptr;
++    energy::DeviceEnergyModel::DoDispose();
++}
++
+ } // namespace ns3
+diff --git a/model/nr-gnb-energy-model.h b/model/nr-gnb-energy-model.h
+index 2384267f..5d401f29 100644
+--- a/model/nr-gnb-energy-model.h
++++ b/model/nr-gnb-energy-model.h
+@@ -3,7 +3,7 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ //
+ // 3GPP References:
+ //   TR 38.864 V18.1.0 (2023-03): Section 5 - Energy consumption model for BS
+@@ -11,22 +11,101 @@
+ #ifndef NR_GNB_ENERGY_MODEL_H
+ #define NR_GNB_ENERGY_MODEL_H
+ 
+-#include "ns3/object.h"
++#include "ns3/device-energy-model.h"
++#include "ns3/nstime.h"
++#include "ns3/traced-value.h"
++
++#include <vector>
+ 
+ namespace ns3
+ {
+ 
+ /**
+  * @ingroup nr
+- * @brief Placeholder for the TR 38.864 gNB energy model (Week 5).
++ * @brief gNB power consumption states (TR 38.864 Table 5.1-2 / 5.1-3).
++ */
++enum class NrGnbPowerState
++{
++    DeepSleep,     //!< TR 38.864: Deep sleep  (P1)
++    LightSleep,    //!< TR 38.864: Light sleep (P2)
++    MicroSleep,    //!< TR 38.864: Micro sleep (P3) - static baseline
++    ActiveDl,      //!< TR 38.864: Active DL   (P_DL formula)
++    ActiveUl,      //!< TR 38.864: Active UL   (P_UL formula)
++    Transitioning, //!< Wake-up transition (T)
++    NumStates      //!< sentinel
++};
++
++/**
++ * @ingroup nr
++ * @brief Per-symbol activity of the gNB radio within a slot (TR 38.864 Section 5.2).
++ *
++ * This classifies what the gNB is doing during an OFDM symbol, which is what the
++ * energy formula keys off. It is NOT the 3GPP TDD slot type: 5G-LENA's "flexible"
++ * (F) slot is a dually-schedulable slot (DL CTRL + DL data + UL data + UL CTRL),
++ * not an idle one, and the scheduler resolves every allocated symbol to a
++ * definite DL or UL direction before the slot executes. A symbol that no
++ * var-TTI allocates carries no transmission or reception and is genuinely idle.
++ */
++enum class NrGnbSymbolType
++{
++    Dl,   //!< gNB transmitting DL - P_DL
++    Ul,   //!< gNB receiving UL    - P_UL
++    Idle, //!< Unallocated symbol  - P3
++    NumTypes
++};
++
++/**
++ * @ingroup nr
++ * @brief TR 38.864 gNB power consumption model.
+  *
+- * Minimal stub so that NrGnbPhyEnergyListener has a complete type to hold and
+- * drive. The gNB power-state machine, DL/UL power formulas, and symbol-level
+- * energy accounting are added in a later milestone.
++ * Implements the BS energy model of TR 38.864 Section 5: the DL/UL active power
++ * formulas with sa/sf/sp scaling, the P1..P5 relative power table, and
++ * symbol-level slot energy accumulation (Section 5.2). It is an ns-3
++ * energy::DeviceEnergyModel so it can be attached to an energy::EnergySource.
++ *
++ * Two complementary accounting paths feed the same running total:
++ *   - Discrete state path: ChangeState() integrates the current state power
++ *     over the elapsed time (used for sleep periods and whole-slot active
++ *     intervals). This is also what drives the attached EnergySource.
++ *   - Symbol-level path: UpdateSymbolPower() is called per OFDM symbol and
++ *     FinalizeSlotEnergy() commits the per-symbol sum (Section 5.2). Use this
++ *     for symbol-accurate active slots; do not mix it with ChangeState() over
++ *     the same time interval or energy will be double counted.
++ *
++ * P1..P5 are stored as spec-derived tables keyed by (BsCategory, RefConfig);
++ * a single attribute default cannot encode the per-category/set values.
+  */
+-class NrGnbEnergyModel : public Object
++class NrGnbEnergyModel : public energy::DeviceEnergyModel
+ {
+   public:
++    /**
++     * @brief BS hardware category (TR 38.864 Section 5.1).
++     */
++    enum BsCategory
++    {
++        BsCat1, //!< Macro / large-scale BS (e.g. 64 TxRU, 55 dBm)
++        BsCat2  //!< Small cell / distributed unit (e.g. 2 TxRU, 33 dBm)
++    };
++
++    /**
++     * @brief Reference configuration set (TR 38.864 Table 5.1-1).
++     */
++    enum RefConfigSet
++    {
++        Set1, //!< FR1 TDD, 100 MHz, 30 kHz SCS, 64 DL TxRU
++        Set2, //!< FR1 FDD, 20 MHz, 15 kHz SCS, 32 DL TxRU
++        Set3  //!< FR2 TDD, 100 MHz, 120 kHz SCS, 2 DL TxRU
++    };
++
++    /**
++     * @brief PA efficiency mode (TR 38.864 Section 5.1).
++     */
++    enum EtaMode
++    {
++        EtaSingle, //!< eta = 1.0 for all sf, sp
++        EtaDual    //!< eta = 1.0 if sf*sp >= 0.5, else 0.76
++    };
++
+     /**
+      * @brief Get the TypeId
+      * @return the TypeId
+@@ -42,6 +121,181 @@ class NrGnbEnergyModel : public Object
+      * @brief ~NrGnbEnergyModel
+      */
+     ~NrGnbEnergyModel() override;
++
++    // ----- 3GPP power formulas (pure, testable against TR 38.864 Section 5.1) -----
++
++    /**
++     * @brief Relative power for one of the P1..P5 states (current category/set).
++     * @param state One of the discrete NrGnbPowerState values.
++     * @return Relative power in power-units.
++     */
++    double GetRelativePower(NrGnbPowerState state) const;
++
++    /**
++     * @brief PA efficiency factor eta(sf, sp) (TR 38.864 Section 5.1).
++     * @param sf Bandwidth utilization factor [0,1].
++     * @param sp Tx power ratio [0,1].
++     * @return 1.0 (EtaSingle, or sf*sp >= 0.5) or 0.76 (EtaDual and sf*sp < 0.5).
++     */
++    double GetEta(double sf, double sp) const;
++
++    /**
++     * @brief Instantaneous DL active power [W] (TR 38.864 Section 5.1).
++     *
++     * P_DL = P3 + sa*(P4 - P3) * [ A + (sf*sp / eta(sf,sp)) * (1 - A) ].
++     *
++     * @param sa Active TRxRU ratio [0,1].
++     * @param sf Allocated-RB ratio [0,1].
++     * @param sp Tx power ratio [0,1].
++     * @return DL power in Watts.
++     */
++    double CalcDlPowerW(double sa, double sf, double sp) const;
++
++    /**
++     * @brief Instantaneous UL active power [W] (TR 38.864 Section 5.1).
++     *
++     * P_UL = P3 + sa*(P5 - P3). No sf/sp dependence.
++     *
++     * @param sa Active TRxRU ratio [0,1].
++     * @return UL power in Watts.
++     */
++    double CalcUlPowerW(double sa) const;
++
++    /**
++     * @brief OFDM symbol duration for the configured numerology.
++     * @return Symbol duration = (1ms / 2^mu) / 14.
++     */
++    Time GetSymbolDuration() const;
++
++    /**
++     * @brief Symbol-accurate energy of one slot (TR 38.864 Section 5.2).
++     *
++     * E_slot = sum_n P_symbol[n] * T_symbol, with P_symbol from the DL/UL/guard
++     * classification. This is a pure helper (does not touch the running total);
++     * use it to validate symbol-level accounting.
++     *
++     * @param pattern Per-symbol direction for the 14 symbols of the slot.
++     * @param sa Active TRxRU ratio [0,1].
++     * @param sf Allocated-RB ratio [0,1].
++     * @param sp Tx power ratio [0,1].
++     * @return Slot energy in Joules.
++     */
++    double ComputeSlotEnergyJ(const std::vector<NrGnbSymbolType>& pattern,
++                              double sa,
++                              double sf,
++                              double sp) const;
++
++    // ----- Symbol-level accumulation path (driven by NrGnbPhyEnergyListener) -----
++
++    /**
++     * @brief Accumulate one symbol's energy into the current slot (Section 5.2).
++     * @param sa Active TRxRU ratio [0,1].
++     * @param sf Allocated-RB ratio [0,1].
++     * @param sp Tx power ratio [0,1].
++     * @param symbolType DL / UL / guard classification of this symbol.
++     */
++    void UpdateSymbolPower(double sa, double sf, double sp, NrGnbSymbolType symbolType);
++
++    /**
++     * @brief Commit the accumulated per-symbol energy of the current slot.
++     */
++    void FinalizeSlotEnergy();
++
++    // ----- Dynamic scaling-factor setters -----
++
++    /**
++     * @brief Set the bandwidth utilization factor sf for the active state.
++     * @param sf Allocated-RB ratio [0,1].
++     */
++    void SetSf(double sf);
++
++    /**
++     * @brief Set the current Tx power; updates sp = P_tx_lin / P_ref_lin.
++     * @param txPowerDbm Current total Tx power in dBm.
++     */
++    void SetTxPowerDbm(double txPowerDbm);
++
++    // ----- State machine -----
++
++    /**
++     * @brief Change the gNB power state and accrue energy for the elapsed time.
++     * @param newState New NrGnbPowerState (passed as int per DeviceEnergyModel).
++     */
++    void ChangeState(int newState) override;
++
++    /**
++     * @brief Get the current gNB power state.
++     * @return The current NrGnbPowerState.
++     */
++    NrGnbPowerState GetCurrentState() const;
++
++    /**
++     * @brief Instantaneous power draw of the current discrete state [W].
++     *
++     * For ACTIVE_DL/UL this uses the current sa/sf/sp; for sleep states it is
++     * the corresponding P1/P2/P3 relative value.
++     *
++     * @return Power in Watts.
++     */
++    double GetCurrentPowerW() const;
++
++    /**
++     * @brief Total energy consumed since simulation start [Joules].
++     * @return Cumulative energy in Joules (includes the open state interval).
++     */
++    double GetTotalEnergyJ() const;
++    /**
++     * @brief Set the OFDM symbol duration (sourced from the PHY by the listener).
++     * @param symbolDuration Duration of one OFDM symbol.
++     */
++    void SetSymbolDuration(Time symbolDuration);
++
++    // ----- energy::DeviceEnergyModel interface -----
++
++    void SetEnergySource(Ptr<energy::EnergySource> source) override;
++    double GetTotalEnergyConsumption() const override;
++    void HandleEnergyDepletion() override;
++    void HandleEnergyRecharged() override;
++    void HandleEnergyChanged() override;
++
++  protected:
++    void DoDispose() override;
++
++  private:
++    /**
++     * @brief Current draw of the current state, in Ampere (DeviceEnergyModel).
++     * @return Current in Ampere (power / supply voltage).
++     */
++    double DoGetCurrentA() const override;
++
++    /**
++     * @brief Convert a relative power-unit value to Watts via PowerUnit.
++     * @param relative Relative power in power-units.
++     * @return Power in Watts.
++     */
++    double ToWatts(double relative) const;
++
++    Ptr<energy::EnergySource> m_source; //!< Attached energy source (may be null)
++
++    BsCategory m_bsCategory;  //!< BS hardware category
++    RefConfigSet m_refConfig; //!< Reference configuration set
++    EtaMode m_etaMode;        //!< PA efficiency mode
++    double m_antennaRatioA;   //!< Antenna dynamic power fraction A
++    double m_powerUnitW;      //!< Absolute scale: W per relative power-unit
++    Time m_symbolDuration;    //!< OFDM symbol duration (set from NrGnbPhy::GetSymbolPeriod)
++    double m_refTxPowerDbm;   //!< Reference Tx power for sp [dBm]
++    double m_sa;              //!< Active TRxRU ratio; fixed at 1.0 until antenna muting is modelled
++    double m_sf;              //!< Current bandwidth utilization factor
++    double m_sp;              //!< Current Tx power ratio
++
++    NrGnbPowerState m_currentState; //!< Current discrete power state
++    Time m_lastUpdateTime;          //!< Time of last state change
++
++    double m_slotEnergyAccumJ; //!< Per-symbol energy accumulated for current slot
++
++    TracedValue<int> m_stateTrace;      //!< Fires on each discrete state change
++    TracedValue<double> m_powerTrace;   //!< Fires with instantaneous power [W] on each change
++    TracedValue<double> m_totalEnergyJ; //!< Accumulated energy [J], excl. open interval
+ };
+ 
+ } // namespace ns3
+diff --git a/model/nr-gnb-phy-energy-listener.cc b/model/nr-gnb-phy-energy-listener.cc
+index c155bc87..6e884cba 100644
+--- a/model/nr-gnb-phy-energy-listener.cc
++++ b/model/nr-gnb-phy-energy-listener.cc
+@@ -3,18 +3,21 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ //
+ // 3GPP References:
+ //   TR 38.864 V18.1.0 (2023-03): Section 5.1 - scaling factors sa, sf, sp definitions
++//   TR 38.864 V18.1.0 (2023-03): Section 5.2 - symbol-level time-domain energy
+ 
+ #include "nr-gnb-phy-energy-listener.h"
+-#include "nr-gnb-phy.h"
++
+ #include "nr-gnb-energy-model.h"
++#include "nr-gnb-phy.h"
+ 
+ #include "ns3/log.h"
+ #include "ns3/simulator.h"
+ 
++#include <algorithm>
+ #include <cmath>
+ 
+ namespace ns3
+@@ -23,6 +26,11 @@ namespace ns3
+ NS_LOG_COMPONENT_DEFINE("NrGnbPhyEnergyListener");
+ NS_OBJECT_ENSURE_REGISTERED(NrGnbPhyEnergyListener);
+ 
++namespace
++{
++constexpr uint32_t SYMBOLS_PER_SLOT = 14; //!< OFDM symbols per NR slot (normal CP)
++} // namespace
++
+ TypeId
+ NrGnbPhyEnergyListener::GetTypeId()
+ {
+@@ -36,10 +44,10 @@ NrGnbPhyEnergyListener::GetTypeId()
+ NrGnbPhyEnergyListener::NrGnbPhyEnergyListener()
+     : m_lastDlSf(0.0),
+       m_lastUlSf(0.0),
+-      m_lastSp(1.0),    // Default: full power (sp=1)
+-      m_lastSa(1.0),    // Default: all antennas active (sa=1)
++      m_lastSp(1.0), // Default: full power (sp=1)
++      m_lastSa(1.0), // Default: all antennas active (sa=1)
+       m_totalBwpRbs(0),
+-      m_referenceTxPowerDbm(55.0)  // TR 38.864 Set 1 reference: 55 dBm total; per-antenna varies
++      m_referenceTxPowerDbm(55.0) // TR 38.864 Set 1 reference; refreshed at attach
+ {
+     NS_LOG_FUNCTION(this);
+ }
+@@ -57,11 +65,13 @@ NrGnbPhyEnergyListener::SetPhy(Ptr<NrGnbPhy> phy)
+     m_phy = phy;
+     m_totalBwpRbs = phy->GetRbNum();
+     m_referenceTxPowerDbm = phy->GetTxPower();
+-    // TODO Week 7: connect trace sources once added to NrGnbPhy:
+-    // phy->TraceConnectWithoutContext("SlotIndication",
+-    //     MakeCallback(&NrGnbPhyEnergyListener::SlotIndicationCallback, this));
+-    // phy->TraceConnectWithoutContext("PacketBurstSent",
+-    //     MakeCallback(&NrGnbPhyEnergyListener::DlBurstSentCallback, this));
++    if (m_model)
++    {
++        m_model->SetSymbolDuration(phy->GetSymbolPeriod());
++    }
++    phy->TraceConnectWithoutContext(
++        "SlotEnergyStats",
++        MakeCallback(&NrGnbPhyEnergyListener::SlotEnergyStatsCallback, this));
+ }
+ 
+ void
+@@ -69,7 +79,12 @@ NrGnbPhyEnergyListener::SetEnergyModel(Ptr<NrGnbEnergyModel> model)
+ {
+     NS_LOG_FUNCTION(this << model);
+     NS_ASSERT_MSG(model, "NrGnbEnergyModel pointer must not be null");
++
+     m_model = model;
++    if (m_phy)
++    {
++        m_model->SetSymbolDuration(m_phy->GetSymbolPeriod());
++    }
+ }
+ 
+ void
+@@ -82,57 +97,67 @@ NrGnbPhyEnergyListener::DoDispose()
+ }
+ 
+ void
+-NrGnbPhyEnergyListener::SlotIndicationCallback(const SfnSf& sfnSf)
++NrGnbPhyEnergyListener::SlotEnergyStatsCallback(const SfnSf& sfnSf,
++                                                uint32_t availableRb,
++                                                uint32_t dlDataSym,
++                                                uint32_t dlDataReg,
++                                                uint32_t ulDataSym,
++                                                uint32_t dlCtrlSym,
++                                                uint32_t dlCtrlReg,
++                                                uint32_t ulCtrlSym,
++                                                uint16_t bwpId,
++                                                uint16_t cellId)
+ {
+-    NS_LOG_FUNCTION(this << sfnSf);
++    NS_LOG_FUNCTION(this << sfnSf << availableRb << dlDataSym << ulDataSym << dlCtrlSym << ulCtrlSym
++                         << bwpId << cellId);
+     if (!m_model)
+     {
+         return;
+     }
+-    // TODO Week 7 (revisit here in Week 3 to stub):
+-    //
+-    // Key computation per TR 38.864 §5.1:
+-    //
+-    // For each symbol (0..13) in this slot:
+-    //   1. Classify symbol type: DL / UL / Guard from the TDD pattern.
+-    //      NrGnbPhy currently exposes only SetTddPattern() (no getter), so
+-    //      this needs a getter added, or the pattern cached at attach time.
+-    //      Decision (caching vs. per-slot query) to be made before Week 7.
+-    //
+-    //   2. sa = activeTRxRUs / totalTRxRUs. No source in PHY yet, so use
+-    //      m_lastSa (fixed at 1.0) until antenna muting is added.
+-    //
+-    //   3. Compute sf = allocatedDlRBs / m_totalBwpRbs
+-    //      (updated by DlBurstSentCallback, use m_lastDlSf)
+-    //
+-    //   4. RefreshSp() to update m_lastSp from current Tx power.
+-    //
+-    //   5. Call m_model->UpdateSymbolPower(sa, sf, sp, symbolType)
+-    //      for each symbol
+-    //
+-    // After all 14 symbols processed:
+-    //   6. Call m_model->FinalizeSlotEnergy()
+-}
+-
+-void
+-NrGnbPhyEnergyListener::DlBurstSentCallback(uint32_t allocatedRbs)
+-{
+-    // TODO Week 7:
+-    //
+-    // sf = allocatedRbs / m_totalBwpRbs
+-    // Source: TR 38.864 §5.1 — sf = fraction of BW carrying DL data
+-    //
+-    // Guard: if m_totalBwpRbs == 0, log a warning and return
+-    // m_lastDlSf = static_cast<double>(allocatedRbs) / m_totalBwpRbs;
+-    NS_LOG_FUNCTION(this << allocatedRbs);
+-}
+-
+-void
+-NrGnbPhyEnergyListener::UlReceiveCallback(uint32_t allocatedRbs)
+-{
+-    // TODO Week 7:
+-    // m_lastUlSf = static_cast<double>(allocatedRbs) / m_totalBwpRbs;
+-    NS_LOG_FUNCTION(this << allocatedRbs);
++    RefreshSp();
++
++    // sf = used REGs / (RBs in band * used symbols): the fraction of the band
++    // occupied during the active symbols (TR 38.864 Section 5.1 definition of sf).
++    // Computed separately for the DL data region and the DL control (PDCCH)
++    // region; the UL power formula has no sf dependence.
++    auto sf = [availableRb](uint32_t reg, uint32_t sym) {
++        return (availableRb > 0 && sym > 0)
++                   ? std::min(1.0,
++                              static_cast<double>(reg) / (static_cast<double>(availableRb) * sym))
++                   : 0.0;
++    };
++    double sfData = sf(dlDataReg, dlDataSym);
++    double sfCtrl = sf(dlCtrlReg, dlCtrlSym);
++    m_lastDlSf = sfData;
++
++    // Direction-aware per-symbol timeline (TR 38.864 Section 5.2). The gNB
++    // transmits during DL data and DL control (PDCCH), and receives during UL
++    // data and UL control (PUCCH/SRS), so DL symbols use P_DL(sf) and UL symbols
++    // use P_UL. Symbols carrying no allocation are idle (micro-sleep, P3). sa is
++    // held at 1.0 until antenna muting is modelled.
++    uint32_t scheduled = dlDataSym + ulDataSym + dlCtrlSym + ulCtrlSym;
++    uint32_t idleSym = (scheduled < SYMBOLS_PER_SLOT) ? (SYMBOLS_PER_SLOT - scheduled) : 0;
++    for (uint32_t s = 0; s < dlDataSym; ++s)
++    {
++        m_model->UpdateSymbolPower(m_lastSa, sfData, m_lastSp, NrGnbSymbolType::Dl);
++    }
++    for (uint32_t s = 0; s < dlCtrlSym; ++s)
++    {
++        m_model->UpdateSymbolPower(m_lastSa, sfCtrl, m_lastSp, NrGnbSymbolType::Dl);
++    }
++    for (uint32_t s = 0; s < ulDataSym; ++s)
++    {
++        m_model->UpdateSymbolPower(m_lastSa, 0.0, m_lastSp, NrGnbSymbolType::Ul);
++    }
++    for (uint32_t s = 0; s < ulCtrlSym; ++s)
++    {
++        m_model->UpdateSymbolPower(m_lastSa, 0.0, m_lastSp, NrGnbSymbolType::Ul);
++    }
++    for (uint32_t s = 0; s < idleSym; ++s)
++    {
++        m_model->UpdateSymbolPower(m_lastSa, 0.0, m_lastSp, NrGnbSymbolType::Idle);
++    }
++    m_model->FinalizeSlotEnergy();
+ }
+ 
+ void
+@@ -143,18 +168,37 @@ NrGnbPhyEnergyListener::RefreshSp()
+     {
+         return;
+     }
+-    // sp = current Tx power / reference Tx power (linear).
+-    // m_referenceTxPowerDbm is captured from m_phy->GetTxPower() at attach
+-    // time in SetPhy(); the current value below is re-read each slot so
+-    // runtime Tx-power changes (e.g. power control) are reflected.
++    // sp = current Tx power / reference Tx power (linear). The reference is
++    // captured from m_phy->GetTxPower() at attach time in SetPhy(); the
++    // current value below is re-read each slot so runtime Tx-power changes
++    // (e.g. power control) are reflected.
+     double curLin = std::pow(10.0, m_phy->GetTxPower() / 10.0);
+     double refLin = std::pow(10.0, m_referenceTxPowerDbm / 10.0);
+-    m_lastSp = (refLin > 0.0) ? (curLin / refLin) : 1.0;
++    m_lastSp = (refLin > 0.0) ? std::min(1.0, curLin / refLin) : 1.0;
+ }
+ 
+-double NrGnbPhyEnergyListener::GetLastDlSf() const { return m_lastDlSf; }
+-double NrGnbPhyEnergyListener::GetLastUlSf() const { return m_lastUlSf; }
+-double NrGnbPhyEnergyListener::GetLastSp()   const { return m_lastSp; }
+-double NrGnbPhyEnergyListener::GetLastSa()   const { return m_lastSa; }
++double
++NrGnbPhyEnergyListener::GetLastDlSf() const
++{
++    return m_lastDlSf;
++}
++
++double
++NrGnbPhyEnergyListener::GetLastUlSf() const
++{
++    return m_lastUlSf;
++}
++
++double
++NrGnbPhyEnergyListener::GetLastSp() const
++{
++    return m_lastSp;
++}
++
++double
++NrGnbPhyEnergyListener::GetLastSa() const
++{
++    return m_lastSa;
++}
+ 
+ } // namespace ns3
+diff --git a/model/nr-gnb-phy-energy-listener.h b/model/nr-gnb-phy-energy-listener.h
+index d5bfac26..d35d572f 100644
+--- a/model/nr-gnb-phy-energy-listener.h
++++ b/model/nr-gnb-phy-energy-listener.h
+@@ -3,7 +3,7 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ //
+ // 3GPP References:
+ //   TR 38.864 V18.1.0 (2023-03): Section 5.1 - Energy consumption model for BS
+@@ -11,11 +11,13 @@
+ #ifndef NR_GNB_PHY_ENERGY_LISTENER_H
+ #define NR_GNB_PHY_ENERGY_LISTENER_H
+ 
+-#include "ns3/object.h"
+-#include "ns3/ptr.h"
++#include "sfnsf.h"
++
+ #include "ns3/callback.h"
+ #include "ns3/nstime.h"
+-#include "ns3/sfnsf.h"
++#include "ns3/object.h"
++#include "ns3/ptr.h"
++
+ namespace ns3
+ {
+ 
+@@ -23,16 +25,17 @@ namespace ns3
+ class NrGnbPhy;
+ class NrGnbEnergyModel;
+ 
+-
+ /**
+  * @ingroup nr
+  * @brief Callback bridge between NR gNB PHY layer events and the gNB energy model.
+  *
+  * This class is the decoupling layer between the gNB's PHY event stream and the
+- * gNB energy model state machine. It subscribes to trace sources on NrGnbPhy,
+- * extracts the dynamic scaling factors (sa, sf, sp) required by the 3GPP
+- * TR 38.864 power formula, and forwards energy model state-change calls to
+- * NrGnbEnergyModel.
++ * gNB energy model state machine. It subscribes to the existing NrGnbPhy
++ * "SlotEnergyStats" trace, which reports the per-slot scheduler usage split by
++ * direction (DL/UL data and DL/UL control symbols and REGs), extracts the
++ * dynamic scaling factors (sa, sf, sp) required by the 3GPP TR 38.864 power
++ * formula, and drives NrGnbEnergyModel symbol-by-symbol, charging DL symbols at
++ * the DL active power and UL symbols at the UL power (TR 38.864 Section 5.2).
+  *
+  * Design rationale:
+  *   - This class must NOT be aware of the energy formula internals.
+@@ -41,7 +44,6 @@ class NrGnbEnergyModel;
+  *     (if no model is attached, callbacks are no-ops).
+  *   - It has a single responsibility: the gNB side of the mapping. The UE side
+  *     lives in a separate listener.
+- *
+  */
+ class NrGnbPhyEnergyListener : public Object
+ {
+@@ -64,10 +66,8 @@ class NrGnbPhyEnergyListener : public Object
+     /**
+      * @brief Attach this listener to a gNB PHY instance.
+      *
+-     * Subscribes to the following trace sources on phy:
+-     *   - SlotIndication     - fires each slot start. extract TDD structure here
+-     *   - PacketBurstSent    - DL burst sent; extract active RBs for sf
+-     *   - UlRxSuccess        - UL reception; triggers UL power state
++     * Subscribes to the NrGnbPhy "SlotEnergyStats" trace and caches the total
++     * BWP RBs and the reference Tx power for the sp computation.
+      *
+      * @param phy Pointer to the NrGnbPhy on the gNB node.
+      */
+@@ -82,7 +82,7 @@ class NrGnbPhyEnergyListener : public Object
+     /**
+      * @brief Get the most recently computed DL bandwidth utilization sf.
+      *
+-     * sf = allocated_RBs_DL / total_BWP_RBs
++     * sf = used_REGs / (available_RBs * used_symbols)
+      * Source: TR 38.864 Section 5.1 definition of sf.
+      *
+      * @return Last sf value in [0.0, 1.0].
+@@ -123,36 +123,39 @@ class NrGnbPhyEnergyListener : public Object
+ 
+   private:
+     /**
+-     * @brief Called each time a new slot starts (gNB side).
+-     *
+-     * Responsibilities:
+-     *   1. Extract TDD symbol pattern for this slot from NrGnbPhy.
+-     *   2. Compute sf = allocated_DL_RBs / total_BWP_RBs (from scheduler output).
+-     *   3. Compute sp from current Tx power setting.
+-     *   4. Call NrGnbEnergyModel::UpdateSymbolPower() for each of the 14 symbols.
+-     *
+-     * @param sfnSf The current system frame / slot number.
+-     */
+-    void SlotIndicationCallback(const SfnSf& sfnSf);
+-
+-    /**
+-     * @brief Called when a DL packet burst is sent by the gNB.
+-     *
+-     * Used to extract the number of allocated DL RBs for sf computation.
+-     * sf = allocatedRbs / m_totalBwpRbs
+-     *
+-     * @param allocatedRbs Number of DL resource blocks allocated in this TTI.
+-     */
+-    void DlBurstSentCallback(uint32_t allocatedRbs);
+-
+-    /**
+-     * @brief Called when a UL burst reception completes at the gNB.
++     * @brief Per-slot gNB driver, connected to NrGnbPhy "SlotEnergyStats".
+      *
+-     * Used to extract the number of allocated UL RBs for the UL sf factor.
++     * Builds a direction-aware per-symbol power timeline (TR 38.864 Section 5.2):
++     *   - DL data / DL control (PDCCH) symbols -> DL active power at the measured
++     *     sf (the gNB is transmitting, PA on);
++     *   - UL data / UL control (PUCCH/SRS) symbols -> UL power (the gNB is
++     *     receiving), which has no sf/sp dependence;
++     *   - unallocated symbols -> micro-sleep (P3).
++     * "Idle" is not the 3GPP "flexible" (F) slot type: F is a dually-schedulable
++     * slot already resolved to DL/UL directions, so a fully-scheduled F slot has
++     * no idle symbols at all. After the 14 symbols the slot energy is committed.
+      *
+-     * @param allocatedRbs Number of UL resource blocks in this TTI.
++     * @param sfnSf       The current system frame / slot number.
++     * @param availableRb Resource blocks available in the BWP.
++     * @param dlDataSym   DL data symbols in the slot.
++     * @param dlDataReg   DL data REGs (RB x symbols), for the DL data sf.
++     * @param ulDataSym   UL data symbols in the slot.
++     * @param dlCtrlSym   DL control (PDCCH) symbols.
++     * @param dlCtrlReg   DL control REGs (RB x symbols), for the PDCCH sf.
++     * @param ulCtrlSym   UL control (PUCCH/SRS) symbols.
++     * @param bwpId       BWP id.
++     * @param cellId      Cell id.
+      */
+-    void UlReceiveCallback(uint32_t allocatedRbs);
++    void SlotEnergyStatsCallback(const SfnSf& sfnSf,
++                                 uint32_t availableRb,
++                                 uint32_t dlDataSym,
++                                 uint32_t dlDataReg,
++                                 uint32_t ulDataSym,
++                                 uint32_t dlCtrlSym,
++                                 uint32_t dlCtrlReg,
++                                 uint32_t ulCtrlSym,
++                                 uint16_t bwpId,
++                                 uint16_t cellId);
+ 
+     /**
+      * @brief Recompute m_lastSp from the gNB's current Tx power.
+@@ -162,17 +165,17 @@ class NrGnbPhyEnergyListener : public Object
+      */
+     void RefreshSp();
+ 
+-    Ptr<NrGnbPhy> m_phy;             //!< Attached gNB PHY (may be null)
+-    Ptr<NrGnbEnergyModel> m_model;   //!< Attached gNB energy model (may be null)
++    Ptr<NrGnbPhy> m_phy;           //!< Attached gNB PHY (may be null)
++    Ptr<NrGnbEnergyModel> m_model; //!< Attached gNB energy model (may be null)
+ 
+-    double m_lastDlSf; //!< Last DL sf computed: allocated_RBs / total_RBs
++    double m_lastDlSf; //!< Last DL sf computed: used_REGs / (available_RBs * used_sym)
+     double m_lastUlSf; //!< Last UL sf computed
+     double m_lastSp;   //!< Last sp computed: currentTxPower_lin / refTxPower_lin
+     double m_lastSa;   //!< Last sa: activeTRxRUs / totalTRxRUs. Fixed at 1.0
+                        //!< until antenna muting is added (no source in PHY yet).
+ 
+-    uint32_t m_totalBwpRbs;         //!< Total RBs in active BWP (from NrGnbPhy)
+-    double m_referenceTxPowerDbm;   //!< Reference Tx power for sp computation
++    uint32_t m_totalBwpRbs;       //!< Total RBs in active BWP (from NrGnbPhy)
++    double m_referenceTxPowerDbm; //!< Reference Tx power for sp computation
+ };
+ 
+ } // namespace ns3
+diff --git a/model/nr-gnb-phy.cc b/model/nr-gnb-phy.cc
+index 516df5ba..f7ca95f6 100644
+--- a/model/nr-gnb-phy.cc
++++ b/model/nr-gnb-phy.cc
+@@ -29,6 +29,7 @@
+ #include "ns3/uinteger.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <functional>
+ #include <random>
+ #include <string>
+@@ -197,6 +198,12 @@ NrGnbPhy::GetTypeId()
+                             "used symbols, available RBs, available symbols, bwp ID, cell ID",
+                             MakeTraceSourceAccessor(&NrGnbPhy::m_phySlotCtrlStats),
+                             "ns3::NrGnbPhy::SlotStatsTracedCallback")
++            .AddTraceSource("SlotEnergyStats",
++                            "Per-direction slot statistics for the energy framework: SfnSf, "
++                            "available RBs, DL data symbols, DL data REGs, UL data symbols, DL "
++                            "ctrl symbols, DL ctrl REGs, UL ctrl symbols, bwp ID, cell ID",
++                            MakeTraceSourceAccessor(&NrGnbPhy::m_phySlotEnergyStats),
++                            "ns3::NrGnbPhy::SlotEnergyStatsTracedCallback")
+             .AddTraceSource(
+                 "RBDataStats",
+                 "Resource Block used for data: SfnSf, symbol, RB PHY map, bwp ID, cell ID",
+@@ -1048,6 +1055,50 @@ NrGnbPhy::GenerateAllocationStatistics(const SlotAllocInfo& allocInfo) const
+                        GetSymbolsPerSlot() - dataSym,
+                        GetBwpId(),
+                        GetCellId());
++
++    // Per-direction split for the energy framework (additive; the aggregate
++    // stats above are untouched). DL/UL data and DL/UL control occupy disjoint
++    // symbol ranges within a slot, so a per-symbol class map is exac. It
++    // captures F slots (DL data + UL data) and HARQ retransmissions, which the
++    // MAC scheduling traces do not.
++    std::vector<uint8_t> symClass(GetSymbolsPerSlot(),
++                                  0); // 0 idle, 1 DL data, 2 UL data, 3 DL ctrl, 4 UL ctrl
++    uint32_t dlDataReg = 0;
++    uint32_t dlCtrlReg = 0;
++    for (const auto& allocation : allocInfo.m_varTtiAllocInfo)
++    {
++        const auto& dci = allocation.m_dci;
++        const bool ul = (dci->m_format == DciInfoElementTdma::UL);
++        const bool isData =
++            (dci->m_type & (DciInfoElementTdma::DATA | DciInfoElementTdma::MSG3)) != 0;
++        const uint8_t cls = isData ? (ul ? 2 : 1) : (ul ? 4 : 3);
++        const uint32_t rbg = std::count(dci->m_rbgBitmask.begin(), dci->m_rbgBitmask.end(), 1);
++        const uint32_t reg = rbg * GetNumRbPerRbg() * dci->m_numSym;
++        for (uint32_t s = dci->m_symStart;
++             s < dci->m_symStart + dci->m_numSym && s < symClass.size();
++             ++s)
++        {
++            symClass[s] = cls;
++        }
++        if (isData && !ul)
++        {
++            dlDataReg += reg;
++        }
++        else if (!isData && !ul)
++        {
++            dlCtrlReg += reg;
++        }
++    }
++    m_phySlotEnergyStats(allocInfo.m_sfnSf,
++                         availRb,
++                         std::count(symClass.begin(), symClass.end(), 1),
++                         dlDataReg,
++                         std::count(symClass.begin(), symClass.end(), 2),
++                         std::count(symClass.begin(), symClass.end(), 3),
++                         dlCtrlReg,
++                         std::count(symClass.begin(), symClass.end(), 4),
++                         GetBwpId(),
++                         GetCellId());
+ }
+ 
+ void
+diff --git a/model/nr-gnb-phy.h b/model/nr-gnb-phy.h
+index b08447c2..e488c719 100644
+--- a/model/nr-gnb-phy.h
++++ b/model/nr-gnb-phy.h
+@@ -436,6 +436,34 @@ class NR_EXPORT NrGnbPhy : public NrPhy
+                                           uint16_t bwpId,
+                                           uint16_t cellId);
+ 
++    /**
++     * @brief TracedCallback signature for per-direction slot energy statistics
++     *
++     * Splits the slot's used symbols by direction so an energy listener can
++     * charge each at the correct TR 38.864 power (DL active vs UL vs micro-sleep).
++     *
++     * @param [in] sfnSf Slot number
++     * @param [in] availableRb Available RBs in the BWP
++     * @param [in] dlDataSym DL data symbols in the slot
++     * @param [in] dlDataReg DL data REGs (RB x symbols), for the DL sf
++     * @param [in] ulDataSym UL data symbols in the slot
++     * @param [in] dlCtrlSym DL control (PDCCH) symbols
++     * @param [in] dlCtrlReg DL control REGs (RB x symbols), for the PDCCH sf
++     * @param [in] ulCtrlSym UL control (PUCCH/SRS) symbols
++     * @param [in] bwpId BWP ID
++     * @param [in] cellId Cell ID
++     */
++    typedef void (*SlotEnergyStatsTracedCallback)(const SfnSf& sfnSf,
++                                                  uint32_t availableRb,
++                                                  uint32_t dlDataSym,
++                                                  uint32_t dlDataReg,
++                                                  uint32_t ulDataSym,
++                                                  uint32_t dlCtrlSym,
++                                                  uint32_t dlCtrlReg,
++                                                  uint32_t ulCtrlSym,
++                                                  uint16_t bwpId,
++                                                  uint16_t cellId);
++
+     /**
+      * @brief Retrieve the number of RB per RBG
+      * @return the number of RB per RBG
+@@ -898,6 +926,24 @@ class NR_EXPORT NrGnbPhy : public NrPhy
+                    uint16_t>
+         m_phySlotDataStats;
+ 
++    /**
++     * @brief Per-direction slot statistics for the energy framework: splits the
++     * used symbols into DL/UL data and DL/UL control so a listener can charge
++     * each at the correct TR 38.864 power. Additive; does not affect the
++     * aggregate SlotData/SlotCtrl stats.
++     */
++    TracedCallback<const SfnSf&,
++                   uint32_t,
++                   uint32_t,
++                   uint32_t,
++                   uint32_t,
++                   uint32_t,
++                   uint32_t,
++                   uint32_t,
++                   uint16_t,
++                   uint16_t>
++        m_phySlotEnergyStats;
++
+     TracedCallback<const SfnSf&, uint8_t, const std::vector<int>&, uint16_t, uint16_t>
+         m_rbStatistics;
+ 
+diff --git a/model/nr-ue-drx-model.cc b/model/nr-ue-drx-model.cc
+new file mode 100644
+index 00000000..38a39481
+--- /dev/null
++++ b/model/nr-ue-drx-model.cc
+@@ -0,0 +1,164 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.840 V16.0.0 (2019-06): Section 8 - C-DRX power saving evaluation
++
++#include "nr-ue-drx-model.h"
++
++#include "nr-ue-energy-model.h"
++
++#include "ns3/log.h"
++#include "ns3/nstime.h"
++#include "ns3/simulator.h"
++
++namespace ns3
++{
++
++NS_LOG_COMPONENT_DEFINE("NrUeDrxModel");
++NS_OBJECT_ENSURE_REGISTERED(NrUeDrxModel);
++
++TypeId
++NrUeDrxModel::GetTypeId()
++{
++    static TypeId tid =
++        TypeId("ns3::NrUeDrxModel")
++            .SetParent<Object>()
++            .SetGroupName("Nr")
++            .AddConstructor<NrUeDrxModel>()
++            .AddAttribute("LongCycle",
++                          "DRX long cycle period (TS 38.321 drx-LongCycle).",
++                          TimeValue(MilliSeconds(160)),
++                          MakeTimeAccessor(&NrUeDrxModel::m_longCycle),
++                          MakeTimeChecker())
++            .AddAttribute("OnDuration",
++                          "onDuration monitoring window (TS 38.321 drx-onDurationTimer).",
++                          TimeValue(MilliSeconds(8)),
++                          MakeTimeAccessor(&NrUeDrxModel::m_onDuration),
++                          MakeTimeChecker())
++            .AddAttribute("InactivityTimer",
++                          "drx-InactivityTimer restarted on each data activity.",
++                          TimeValue(MilliSeconds(10)),
++                          MakeTimeAccessor(&NrUeDrxModel::m_inactivityTimer),
++                          MakeTimeChecker())
++            .AddAttribute("DeepSleepThreshold",
++                          "Gap to next onDuration at/above which deep sleep is used.",
++                          TimeValue(MilliSeconds(20)),
++                          MakeTimeAccessor(&NrUeDrxModel::m_deepSleepThreshold),
++                          MakeTimeChecker());
++    return tid;
++}
++
++NrUeDrxModel::NrUeDrxModel()
++    : m_energyModel(nullptr),
++      m_longCycle(MilliSeconds(160)),
++      m_onDuration(MilliSeconds(8)),
++      m_inactivityTimer(MilliSeconds(10)),
++      m_deepSleepThreshold(MilliSeconds(20)),
++      m_nextCycleTime(Seconds(0)),
++      m_inactivityRunning(false)
++{
++    NS_LOG_FUNCTION(this);
++}
++
++NrUeDrxModel::~NrUeDrxModel()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++NrUeDrxModel::SetEnergyModel(Ptr<NrUeEnergyModel> model)
++{
++    NS_LOG_FUNCTION(this << model);
++    NS_ASSERT_MSG(model, "NrUeEnergyModel pointer must not be null");
++    m_energyModel = model;
++}
++
++void
++NrUeDrxModel::Start(Time startAt)
++{
++    NS_LOG_FUNCTION(this << startAt);
++    m_cycleEvent = Simulator::Schedule(startAt - Simulator::Now(), &NrUeDrxModel::StartCycle, this);
++}
++
++void
++NrUeDrxModel::StartCycle()
++{
++    NS_LOG_FUNCTION(this);
++    // Wake for the onDuration: monitor PDCCH (TR 38.840 "PDCCH-only").
++    if (m_energyModel)
++    {
++        m_energyModel->ChangeState(NR_UE_PDCCH_ONLY);
++    }
++    m_inactivityRunning = false;
++    m_nextCycleTime = Simulator::Now() + m_longCycle;
++    m_onDurationEvent = Simulator::Schedule(m_onDuration, &NrUeDrxModel::EndOnDuration, this);
++    m_cycleEvent = Simulator::Schedule(m_longCycle, &NrUeDrxModel::StartCycle, this);
++}
++
++void
++NrUeDrxModel::EndOnDuration()
++{
++    NS_LOG_FUNCTION(this);
++    // If no activity extended the awake window, sleep now.
++    if (!m_inactivityRunning)
++    {
++        GoToSleep();
++    }
++}
++
++void
++NrUeDrxModel::NotifyDataActivity()
++{
++    NS_LOG_FUNCTION(this);
++    // (Re)start the inactivity timer; this keeps the UE awake past onDuration.
++    m_inactivityRunning = true;
++    m_inactivityEvent.Cancel();
++    m_inactivityEvent =
++        Simulator::Schedule(m_inactivityTimer, &NrUeDrxModel::InactivityExpired, this);
++}
++
++void
++NrUeDrxModel::InactivityExpired()
++{
++    NS_LOG_FUNCTION(this);
++    m_inactivityRunning = false;
++    GoToSleep();
++}
++
++void
++NrUeDrxModel::GoToSleep()
++{
++    NS_LOG_FUNCTION(this);
++    if (!m_energyModel)
++    {
++        return;
++    }
++    // Deeper sleep only pays off over a long inactive gap (TR 38.840 Section 8.1).
++    Time gap = m_nextCycleTime - Simulator::Now();
++    if (gap >= m_deepSleepThreshold)
++    {
++        m_energyModel->ChangeState(NR_UE_DEEP_SLEEP);
++    }
++    else
++    {
++        m_energyModel->ChangeState(NR_UE_LIGHT_SLEEP);
++    }
++}
++
++void
++NrUeDrxModel::DoDispose()
++{
++    NS_LOG_FUNCTION(this);
++    m_cycleEvent.Cancel();
++    m_onDurationEvent.Cancel();
++    m_inactivityEvent.Cancel();
++    m_energyModel = nullptr;
++    Object::DoDispose();
++}
++
++} // namespace ns3
+diff --git a/model/nr-ue-drx-model.h b/model/nr-ue-drx-model.h
+new file mode 100644
+index 00000000..3b7fd3b5
+--- /dev/null
++++ b/model/nr-ue-drx-model.h
+@@ -0,0 +1,127 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.840 V16.0.0 (2019-06): Section 8 - UE power saving / C-DRX evaluation
++//   TS 38.321: MAC C-DRX procedure (onDuration, inactivity, long cycle)
++
++#ifndef NR_UE_DRX_MODEL_H
++#define NR_UE_DRX_MODEL_H
++
++#include "ns3/event-id.h"
++#include "ns3/nstime.h"
++#include "ns3/object.h"
++#include "ns3/ptr.h"
++
++namespace ns3
++{
++
++class NrUeEnergyModel;
++
++/**
++ * @ingroup nr
++ * @brief Connected-mode DRX power model that drives the UE energy state machine.
++ *
++ * 5G-LENA has no MAC C-DRX engine, so for TR 38.840 power-saving evaluation
++ * this class runs the DRX timers (onDuration, inactivity, long cycle) on the
++ * ns-3 scheduler and toggles the attached NrUeEnergyModel between active
++ * monitoring (PDCCH-only) and sleep (light / deep) accordingly. It is a power
++ * model for energy evaluation, not a protocol-accurate MAC DRX: it does not
++ * gate the scheduler, it only decides the UE power state over time.
++ *
++ * Behaviour (TS 38.321 semantics):
++ *   - Each long cycle the onDuration starts: UE wakes to PDCCH-only monitoring.
++ *   - Data activity (NotifyDataActivity, fired by NrUePhyEnergyListener on a
++ *     transport block) (re)starts the inactivity timer and keeps the UE awake.
++ *   - When the onDuration ends with no running inactivity timer, or when the
++ *     inactivity timer expires, the UE sleeps until the next onDuration.
++ *   - Sleep depth is chosen by the gap to the next onDuration: a gap at least
++ *     DeepSleepThreshold long uses deep sleep, otherwise light sleep
++ *     (TR 38.840 Section 8.1: deeper sleep amortises its transition cost only
++ *     over long inactive periods).
++ */
++class NrUeDrxModel : public Object
++{
++  public:
++    /**
++     * @brief Get the TypeId
++     * @return the TypeId
++     */
++    static TypeId GetTypeId();
++
++    /**
++     * @brief NrUeDrxModel constructor
++     */
++    NrUeDrxModel();
++
++    /**
++     * @brief ~NrUeDrxModel
++     */
++    ~NrUeDrxModel() override;
++
++    /**
++     * @brief Set the UE energy model that this DRX model drives.
++     * @param model Pointer to the NrUeEnergyModel instance.
++     */
++    void SetEnergyModel(Ptr<NrUeEnergyModel> model);
++
++    /**
++     * @brief Begin DRX cycling at the given time.
++     * @param startAt Absolute time of the first onDuration start.
++     */
++    void Start(Time startAt);
++
++    /**
++     * @brief Notify the model that data was sent/received for this UE.
++     *
++     * (Re)starts the inactivity timer and keeps the UE awake. Called by
++     * NrUePhyEnergyListener on each DL/UL transport block.
++     */
++    void NotifyDataActivity();
++
++  protected:
++    void DoDispose() override;
++
++  private:
++    /**
++     * @brief Start of a DRX long cycle: wake to onDuration monitoring.
++     */
++    void StartCycle();
++
++    /**
++     * @brief End of the onDuration window: sleep if no inactivity timer runs.
++     */
++    void EndOnDuration();
++
++    /**
++     * @brief Inactivity timer expiry: sleep until the next onDuration.
++     */
++    void InactivityExpired();
++
++    /**
++     * @brief Put the UE into the appropriate sleep state for the gap remaining.
++     */
++    void GoToSleep();
++
++    Ptr<NrUeEnergyModel> m_energyModel; //!< Driven UE energy model (may be null)
++
++    Time m_longCycle;          //!< DRX long cycle period
++    Time m_onDuration;         //!< onDuration window length
++    Time m_inactivityTimer;    //!< drx-InactivityTimer length
++    Time m_deepSleepThreshold; //!< Gap >= this -> deep sleep, else light sleep
++
++    Time m_nextCycleTime;     //!< Absolute time of the next onDuration start
++    bool m_inactivityRunning; //!< True while the inactivity timer is armed
++
++    EventId m_cycleEvent;      //!< Next StartCycle event
++    EventId m_onDurationEvent; //!< EndOnDuration event
++    EventId m_inactivityEvent; //!< InactivityExpired event
++};
++
++} // namespace ns3
++
++#endif // NR_UE_DRX_MODEL_H
+diff --git a/model/nr-ue-energy-model.cc b/model/nr-ue-energy-model.cc
+index 13ef3e02..935c00b9 100644
+--- a/model/nr-ue-energy-model.cc
++++ b/model/nr-ue-energy-model.cc
+@@ -3,11 +3,23 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.840 V16.0.0 (2019-06): Section 8.1 - UE power states and scaling
+ 
+ #include "nr-ue-energy-model.h"
+ 
++#include "ns3/double.h"
++#include "ns3/energy-source.h"
++#include "ns3/enum.h"
+ #include "ns3/log.h"
++#include "ns3/nstime.h"
++#include "ns3/simulator.h"
++#include "ns3/uinteger.h"
++
++#include <algorithm>
++#include <cmath>
+ 
+ namespace ns3
+ {
+@@ -15,17 +27,111 @@ namespace ns3
+ NS_LOG_COMPONENT_DEFINE("NrUeEnergyModel");
+ NS_OBJECT_ENSURE_REGISTERED(NrUeEnergyModel);
+ 
++// TR 38.840 Table 18 relative power values (Deep Sleep = 1). Stored as tables
++// keyed by frequency range because a single attribute default cannot express
++// the "FR1 value / FR2 value" pairs the standard defines.
++namespace
++{
++// Index by NrUePowerState (excluding the NR_UE_NUM_STATES sentinel).
++constexpr double UE_POWER_FR1[NR_UE_NUM_STATES] = {
++    1.0,   // NR_UE_DEEP_SLEEP
++    20.0,  // NR_UE_LIGHT_SLEEP
++    45.0,  // NR_UE_MICRO_SLEEP
++    100.0, // NR_UE_PDCCH_ONLY
++    100.0, // NR_UE_SSB_CSI_RS
++    300.0, // NR_UE_PDCCH_PDSCH
++    250.0  // NR_UE_UL_TX (0 dBm anchor; 23 dBm anchor = 700, see SetUlTxPowerDbm)
++};
++constexpr double UE_POWER_FR2[NR_UE_NUM_STATES] = {
++    1.0,   // NR_UE_DEEP_SLEEP
++    20.0,  // NR_UE_LIGHT_SLEEP
++    38.0,  // NR_UE_MICRO_SLEEP
++    175.0, // NR_UE_PDCCH_ONLY
++    175.0, // NR_UE_SSB_CSI_RS
++    350.0, // NR_UE_PDCCH_PDSCH
++    350.0  // NR_UE_UL_TX (single FR2 value)
++};
++
++constexpr double UE_UL_POWER_FR1_0DBM = 250.0;   // TR 38.840 Table 18
++constexpr double UE_UL_POWER_FR1_23DBM = 700.0;  // TR 38.840 Table 18
++constexpr double UE_BWP_TRANSITION_FLOOR = 50.0; // TR 38.840 Section 8.1.3
++} // namespace
++
+ TypeId
+ NrUeEnergyModel::GetTypeId()
+ {
+-    static TypeId tid = TypeId("ns3::NrUeEnergyModel")
+-                            .SetParent<Object>()
+-                            .SetGroupName("Nr")
+-                            .AddConstructor<NrUeEnergyModel>();
++    static TypeId tid =
++        TypeId("ns3::NrUeEnergyModel")
++            .SetParent<energy::DeviceEnergyModel>()
++            .SetGroupName("Nr")
++            .AddConstructor<NrUeEnergyModel>()
++            .AddAttribute("FreqRange",
++                          "Frequency range selecting the TR 38.840 power table.",
++                          EnumValue(FR1),
++                          MakeEnumAccessor<FreqRange>(&NrUeEnergyModel::m_freqRange),
++                          MakeEnumChecker(FR1, "FR1", FR2, "FR2"))
++            .AddAttribute("PowerUnit",
++                          "Absolute power of one TR 38.840 relative power-unit, in mW.",
++                          DoubleValue(1.0),
++                          MakeDoubleAccessor(&NrUeEnergyModel::m_powerUnitMw),
++                          MakeDoubleChecker<double>(0.0))
++            .AddAttribute("ReferenceRxAntennas",
++                          "Reference number of receive antennas (TR 38.840 Section 8.1.3).",
++                          UintegerValue(4),
++                          MakeUintegerAccessor(&NrUeEnergyModel::m_refRxAntennas),
++                          MakeUintegerChecker<uint32_t>(1))
++            .AddAttribute("ReferenceBwpBandwidth",
++                          "Reference BWP bandwidth in MHz (TR 38.840 Section 8.1.3).",
++                          UintegerValue(100),
++                          MakeUintegerAccessor(&NrUeEnergyModel::m_refBwpMhz),
++                          MakeUintegerChecker<uint32_t>(1))
++            .AddAttribute("SetupTransitionPower",
++                          "Transient extra power [W] for a sleep->active (RRC setup) transition. "
++                          "0 = disabled (instantaneous, free transitions).",
++                          DoubleValue(0.0),
++                          MakeDoubleAccessor(&NrUeEnergyModel::m_setupTransitionPowerW),
++                          MakeDoubleChecker<double>(0.0))
++            .AddAttribute("SetupTransitionTime",
++                          "Duration of the setup/RRC transition transient.",
++                          TimeValue(MilliSeconds(20)),
++                          MakeTimeAccessor(&NrUeEnergyModel::m_setupTransitionTime),
++                          MakeTimeChecker())
++            .AddTraceSource("State",
++                            "Current UE power state (NrUePowerState as int).",
++                            MakeTraceSourceAccessor(&NrUeEnergyModel::m_stateTrace),
++                            "ns3::TracedValueCallback::Int32")
++            .AddTraceSource("InstantaneousPower",
++                            "Instantaneous UE power draw [W] at each state change.",
++                            MakeTraceSourceAccessor(&NrUeEnergyModel::m_powerTrace),
++                            "ns3::TracedValueCallback::Double")
++            .AddTraceSource("TotalEnergyConsumption",
++                            "Total energy consumed by the UE [J].",
++                            MakeTraceSourceAccessor(&NrUeEnergyModel::m_totalEnergyJ),
++                            "ns3::TracedValueCallback::Double");
+     return tid;
+ }
+ 
+ NrUeEnergyModel::NrUeEnergyModel()
++    : m_source(nullptr),
++      m_freqRange(FR1),
++      m_powerUnitMw(1.0),
++      m_refRxAntennas(4),
++      m_refBwpMhz(100),
++      m_currentState(NR_UE_DEEP_SLEEP),
++      m_lastUpdateTime(Seconds(0)),
++      m_ulRelativePower(UE_UL_POWER_FR1_0DBM),
++      m_stateTimeS{},
++      m_occupancyStart(Seconds(0)),
++      m_bwpScale(1.0),
++      m_antennaScale(1.0),
++      m_bdScale(1.0),
++      m_transitionExtraW(0.0),
++      m_transitionEndTime(Seconds(0)),
++      m_setupTransitionPowerW(0.0),
++      m_setupTransitionTime(MilliSeconds(20)),
++      m_stateTrace(NR_UE_DEEP_SLEEP),
++      m_powerTrace(0.0),
++      m_totalEnergyJ(0.0)
+ {
+     NS_LOG_FUNCTION(this);
+ }
+@@ -35,4 +141,289 @@ NrUeEnergyModel::~NrUeEnergyModel()
+     NS_LOG_FUNCTION(this);
+ }
+ 
++double
++NrUeEnergyModel::GetRelativePower(NrUePowerState state) const
++{
++    NS_LOG_FUNCTION(this << state);
++    NS_ASSERT_MSG(state < NR_UE_NUM_STATES, "Invalid UE power state");
++    if (state == NR_UE_UL_TX)
++    {
++        // UL power is level-dependent (set via SetUlTxPowerDbm); use the cached
++        // value rather than the table anchor so power control is reflected.
++        return m_ulRelativePower;
++    }
++    return (m_freqRange == FR1) ? UE_POWER_FR1[state] : UE_POWER_FR2[state];
++}
++
++bool
++NrUeEnergyModel::IsActiveDlState(NrUePowerState state)
++{
++    return state == NR_UE_PDCCH_ONLY || state == NR_UE_SSB_CSI_RS || state == NR_UE_PDCCH_PDSCH;
++}
++
++double
++NrUeEnergyModel::GetStatePowerW(NrUePowerState state) const
++{
++    NS_LOG_FUNCTION(this << state);
++    double relative = GetRelativePower(state);
++    if (IsActiveDlState(state))
++    {
++        relative *= m_bwpScale * m_antennaScale * m_bdScale;
++    }
++    return relative * m_powerUnitMw * 1e-3;
++}
++
++double
++NrUeEnergyModel::ScaleBwp(uint32_t bandwidthMhz) const
++{
++    NS_LOG_FUNCTION(this << bandwidthMhz);
++    // TR 38.840 Section 8.1.3: scale(X) = 0.4 + 0.6 * (X - 20) / 80.
++    double scale = 0.4 + 0.6 * (static_cast<double>(bandwidthMhz) - 20.0) / 80.0;
++    // The scaled active power must not fall below the BWP transition floor.
++    // Express the floor relative to the reference PDCCH+PDSCH power so the
++    // factor stays in (0, 1].
++    double floorFactor = UE_BWP_TRANSITION_FLOOR / UE_POWER_FR1[NR_UE_PDCCH_PDSCH];
++    return std::clamp(scale, floorFactor, 1.0);
++}
++
++void
++NrUeEnergyModel::ApplyBwpScaling(uint32_t bandwidthMhz)
++{
++    NS_LOG_FUNCTION(this << bandwidthMhz);
++    m_bwpScale = ScaleBwp(bandwidthMhz);
++}
++
++void
++NrUeEnergyModel::ApplyAntennaScaling(uint32_t activeAntennas)
++{
++    NS_LOG_FUNCTION(this << activeAntennas);
++    NS_ASSERT_MSG(activeAntennas >= 1, "At least one receive antenna required");
++    // Each halving of the receive chains relative to the reference applies one
++    // 0.7 factor (TR 38.840 Section 8.1.3: P_2Rx = 0.7 * P_4Rx, etc.).
++    double factor = 1.0;
++    uint32_t ant = m_refRxAntennas;
++    while (ant > activeAntennas && ant > 1)
++    {
++        factor *= 0.7;
++        ant /= 2;
++    }
++    m_antennaScale = factor;
++}
++
++void
++NrUeEnergyModel::ApplyBdReduction(double alpha)
++{
++    NS_LOG_FUNCTION(this << alpha);
++    NS_ASSERT_MSG(alpha > 0.0 && alpha <= 1.0, "alpha must be in (0, 1]");
++    // TR 38.840 Section 8.1.3: P(alpha) = alpha*Pt + (1-alpha)*0.7*Pt.
++    m_bdScale = alpha + (1.0 - alpha) * 0.7;
++}
++
++void
++NrUeEnergyModel::SetUlTxPowerDbm(double txPowerDbm)
++{
++    NS_LOG_FUNCTION(this << txPowerDbm);
++    if (m_freqRange == FR2)
++    {
++        m_ulRelativePower = UE_POWER_FR2[NR_UE_UL_TX];
++        return;
++    }
++    // FR1: linearly interpolate between the 0 dBm and 23 dBm anchors.
++    double frac = std::clamp(txPowerDbm / 23.0, 0.0, 1.0);
++    m_ulRelativePower =
++        UE_UL_POWER_FR1_0DBM + frac * (UE_UL_POWER_FR1_23DBM - UE_UL_POWER_FR1_0DBM);
++}
++
++void
++NrUeEnergyModel::ChangeState(int newState)
++{
++    NS_LOG_FUNCTION(this << newState);
++    NS_ASSERT_MSG(newState >= 0 && newState < NR_UE_NUM_STATES, "Invalid UE state");
++
++    Time now = Simulator::Now();
++    double durationS = (now - m_lastUpdateTime).GetSeconds();
++    // Accrue the energy and the occupancy time of the state we are leaving.
++    m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
++    m_stateTimeS[m_currentState] += durationS;
++    m_lastUpdateTime = now;
++    m_currentState = static_cast<NrUePowerState>(newState);
++
++    m_stateTrace = newState;
++    m_powerTrace = GetCurrentPowerW();
++    if (m_source)
++    {
++        m_source->UpdateEnergySource();
++    }
++}
++
++NrUePowerState
++NrUeEnergyModel::GetCurrentState() const
++{
++    return m_currentState;
++}
++
++double
++NrUeEnergyModel::GetCurrentPowerW() const
++{
++    NS_LOG_FUNCTION(this);
++    double w = GetStatePowerW(m_currentState);
++    if (Simulator::Now() < m_transitionEndTime)
++    {
++        w += m_transitionExtraW; // transition transient riding on top of the state
++    }
++    return w;
++}
++
++void
++NrUeEnergyModel::TriggerTransition(double extraPowerW, Time duration)
++{
++    NS_LOG_FUNCTION(this << extraPowerW << duration);
++    if (extraPowerW <= 0.0 || duration <= Seconds(0))
++    {
++        return;
++    }
++    // Flush the open interval, then ride the transient for `duration`.
++    Time now = Simulator::Now();
++    double durationS = (now - m_lastUpdateTime).GetSeconds();
++    m_totalEnergyJ = m_totalEnergyJ + GetCurrentPowerW() * durationS;
++    m_stateTimeS[m_currentState] += durationS;
++    m_lastUpdateTime = now;
++    m_transitionExtraW = extraPowerW;
++    m_transitionEndTime = now + duration;
++    m_powerTrace = GetCurrentPowerW();
++    if (m_source)
++    {
++        m_source->UpdateEnergySource();
++    }
++    Simulator::Schedule(duration, &NrUeEnergyModel::EndTransition, this);
++}
++
++void
++NrUeEnergyModel::TriggerSetupTransition()
++{
++    NS_LOG_FUNCTION(this);
++    TriggerTransition(m_setupTransitionPowerW, m_setupTransitionTime);
++}
++
++void
++NrUeEnergyModel::EndTransition()
++{
++    NS_LOG_FUNCTION(this);
++    // Commit the transition interval at (state + transient), then settle.
++    Time now = Simulator::Now();
++    double durationS = (now - m_lastUpdateTime).GetSeconds();
++    double powerW = GetStatePowerW(m_currentState) + m_transitionExtraW;
++    m_totalEnergyJ = m_totalEnergyJ + powerW * durationS;
++    m_stateTimeS[m_currentState] += durationS;
++    m_lastUpdateTime = now;
++    m_transitionExtraW = 0.0;
++    m_transitionEndTime = now;
++    m_powerTrace = GetCurrentPowerW();
++    if (m_source)
++    {
++        m_source->UpdateEnergySource();
++    }
++}
++
++double
++NrUeEnergyModel::GetTotalEnergyJ() const
++{
++    NS_LOG_FUNCTION(this);
++    double durationS = (Simulator::Now() - m_lastUpdateTime).GetSeconds();
++    return m_totalEnergyJ + GetCurrentPowerW() * durationS;
++}
++
++double
++NrUeEnergyModel::GetStateTimeFraction(NrUePowerState state) const
++{
++    NS_LOG_FUNCTION(this << state);
++    NS_ASSERT_MSG(state < NR_UE_NUM_STATES, "Invalid UE power state");
++    // Snapshot including the still-open interval in the current state.
++    double perState[NR_UE_NUM_STATES];
++    double total = 0.0;
++    for (int s = 0; s < NR_UE_NUM_STATES; ++s)
++    {
++        perState[s] = m_stateTimeS[s];
++    }
++    perState[m_currentState] += (Simulator::Now() - m_lastUpdateTime).GetSeconds();
++    for (int s = 0; s < NR_UE_NUM_STATES; ++s)
++    {
++        total += perState[s];
++    }
++    return (total > 0.0) ? perState[state] / total : 0.0;
++}
++
++double
++NrUeEnergyModel::GetAverageRelativePower() const
++{
++    NS_LOG_FUNCTION(this);
++    double avg = 0.0;
++    for (int s = 0; s < NR_UE_NUM_STATES; ++s)
++    {
++        avg += GetStateTimeFraction(static_cast<NrUePowerState>(s)) *
++               GetRelativePower(static_cast<NrUePowerState>(s));
++    }
++    return avg;
++}
++
++void
++NrUeEnergyModel::ResetOccupancy()
++{
++    NS_LOG_FUNCTION(this);
++    for (int s = 0; s < NR_UE_NUM_STATES; ++s)
++    {
++        m_stateTimeS[s] = 0.0;
++    }
++    m_occupancyStart = Simulator::Now();
++    m_lastUpdateTime = Simulator::Now();
++}
++
++void
++NrUeEnergyModel::SetEnergySource(Ptr<energy::EnergySource> source)
++{
++    NS_LOG_FUNCTION(this << source);
++    NS_ASSERT(source);
++    m_source = source;
++}
++
++double
++NrUeEnergyModel::GetTotalEnergyConsumption() const
++{
++    return GetTotalEnergyJ();
++}
++
++void
++NrUeEnergyModel::HandleEnergyDepletion()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++NrUeEnergyModel::HandleEnergyRecharged()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++NrUeEnergyModel::HandleEnergyChanged()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++double
++NrUeEnergyModel::DoGetCurrentA() const
++{
++    NS_LOG_FUNCTION(this);
++    double voltage = m_source ? m_source->GetSupplyVoltage() : 1.0;
++    return (voltage > 0.0) ? GetCurrentPowerW() / voltage : 0.0;
++}
++
++void
++NrUeEnergyModel::DoDispose()
++{
++    NS_LOG_FUNCTION(this);
++    m_source = nullptr;
++    energy::DeviceEnergyModel::DoDispose();
++}
++
+ } // namespace ns3
+diff --git a/model/nr-ue-energy-model.h b/model/nr-ue-energy-model.h
+index 160e2d43..76e9b405 100644
+--- a/model/nr-ue-energy-model.h
++++ b/model/nr-ue-energy-model.h
+@@ -3,7 +3,7 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ //
+ // 3GPP References:
+ //   TR 38.840 V16.0.0 (2019-06): Section 8 - UE energy consumption evaluation
+@@ -11,22 +11,62 @@
+ #ifndef NR_UE_ENERGY_MODEL_H
+ #define NR_UE_ENERGY_MODEL_H
+ 
+-#include "ns3/object.h"
++#include "ns3/device-energy-model.h"
++#include "ns3/nstime.h"
++#include "ns3/traced-value.h"
+ 
+ namespace ns3
+ {
+ 
+ /**
+  * @ingroup nr
+- * @brief Placeholder for the TR 38.840 UE energy model (Week 4).
++ * @brief UE energy consumption states (TR 38.840 Table 18, Section 8.1).
+  *
+- * Minimal stub so that NrUePhyEnergyListener has a complete type to hold and
+- * drive. The UE power-state machine, scaling rules, and energy accounting
+- * are added in a later milestone.
++ * Relative power units where Deep Sleep = 1. The absolute power of each state
++ * is the relative value times the PowerUnit attribute (mW per unit).
+  */
+-class NrUeEnergyModel : public Object
++enum NrUePowerState
++{
++    NR_UE_DEEP_SLEEP,  //!< TR 38.840: "Deep Sleep"  - timing not maintained
++    NR_UE_LIGHT_SLEEP, //!< TR 38.840: "Light Sleep" - timing maintained
++    NR_UE_MICRO_SLEEP, //!< TR 38.840: "Micro sleep" - immediate transition
++    NR_UE_PDCCH_ONLY,  //!< TR 38.840: "PDCCH-only"  - control monitoring
++    NR_UE_SSB_CSI_RS,  //!< TR 38.840: "SSB or CSI-RS proc."
++    NR_UE_PDCCH_PDSCH, //!< TR 38.840: "PDCCH + PDSCH" - full DL reception
++    NR_UE_UL_TX,       //!< TR 38.840: "UL" - uplink transmission
++    NR_UE_NUM_STATES   //!< sentinel, not a real state
++};
++
++/**
++ * @ingroup nr
++ * @brief TR 38.840 UE power consumption model.
++ *
++ * Implements the relative power-state model of TR 38.840 Section 8: the model
++ * holds a current power state and, on every state change, integrates the
++ * energy spent in the previous state (E = P * dt) into a running total. As an
++ * ns-3 energy::DeviceEnergyModel it can be attached to a standard
++ * energy::EnergySource and depleted over the course of a simulation.
++ *
++ * The per-state relative power values are spec-derived tables keyed by
++ * frequency range (FR1/FR2); FreqRange and PowerUnit are the user-facing
++ * knobs. The BWP / antenna / PDCCH blind-decoding scalings of Section 8.1.3
++ * are cached multipliers applied to the active DL reception states only;
++ * sleep and UL states are left unscaled. Dynamic scaling is BWP-based:
++ * NrUePhyEnergyListener re-applies ApplyBwpScaling() whenever the active BWP
++ * bandwidth changes.
++ */
++class NrUeEnergyModel : public energy::DeviceEnergyModel
+ {
+   public:
++    /**
++     * @brief Frequency range selector (TR 38.840 Section 8.1.1 / 8.1.2).
++     */
++    enum FreqRange
++    {
++        FR1, //!< Sub-6 GHz reference configuration
++        FR2  //!< mmWave reference configuration
++    };
++
+     /**
+      * @brief Get the TypeId
+      * @return the TypeId
+@@ -42,6 +82,219 @@ class NrUeEnergyModel : public Object
+      * @brief ~NrUeEnergyModel
+      */
+     ~NrUeEnergyModel() override;
++
++    // ----- 3GPP power lookup (pure, testable against TR 38.840 Table 18) -----
++
++    /**
++     * @brief Relative power for a state in the configured frequency range.
++     *
++     * Returns the unscaled TR 38.840 Table 18 relative value (Deep Sleep = 1).
++     *
++     * @param state The power state to look up.
++     * @return Relative power in power-units.
++     */
++    double GetRelativePower(NrUePowerState state) const;
++
++    /**
++     * @brief Absolute power [W] for a state, including any active-state scaling.
++     *
++     * P_W = GetRelativePower(state) * PowerUnit_mW * 1e-3, with the BWP /
++     * antenna / blind-decoding multiplier applied to the active DL reception
++     * states (PDCCH_ONLY, SSB_CSI_RS, PDCCH_PDSCH).
++     *
++     * @param state The power state to evaluate.
++     * @return Absolute power in Watts.
++     */
++    double GetStatePowerW(NrUePowerState state) const;
++
++    // ----- Scaling factors (TR 38.840 Section 8.1.3), pure helpers -----
++
++    /**
++     * @brief BWP bandwidth scaling factor (TR 38.840 Section 8.1.3).
++     *
++     * scale(X) = 0.4 + 0.6 * (X - 20) / 80, valid for X in {10,20,40,80,100} MHz
++     * with linear interpolation between. Result is not allowed to scale the
++     * active power below the BWP transition floor (50 power-units).
++     *
++     * @param bandwidthMhz Active BWP bandwidth in MHz.
++     * @return Multiplicative scaling factor in (0, 1].
++     */
++    double ScaleBwp(uint32_t bandwidthMhz) const;
++
++    /**
++     * @brief Cache the BWP scaling factor for the active reception states.
++     *
++     * Called by NrUePhyEnergyListener whenever the active BWP bandwidth
++     * changes, so a BWP switch is reflected in the UE power draw.
++     *
++     * @param bandwidthMhz New active BWP bandwidth in MHz.
++     */
++    void ApplyBwpScaling(uint32_t bandwidthMhz);
++
++    /**
++     * @brief Cache the antenna scaling factor (TR 38.840 Section 8.1.3).
++     *
++     * FR1: P_2Rx = 0.7 * P_4Rx. FR2: P_1Rx = 0.7 * P_2Rx. Each halving of the
++     * active receive chains relative to the reference applies one 0.7 factor.
++     *
++     * @param activeAntennas Number of active receive antennas.
++     */
++    void ApplyAntennaScaling(uint32_t activeAntennas);
++
++    /**
++     * @brief Cache the PDCCH blind-decoding reduction factor (Section 8.1.3).
++     *
++     * P(alpha) = alpha * Pt + (1 - alpha) * 0.7 * Pt, i.e. multiplier
++     * = alpha + (1 - alpha) * 0.7, for alpha in (0, 1].
++     *
++     * @param alpha Ratio of reduced PDCCH candidates to the reference maximum.
++     */
++    void ApplyBdReduction(double alpha);
++
++    // ----- State machine -----
++
++    /**
++     * @brief Change the UE power state and accrue energy for the elapsed time.
++     * @param newState New NrUePowerState (passed as int per DeviceEnergyModel).
++     */
++    void ChangeState(int newState) override;
++
++    /**
++     * @brief Get the current UE power state.
++     * @return The current NrUePowerState.
++     */
++    NrUePowerState GetCurrentState() const;
++
++    /**
++     * @brief Instantaneous power draw of the current state.
++     * @return Power in Watts.
++     */
++    double GetCurrentPowerW() const;
++
++    /**
++     * @brief Total energy consumed since simulation start [Joules].
++     *
++     * Includes the energy accrued in the current state interval.
++     *
++     * @return Cumulative energy in Joules.
++     */
++    double GetTotalEnergyJ() const;
++
++    /**
++     * @brief Fraction of time spent in a given state since tracking start.
++     *
++     * Used for TR 38.840 occupancy evaluation. Includes the current open
++     * interval. Tracking starts at the first ChangeState() call (or the
++     * explicit ResetOccupancy()).
++     *
++     * @param state The state to query.
++     * @return Time fraction in [0, 1].
++     */
++    double GetStateTimeFraction(NrUePowerState state) const;
++
++    /**
++     * @brief Average relative power over the tracked window [power-units].
++     *
++     * sum_state ( occupancy(state) * relativePower(state) ). This is the
++     * quantity TR 38.840 reports for power-saving comparisons.
++     *
++     * @return Average relative power in power-units.
++     */
++    double GetAverageRelativePower() const;
++
++    /**
++     * @brief Reset the occupancy accounting window to start now.
++     */
++    void ResetOccupancy();
++
++    /**
++     * @brief Select the UL transmit power level (TR 38.840 Table 18).
++     *
++     * Linearly interpolates the UL relative power between the 0 dBm and 23 dBm
++     * anchors (FR1). FR2 uses a single UL value so the level has no effect.
++     *
++     * @param txPowerDbm UL transmit power in dBm.
++     */
++    void SetUlTxPowerDbm(double txPowerDbm);
++
++    // ----- Transition transients -----
++
++    /**
++     * @brief Charge a transition transient (e.g. the RRC connection-setup spike).
++     *
++     * Adds @p extraPowerW on top of the current state power for @p duration,
++     * then settles back, modelling the high-power burst hardware shows on a
++     * sleep->active transition.
++     *
++     * @param extraPowerW Additional transient power [W].
++     * @param duration    How long the transient lasts.
++     */
++    void TriggerTransition(double extraPowerW, Time duration);
++
++    /**
++     * @brief Fire the configured setup/RRC transient (SetupTransitionPower/Time).
++     *
++     * Convenience wrapper used by NrUePhyEnergyListener when the UE wakes from
++     * deep sleep on a transport block. No-op if SetupTransitionPower is 0.
++     */
++    void TriggerSetupTransition();
++
++    // ----- energy::DeviceEnergyModel interface -----
++
++    void SetEnergySource(Ptr<energy::EnergySource> source) override;
++    double GetTotalEnergyConsumption() const override;
++    void HandleEnergyDepletion() override;
++    void HandleEnergyRecharged() override;
++    void HandleEnergyChanged() override;
++
++  protected:
++    void DoDispose() override;
++
++  private:
++    /**
++     * @brief Current draw of the current state, in Ampere (DeviceEnergyModel).
++     * @return Current in Ampere (power / supply voltage).
++     */
++    double DoGetCurrentA() const override;
++
++    /**
++     * @brief True if a state is an active DL reception state (gets scaled).
++     * @param state The state to classify.
++     * @return True for PDCCH_ONLY / SSB_CSI_RS / PDCCH_PDSCH.
++     */
++    static bool IsActiveDlState(NrUePowerState state);
++
++    /**
++     * @brief End the current transition transient: commit its energy, settle.
++     */
++    void EndTransition();
++
++    Ptr<energy::EnergySource> m_source; //!< Attached energy source (may be null)
++
++    FreqRange m_freqRange;    //!< FR1 or FR2 power table selector
++    double m_powerUnitMw;     //!< Absolute scale: mW per relative power-unit
++    uint32_t m_refRxAntennas; //!< Reference receive antennas (TR 38.840 8.1.3)
++    uint32_t m_refBwpMhz;     //!< Reference BWP bandwidth in MHz (100)
++
++    NrUePowerState m_currentState; //!< Current power state
++    Time m_lastUpdateTime;         //!< Time of last state change
++    double m_ulRelativePower;      //!< Current UL relative power (level-dependent)
++
++    double m_stateTimeS[NR_UE_NUM_STATES]; //!< Cumulative time in each state [s]
++    Time m_occupancyStart;                 //!< Start of the occupancy window
++
++    double m_bwpScale;     //!< Cached BWP scaling factor for active states
++    double m_antennaScale; //!< Cached antenna scaling factor for active states
++    double m_bdScale;      //!< Cached blind-decoding reduction factor
++
++    double m_transitionExtraW;      //!< Transient extra power during a transition [W]
++    Time m_transitionEndTime;       //!< End time of the current transition transient
++    double m_setupTransitionPowerW; //!< Default setup/RRC transient power [W] (0 = off)
++    Time m_setupTransitionTime;     //!< Default setup/RRC transient duration
++
++    TracedValue<int> m_stateTrace;      //!< Fires on each state change
++    TracedValue<double> m_powerTrace;   //!< Fires with instantaneous power [W] on each change
++    TracedValue<double> m_totalEnergyJ; //!< Accumulated energy [J], excl. open interval
+ };
+ 
+ } // namespace ns3
+diff --git a/model/nr-ue-phy-energy-listener.cc b/model/nr-ue-phy-energy-listener.cc
+index 54b35521..0d6ee165 100644
+--- a/model/nr-ue-phy-energy-listener.cc
++++ b/model/nr-ue-phy-energy-listener.cc
+@@ -3,21 +3,23 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ //
+ // 3GPP References:
+ //   TR 38.840 V16.0.0 (2019-06): Section 8.1 - UE power state event triggers
+ 
+ #include "nr-ue-phy-energy-listener.h"
+-#include "nr-ue-phy.h"
++
++#include "nr-ue-drx-model.h"
+ #include "nr-ue-energy-model.h"
++#include "nr-ue-phy.h"
+ 
+ #include "ns3/log.h"
+ #include "ns3/simulator.h"
+ 
+ namespace ns3
+ {
+-
++constexpr int64_t NR_SYMBOLS_PER_SLOT = 14; //!< OFDM symbols per NR slot
+ NS_LOG_COMPONENT_DEFINE("NrUePhyEnergyListener");
+ NS_OBJECT_ENSURE_REGISTERED(NrUePhyEnergyListener);
+ 
+@@ -32,6 +34,8 @@ NrUePhyEnergyListener::GetTypeId()
+ }
+ 
+ NrUePhyEnergyListener::NrUePhyEnergyListener()
++    : m_slotDuration(MilliSeconds(1)),
++      m_lastBwpMhz(0)
+ {
+     NS_LOG_FUNCTION(this);
+ }
+@@ -47,13 +51,13 @@ NrUePhyEnergyListener::SetPhy(Ptr<NrUePhy> phy)
+     NS_LOG_FUNCTION(this << phy);
+     NS_ASSERT_MSG(phy, "NrUePhy pointer must not be null");
+     m_phy = phy;
+-    // TODO Week 6: connect trace sources once added to NrUePhy:
+-    // phy->TraceConnectWithoutContext("SlotIndication",
+-    //     MakeCallback(&NrUePhyEnergyListener::SlotIndicationCallback, this));
+-    // phy->TraceConnectWithoutContext("PhyRxCtrlEndOk",
+-    //     MakeCallback(&NrUePhyEnergyListener::PdcchDecodeSuccessCallback, this));
+-    // phy->TraceConnectWithoutContext("PhyTxEnd",
+-    //     MakeCallback(&NrUePhyEnergyListener::UlTxEndCallback, this));
++    m_slotDuration = phy->GetSlotPeriod();
++    RefreshBwpScaling();
++    phy->TraceConnectWithoutContext(
++        "DlDataStats",
++        MakeCallback(&NrUePhyEnergyListener::DlTbReceivedCallback, this));
++    phy->TraceConnectWithoutContext("UlDataStats",
++                                    MakeCallback(&NrUePhyEnergyListener::UlTbSentCallback, this));
+ }
+ 
+ void
+@@ -62,6 +66,16 @@ NrUePhyEnergyListener::SetEnergyModel(Ptr<NrUeEnergyModel> model)
+     NS_LOG_FUNCTION(this << model);
+     NS_ASSERT_MSG(model, "NrUeEnergyModel pointer must not be null");
+     m_model = model;
++    // Attach order (phy first or model first) must not matter.
++    RefreshBwpScaling();
++}
++
++void
++NrUePhyEnergyListener::SetDrxModel(Ptr<NrUeDrxModel> drx)
++{
++    NS_LOG_FUNCTION(this << drx);
++    NS_ASSERT_MSG(drx, "NrUeDrxModel pointer must not be null");
++    m_drx = drx;
+ }
+ 
+ void
+@@ -70,76 +84,109 @@ NrUePhyEnergyListener::DoDispose()
+     NS_LOG_FUNCTION(this);
+     m_phy = nullptr;
+     m_model = nullptr;
++    m_drx = nullptr;
+     Object::DoDispose();
+ }
+ 
+ void
+-NrUePhyEnergyListener::SlotIndicationCallback(const SfnSf& sfnSf)
++NrUePhyEnergyListener::RefreshBwpScaling()
+ {
+-    // TODO Week 6 (stub here in Week 3):
+-    //
+-    // Query DRX state:
+-    //   If DRX_ON:  m_model->ChangeState(NR_UE_PDCCH_ONLY)
+-    //   If DRX_OFF (long cycle): m_model->ChangeState(NR_UE_LIGHT_SLEEP)
+-    //               or DEEP_SLEEP based on remaining inactive period vs. T_deep
+-    //
+-    NS_LOG_FUNCTION(this << sfnSf);
+-    if (!m_model)
++    NS_LOG_FUNCTION(this);
++    if (!m_phy || !m_model)
+     {
+         return;
+     }
++    // GetChannelBandwidth() is in Hz; TR 38.840 Section 8.1.3 scales in MHz.
++    uint32_t bwMhz = m_phy->GetChannelBandwidth() / 1000000;
++    if (bwMhz > 0 && bwMhz != m_lastBwpMhz)
++    {
++        m_model->ApplyBwpScaling(bwMhz);
++        m_lastBwpMhz = bwMhz;
++    }
+ }
+ 
+ void
+-NrUePhyEnergyListener::PdcchDecodeSuccessCallback(bool hasDlGrant, bool hasUlGrant)
++NrUePhyEnergyListener::DlTbReceivedCallback(uint64_t imsi,
++                                            uint32_t tbSize,
++                                            uint32_t symStart,
++                                            uint32_t numSym,
++                                            uint32_t rank)
+ {
+-    // TODO Week 6:
+-    //
+-    // State transition per TR 38.840 §8.1 semantics:
+-    //   if (hasDlGrant):
+-    //     m_model->ChangeState(NR_UE_PDCCH_PDSCH)  // 300 power-units FR1
+-    //   elif (hasUlGrant):
+-    //     // UL starts after UL grant delay; state transitions in UlTxStartCallback
+-    //     // For now remain in PDCCH_ONLY
+-    //   else:
+-    //     m_model->ChangeState(NR_UE_PDCCH_ONLY)   // 100 power-units FR1
+-    NS_LOG_FUNCTION(this << hasDlGrant << hasUlGrant);
+-    if (!m_model)
++    NS_LOG_FUNCTION(this << imsi << tbSize << symStart << numSym << rank);
++    if (!m_model || tbSize == 0)
+     {
+         return;
+     }
++    if (m_model->GetCurrentState() == NR_UE_DEEP_SLEEP)
++    {
++        m_model->TriggerSetupTransition();
++    }
++    RefreshBwpScaling();
++    // Scale active-reception power by the spatial layers actually in use.
++    // TR 38.840 Section 8.1.3 antenna scaling is over Rx branches; rank <= Rx
++    // branches, so this refines the existing antenna knob (active-layer scaling).
++    if (rank >= 1)
++    {
++        m_model->ApplyAntennaScaling(rank);
++    }
++    m_model->ChangeState(NR_UE_PDCCH_PDSCH);
++    if (m_drx)
++    {
++        m_drx->NotifyDataActivity();
++    }
++    // Hold full DL reception only for the allocated symbols, then fall back
++    // to PDCCH-only monitoring for the rest of the slot.
++    Time active = (numSym > 0) ? m_slotDuration * static_cast<int64_t>(numSym) / NR_SYMBOLS_PER_SLOT
++                               : m_slotDuration;
++    Time end = Simulator::Now() + active;
++    m_activeUntil = std::max(m_activeUntil, end);
++    Simulator::Schedule(active, &NrUePhyEnergyListener::ReturnToMonitoring, this);
+ }
+ 
+ void
+-NrUePhyEnergyListener::UlTxStartCallback(double txPowerDbm)
++NrUePhyEnergyListener::UlTbSentCallback(uint64_t imsi,
++                                        uint32_t tbSize,
++                                        uint32_t symStart,
++                                        uint32_t numSym,
++                                        uint32_t rank)
+ {
+-    // TODO Week 6:
+-    //
+-    // Set UE model state to UL_TX.
+-    // The power level depends on Tx power:
+-    //   - txPowerDbm <= 0  → use m_model->GetUlPower0dBm()  (250 units FR1)
+-    //   - txPowerDbm > 0   → interpolate linearly or clamp at 23 dBm (700 units FR1)
+-    //     Source: TR 38.840 Table 18.
+-    //
+-    // m_model->SetUlTxPowerDbm(txPowerDbm);
+-    // m_model->ChangeState(NR_UE_UL_TX);
+-    NS_LOG_FUNCTION(this << txPowerDbm);
+-    if (!m_model)
++    NS_LOG_FUNCTION(this << imsi << tbSize << symStart << numSym << rank);
++    if (!m_model || tbSize == 0)
+     {
+         return;
+     }
++    RefreshBwpScaling();
++    if (m_phy)
++    {
++        m_model->SetUlTxPowerDbm(m_phy->GetTxPower());
++    }
++    m_model->ChangeState(NR_UE_UL_TX);
++    if (m_drx)
++    {
++        m_drx->NotifyDataActivity();
++    }
++    // Active only for the allocated UL symbols.
++    Time active = (numSym > 0) ? m_slotDuration * static_cast<int64_t>(numSym) / NR_SYMBOLS_PER_SLOT
++                               : m_slotDuration;
++    Time end = Simulator::Now() + active;
++    m_activeUntil = std::max(m_activeUntil, end);
++    Simulator::Schedule(active, &NrUePhyEnergyListener::ReturnToMonitoring, this);
+ }
+ 
+ void
+-NrUePhyEnergyListener::UlTxEndCallback()
++NrUePhyEnergyListener::ReturnToMonitoring()
+ {
+-    // TODO Week 6:
+-    //   m_model->ChangeState(NR_UE_MICRO_SLEEP)  // brief micro-sleep after UL burst
+     NS_LOG_FUNCTION(this);
+     if (!m_model)
+     {
+         return;
+     }
++    // A later allocation is still active. Let its own timer do the return.
++    if (Simulator::Now() + NanoSeconds(1) < m_activeUntil)
++    {
++        return;
++    }
++    m_model->ChangeState(NR_UE_PDCCH_ONLY);
+ }
+ 
+ } // namespace ns3
+diff --git a/model/nr-ue-phy-energy-listener.h b/model/nr-ue-phy-energy-listener.h
+index d1168059..c22c0c20 100644
+--- a/model/nr-ue-phy-energy-listener.h
++++ b/model/nr-ue-phy-energy-listener.h
+@@ -3,7 +3,7 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ //
+ // 3GPP References:
+ //   TR 38.840 V16.0.0 (2019-06): Section 8 - UE energy consumption evaluation
+@@ -11,36 +11,48 @@
+ #ifndef NR_UE_PHY_ENERGY_LISTENER_H
+ #define NR_UE_PHY_ENERGY_LISTENER_H
+ 
+-#include "ns3/object.h"
+-#include "ns3/ptr.h"
+ #include "ns3/callback.h"
+ #include "ns3/nstime.h"
+-#include "ns3/sfnsf.h"
++#include "ns3/object.h"
++#include "ns3/ptr.h"
++
++#include <algorithm>
++
+ namespace ns3
+ {
+ 
+ // Forward declarations
+ class NrUePhy;
+ class NrUeEnergyModel;
+-
++class NrUeDrxModel;
++class NrUePhyEnergyListenerDlDurationTestCase;
++class NrUePhyEnergyListenerRankScalingTestCase;
+ 
+ /**
+  * @ingroup nr
+  * @brief Callback bridge between NR UE PHY layer events and the UE energy model.
+  *
+  * This class is the decoupling layer between the UE's PHY event stream and the
+- * UE energy model state machine. It subscribes to trace sources on NrUePhy,
+- * extracts the state transitions required by the 3GPP TR 38.840 UE power
+- * states, and forwards energy model state-change calls to NrUeEnergyModel.
++ * UE energy model state machine. It subscribes to existing trace sources on
++ * NrUePhy and drives the TR 38.840 Section 8.1 UE power states:
++ *   ReportDownlinkTbSize - DL TB delivered -> NR_UE_PDCCH_PDSCH
++ *   ReportUplinkTbSize   - UL TB sent      -> NR_UE_UL_TX
++ * One slot after an active DL/UL slot the UE returns to PDCCH-only
++ * monitoring. Sleep transitions are owned by the NrUeDrxModel,
++ * whose inactivity timer this listener restarts on each transport block.
++ *
++ * Active-state power scaling is BWP-bandwidth based (TR 38.840 Section
++ * 8.1.3): on each transport block the listener re-reads the PHY channel
++ * bandwidth and re-applies NrUeEnergyModel::ApplyBwpScaling() when it
++ * changed, so BWP switches are reflected in the UE power draw.
+  *
+  * Design rationale:
+  *   - This class must NOT be aware of the energy formula internals.
+- *     It only knows: "event occurred, extract parameters, notify model."
++ *     It only knows: event occurred, extract parameters, notify model.
+  *   - It must be usable both with and without an energy model installed
+  *     (if no model is attached, callbacks are no-ops).
+  *   - It has a single responsibility: the UE side of the mapping. The gNB side
+  *     lives in a separate listener.
+- *
+  */
+ class NrUePhyEnergyListener : public Object
+ {
+@@ -64,10 +76,10 @@ class NrUePhyEnergyListener : public Object
+      * @brief Attach this listener to a UE PHY instance.
+      *
+      * Subscribes to the following trace sources on phy:
+-     *   - SlotIndication     - fires each slot start
+-     *   - PhyRxCtrlEndOk     - PDCCH successfully decoded (state -> PDCCH_ONLY or PDCCH_PDSCH)
+-     *   - PhyTxEnd           - UL transmission completed (state -> back to PDCCH or sleep)
+-     *   - DlHarqFeedback     - HARQ ACK/NACK for state tracking
++     *   - ReportDownlinkTbSize - DL transport block delivered
++     *   - ReportUplinkTbSize   - UL transport block sent
++     * Also caches the slot period for the return-to-monitoring timer and
++     * applies the initial BWP scaling from the PHY channel bandwidth.
+      *
+      * @param phy Pointer to the NrUePhy on the UE node.
+      */
+@@ -79,6 +91,18 @@ class NrUePhyEnergyListener : public Object
+      */
+     void SetEnergyModel(Ptr<NrUeEnergyModel> model);
+ 
++    /**
++     * @brief Connect a DRX model to be notified of UE data activity.
++     *
++     * When set, each DL/UL transport block restarts the DRX inactivity timer
++     * via NrUeDrxModel::NotifyDataActivity(), so the DRX model owns the sleep
++     * transitions while this listener owns the active reception/transmission
++     * states.
++     *
++     * @param drx Pointer to the NrUeDrxModel instance.
++     */
++    void SetDrxModel(Ptr<NrUeDrxModel> drx);
++
+   protected:
+     /**
+      * @brief Release attached pointers. Inherited from Object.
+@@ -86,54 +110,74 @@ class NrUePhyEnergyListener : public Object
+     void DoDispose() override;
+ 
+   private:
++    // Unit tests drive the private PHY callbacks directly.
++    friend class NrUePhyEnergyListenerDlDurationTestCase;
++    friend class NrUePhyEnergyListenerRankScalingTestCase;
++
+     /**
+-     * @brief Called each time a new slot starts (UE side).
++     * @brief UE DL driver, connected to NrUePhy "ReportDownlinkTbSize".
+      *
+-     * Responsibilities:
+-     *   1. Determine UE DRX state from MAC DRX timer state.
+-     *   2. Set UE energy model state to PDCCH_ONLY if in DRX ON.
+-     *   3. Set UE energy model state to MICRO_SLEEP/LIGHT_SLEEP if in DRX OFF.
++     * Refreshes the BWP scaling, moves the UE energy model to
++     * NR_UE_PDCCH_PDSCH for the active slot and schedules a return to
++     * NR_UE_PDCCH_ONLY one slot later (TR 38.840 Table 18). When the UE wakes
++     * from deep sleep, the configured setup transient is charged first.
+      *
+-     * @param sfnSf The current system frame / slot number.
++     * @param imsi     UE IMSI.
++     * @param tbSize   Downlink transport block size in bytes (0 = nothing).
++     * @param symStart First OFDM symbol of the DL allocation.
++     * @param numSym   Number of OFDM symbols in the DL allocation.
++     * @param rank     Number of MIMO layers (receive chains) in use.
+      */
+-    void SlotIndicationCallback(const SfnSf& sfnSf);
++    void DlTbReceivedCallback(uint64_t imsi,
++                              uint32_t tbSize,
++                              uint32_t symStart,
++                              uint32_t numSym,
++                              uint32_t rank);
+ 
+     /**
+-     * @brief Called when PDCCH decoding succeeds on the UE.
++     * @brief UE UL driver, connected to NrUePhy "ReportUplinkTbSize".
+      *
+-     * Transitions UE energy model:
+-     *   - If DCI has DL grant: state -> NR_UE_PDCCH_PDSCH
+-     *   - If DCI has UL grant: state will transition to NR_UE_UL_TX at grant time
+-     *   - Otherwise:           state -> NR_UE_PDCCH_ONLY
++     * Selects the UL relative power from the current PHY Tx power
++     * (TR 38.840 Table 18: 250 units at 0 dBm to 700 units at 23 dBm), moves
++     * the UE energy model to NR_UE_UL_TX and schedules a return to
++     * NR_UE_PDCCH_ONLY one slot later.
+      *
+-     * @param hasDownlinkGrant True if the decoded DCI contains a PDSCH grant.
+-     * @param hasUplinkGrant True if the decoded DCI contains a PUSCH grant.
++     * @param imsi     UE IMSI.
++     * @param tbSize   Uplink transport block size in bytes (0 = nothing).
++     * @param symStart First OFDM symbol of the UL allocation.
++     * @param numSym   Number of OFDM symbols in the UL allocation.
++     * @param rank     Number of MIMO layers (transmit chains) in use.
+      */
+-    void PdcchDecodeSuccessCallback(bool hasDownlinkGrant, bool hasUplinkGrant);
++    void UlTbSentCallback(uint64_t imsi,
++                          uint32_t tbSize,
++                          uint32_t symStart,
++                          uint32_t numSym,
++                          uint32_t rank);
+ 
+     /**
+-     * @brief Called when UL transmission starts on the UE.
++     * @brief Return the UE energy model to PDCCH-only monitoring.
+      *
+-     * Transitions UE energy model state to NR_UE_UL_TX.
+-     * Power depends on Tx power level:
+-     *   - If txPowerDbm <= 0 dBm  -> UlPower0dBm
+-     *   - If txPowerDbm > 0 dBm   -> interpolate or use UlPower23dBm
+-     *   Source: TR 38.840 Table 18.
+-     *
+-     * @param txPowerDbm Current UL transmission power in dBm.
++     * Scheduled one slot after an active DL/UL slot.
+      */
+-    void UlTxStartCallback(double txPowerDbm);
++    void ReturnToMonitoring();
+ 
+     /**
+-     * @brief Called when UL transmission ends on the UE.
++     * @brief Re-apply the BWP scaling if the active BWP bandwidth changed.
+      *
+-     * Transitions UE energy model state back from NR_UE_UL_TX to
+-     * NR_UE_PDCCH_ONLY or NR_UE_MICRO_SLEEP depending on DRX state.
++     * Reads the PHY channel bandwidth and calls
++     * NrUeEnergyModel::ApplyBwpScaling() when it differs from the last applied
++     * value (TR 38.840 Section 8.1.3). This is how BWP switches reach the
++     * energy model without any PHY-side hook.
+      */
+-    void UlTxEndCallback();
++    void RefreshBwpScaling();
++
++    Ptr<NrUePhy> m_phy;           //!< Attached UE PHY (may be null)
++    Ptr<NrUeEnergyModel> m_model; //!< Attached UE energy model (may be null)
++    Ptr<NrUeDrxModel> m_drx;      //!< Attached DRX model (may be null)
+ 
+-    Ptr<NrUePhy> m_phy;             //!< Attached UE PHY (may be null)
+-    Ptr<NrUeEnergyModel> m_model;   //!< Attached UE energy model (may be null)
++    Time m_slotDuration; //!< Cached slot period (for the return timer)
++    Time m_activeUntil{Seconds(0)};
++    uint32_t m_lastBwpMhz; //!< Last BWP bandwidth applied to the model [MHz]
+ };
+ 
+ } // namespace ns3
+diff --git a/model/nr-ue-phy.cc b/model/nr-ue-phy.cc
+index 07a57c5f..2bd172f6 100644
+--- a/model/nr-ue-phy.cc
++++ b/model/nr-ue-phy.cc
+@@ -185,6 +185,16 @@ NrUePhy::GetTypeId()
+                             "Report allocated downlink TB size for trace.",
+                             MakeTraceSourceAccessor(&NrUePhy::m_reportDlTbSize),
+                             "ns3::DlTbSize::TracedCallback")
++            .AddTraceSource("DlDataStats",
++                            "Per-TB DL allocation detail for the energy model "
++                            "(imsi, tbSize, symStart, numSym, rank).",
++                            MakeTraceSourceAccessor(&NrUePhy::m_reportDlDataStats),
++                            "ns3::NrUePhy::DataStatsTracedCallback")
++            .AddTraceSource("UlDataStats",
++                            "Per-TB UL allocation detail for the energy model "
++                            "(imsi, tbSize, symStart, numSym, rank).",
++                            MakeTraceSourceAccessor(&NrUePhy::m_reportUlDataStats),
++                            "ns3::NrUePhy::DataStatsTracedCallback")
+             .AddTraceSource("ReportRsrp",
+                             "RSRP statistics.",
+                             MakeTraceSourceAccessor(&NrUePhy::m_reportRsrpTrace),
+@@ -1214,6 +1224,11 @@ NrUePhy::DlData(const std::shared_ptr<DciInfoElementTdma>& dci)
+                                   dci->m_numSym,
+                                   m_currentSlot});
+     m_reportDlTbSize(m_netDevice->GetObject<NrUeNetDevice>()->GetImsi(), dci->m_tbSize);
++    m_reportDlDataStats(m_netDevice->GetObject<NrUeNetDevice>()->GetImsi(),
++                        dci->m_tbSize,
++                        dci->m_symStart,
++                        dci->m_numSym,
++                        dci->m_rank);
+     NS_LOG_INFO("UE" << m_rnti << " RXing DL DATA frame for symbols " << +dci->m_symStart << "-"
+                      << +(dci->m_symStart + dci->m_numSym - 1) << " num of rbg assigned: "
+                      << FromRBGBitmaskToRBAssignment(dci->m_rbgBitmask).size()
+@@ -1265,6 +1280,11 @@ NrUePhy::UlData(const std::shared_ptr<DciInfoElementTdma>& dci)
+         }
+     }
+     m_reportUlTbSize(m_netDevice->GetObject<NrUeNetDevice>()->GetImsi(), dci->m_tbSize);
++    m_reportUlDataStats(m_netDevice->GetObject<NrUeNetDevice>()->GetImsi(),
++                        dci->m_tbSize,
++                        dci->m_symStart,
++                        dci->m_numSym,
++                        dci->m_rank);
+ 
+     NS_LOG_DEBUG("UE" << m_rnti << " TXing UL DATA frame for"
+                       << " symbols " << +dci->m_symStart << "-"
+diff --git a/model/nr-ue-phy.h b/model/nr-ue-phy.h
+index 00861723..b23dacb8 100644
+--- a/model/nr-ue-phy.h
++++ b/model/nr-ue-phy.h
+@@ -515,6 +515,20 @@ class NR_EXPORT NrUePhy : public NrPhy
+                                            bool isServingCell,
+                                            uint8_t componentCarrierId);
+ 
++    /**
++     * @brief TracedCallback signature for the per-TB DL/UL data-stats traces.
++     * @param [in] imsi     UE IMSI
++     * @param [in] tbSize   Transport block size [bytes]
++     * @param [in] symStart Starting OFDM symbol of the allocation
++     * @param [in] numSym   Number of OFDM symbols in the allocation
++     * @param [in] rank     Number of MIMO layers (spatial streams)
++     */
++    typedef void (*DataStatsTracedCallback)(uint64_t imsi,
++                                            uint32_t tbSize,
++                                            uint32_t symStart,
++                                            uint32_t numSym,
++                                            uint32_t rank);
++
+     /// @brief Generate DL CQI, PMI, and RI (channel quality precoding matrix and rank indicators)
+     /// @param cqiMimoFeedbackSignal a vector of parameters of the received signals and interference
+     /// @param pmiUpdateParams struct that defines if WB/SB PMIs need to be updated
+@@ -1069,6 +1083,10 @@ class NR_EXPORT NrUePhy : public NrPhy
+     TracedCallback<uint16_t, uint16_t, double, uint16_t> m_dlCtrlSinrTrace;
+     TracedCallback<uint64_t, uint64_t> m_reportUlTbSize; //!< Report the UL TBS
+     TracedCallback<uint64_t, uint64_t> m_reportDlTbSize; //!< Report the DL TBS
++    //!< Per-TB DL allocation detail (imsi, tbSize, symStart, numSym, rank)
++    TracedCallback<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t> m_reportDlDataStats;
++    //!< Per-TB UL allocation detail (imsi, tbSize, symStart, numSym, rank)
++    TracedCallback<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t> m_reportUlDataStats;
+     TracedCallback<const SfnSf&,
+                    Ptr<const SpectrumValue>,
+                    const Time&,
+diff --git a/test/nr-test-energy-models.cc b/test/nr-test-energy-models.cc
+new file mode 100644
+index 00000000..9a3f68bf
+--- /dev/null
++++ b/test/nr-test-energy-models.cc
+@@ -0,0 +1,368 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++
++#include "ns3/enum.h"
++#include "ns3/nr-gnb-energy-model.h"
++#include "ns3/nr-ue-drx-model.h"
++#include "ns3/nr-ue-energy-model.h"
++#include "ns3/nstime.h"
++#include "ns3/simulator.h"
++#include "ns3/test.h"
++
++#include <string>
++#include <vector>
++
++/**
++ * @file nr-test-energy-models.cc
++ * @ingroup test
++ *
++ * @brief Unit tests for NrUeEnergyModel (TR 38.840), NrGnbEnergyModel
++ * (TR 38.864) and NrUeDrxModel: the pure spec-derived math and the
++ * time-dependent energy accounting / DRX cycling.
++ */
++namespace ns3
++{
++
++/**
++ * @brief TR 38.840 Table 18 power tables and Section 8.1.3 scalings.
++ */
++class NrUeEnergyModelPowerTestCase : public TestCase
++{
++  public:
++    NrUeEnergyModelPowerTestCase()
++        : TestCase("NrUeEnergyModel TR 38.840 power table and scalings")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrUeEnergyModelPowerTestCase::DoRun()
++{
++    Ptr<NrUeEnergyModel> ue = CreateObject<NrUeEnergyModel>();
++
++    // TR 38.840 Table 18 FR1 relative powers (Deep Sleep = 1).
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_DEEP_SLEEP), 1.0, 1e-9, "deep sleep");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_LIGHT_SLEEP), 20.0, 1e-9, "light sleep");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_MICRO_SLEEP), 45.0, 1e-9, "micro sleep");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_PDCCH_ONLY), 100.0, 1e-9, "PDCCH-only");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_SSB_CSI_RS), 100.0, 1e-9, "SSB/CSI-RS");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_PDCCH_PDSCH), 300.0, 1e-9, "PDCCH+PDSCH");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_UL_TX), 250.0, 1e-9, "UL 0 dBm anchor");
++
++    // UL power interpolates linearly between the 0 dBm and 23 dBm anchors.
++    ue->SetUlTxPowerDbm(23.0);
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_UL_TX), 700.0, 1e-9, "UL at 23 dBm");
++    ue->SetUlTxPowerDbm(11.5);
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_UL_TX), 475.0, 1e-9, "UL at 11.5 dBm");
++    ue->SetUlTxPowerDbm(0.0);
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetRelativePower(NR_UE_UL_TX), 250.0, 1e-9, "UL back at 0 dBm");
++
++    // BWP scaling: scale(X) = 0.4 + 0.6 * (X - 20) / 80 (TR 38.840 8.1.3).
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->ScaleBwp(100), 1.0, 1e-9, "100 MHz reference");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->ScaleBwp(40), 0.55, 1e-9, "40 MHz");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->ScaleBwp(20), 0.4, 1e-9, "20 MHz");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->ScaleBwp(10), 0.325, 1e-9, "10 MHz");
++
++    // BWP scaling applies to the active DL states only (PowerUnit = 1 mW).
++    ue->ApplyBwpScaling(20);
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetStatePowerW(NR_UE_PDCCH_PDSCH),
++                              0.12,
++                              1e-9,
++                              "300 units x 0.4 x 1 mW");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetStatePowerW(NR_UE_DEEP_SLEEP),
++                              1e-3,
++                              1e-12,
++                              "sleep states are unscaled");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetStatePowerW(NR_UE_UL_TX), 0.25, 1e-9, "UL is unscaled by BWP");
++
++    // Antenna scaling: each halving from the 4-antenna reference is one 0.7x.
++    ue->ApplyBwpScaling(100);
++    ue->ApplyAntennaScaling(2);
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetStatePowerW(NR_UE_PDCCH_ONLY),
++                              0.07,
++                              1e-9,
++                              "P_2Rx = 0.7 x P_4Rx");
++    ue->ApplyAntennaScaling(4);
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetStatePowerW(NR_UE_PDCCH_ONLY),
++                              0.1,
++                              1e-9,
++                              "reference antennas restore full power");
++
++    // Blind-decoding reduction: multiplier = alpha + (1 - alpha) * 0.7.
++    ue->ApplyBdReduction(0.5);
++    NS_TEST_ASSERT_MSG_EQ_TOL(ue->GetStatePowerW(NR_UE_PDCCH_ONLY),
++                              0.085,
++                              1e-9,
++                              "alpha = 0.5 -> 0.85 multiplier");
++
++    // FR2 table.
++    Ptr<NrUeEnergyModel> fr2 = CreateObject<NrUeEnergyModel>();
++    fr2->SetAttribute("FreqRange", EnumValue(NrUeEnergyModel::FR2));
++    NS_TEST_ASSERT_MSG_EQ_TOL(fr2->GetRelativePower(NR_UE_PDCCH_ONLY), 175.0, 1e-9, "FR2 PDCCH");
++    NS_TEST_ASSERT_MSG_EQ_TOL(fr2->GetRelativePower(NR_UE_MICRO_SLEEP), 38.0, 1e-9, "FR2 micro");
++    fr2->SetUlTxPowerDbm(5.0);
++    NS_TEST_ASSERT_MSG_EQ_TOL(fr2->GetRelativePower(NR_UE_UL_TX),
++                              350.0,
++                              1e-9,
++                              "FR2 UL is level-independent");
++}
++
++/**
++ * @brief State-change energy integration and occupancy accounting.
++ */
++class NrUeEnergyModelAccountingTestCase : public TestCase
++{
++  public:
++    NrUeEnergyModelAccountingTestCase()
++        : TestCase("NrUeEnergyModel energy integration and occupancy")
++    {
++    }
++
++  private:
++    void DoRun() override;
++
++    Ptr<NrUeEnergyModel> m_ue; //!< Model under test
++};
++
++void
++NrUeEnergyModelAccountingTestCase::DoRun()
++{
++    m_ue = CreateObject<NrUeEnergyModel>();
++
++    // [0,1]s deep sleep (1 unit), [1,2]s PDCCH-only (100 units), [2,3]s deep
++    // sleep again. PowerUnit = 1 mW per unit.
++    Simulator::Schedule(Seconds(1),
++                        &NrUeEnergyModel::ChangeState,
++                        m_ue,
++                        static_cast<int>(NR_UE_PDCCH_ONLY));
++    Simulator::Schedule(Seconds(2),
++                        &NrUeEnergyModel::ChangeState,
++                        m_ue,
++                        static_cast<int>(NR_UE_DEEP_SLEEP));
++    Simulator::Stop(Seconds(3));
++    Simulator::Run();
++
++    // E = 1e-3*1 + 0.1*1 + 1e-3*1 = 0.102 J (open interval included).
++    NS_TEST_ASSERT_MSG_EQ_TOL(m_ue->GetTotalEnergyJ(), 0.102, 1e-9, "integrated energy");
++    NS_TEST_ASSERT_MSG_EQ_TOL(m_ue->GetStateTimeFraction(NR_UE_DEEP_SLEEP),
++                              2.0 / 3.0,
++                              1e-9,
++                              "deep sleep occupancy");
++    NS_TEST_ASSERT_MSG_EQ_TOL(m_ue->GetStateTimeFraction(NR_UE_PDCCH_ONLY),
++                              1.0 / 3.0,
++                              1e-9,
++                              "PDCCH-only occupancy");
++    // Average relative power = 2/3 * 1 + 1/3 * 100 = 34 power-units.
++    NS_TEST_ASSERT_MSG_EQ_TOL(m_ue->GetAverageRelativePower(), 34.0, 1e-9, "average power");
++
++    Simulator::Destroy();
++}
++
++/**
++ * @brief TR 38.864 Section 5.1 gNB power formulas.
++ */
++class NrGnbEnergyModelFormulaTestCase : public TestCase
++{
++  public:
++    NrGnbEnergyModelFormulaTestCase()
++        : TestCase("NrGnbEnergyModel TR 38.864 power formulas")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrGnbEnergyModelFormulaTestCase::DoRun()
++{
++    Ptr<NrGnbEnergyModel> gnb = CreateObject<NrGnbEnergyModel>();
++
++    // TR 38.864 Table 5.1-3, BS Category 1 / Set 1, PowerUnit = 1 W.
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetRelativePower(NrGnbPowerState::DeepSleep), 1.0, 1e-9, "P1");
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetRelativePower(NrGnbPowerState::LightSleep), 25.0, 1e-9, "P2");
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetRelativePower(NrGnbPowerState::MicroSleep), 55.0, 1e-9, "P3");
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetRelativePower(NrGnbPowerState::ActiveDl), 280.0, 1e-9, "P4");
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetRelativePower(NrGnbPowerState::ActiveUl), 110.0, 1e-9, "P5");
++
++    // P_DL = P3 + sa*(P4-P3) * [A + (sf*sp/eta)*(1-A)], A = 0.4, eta = 1.
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->CalcDlPowerW(1.0, 1.0, 1.0),
++                              280.0,
++                              1e-9,
++                              "full load reaches P4");
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->CalcDlPowerW(1.0, 0.0, 1.0),
++                              145.0,
++                              1e-9,
++                              "sf=0 leaves the antenna static part");
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->CalcDlPowerW(0.5, 1.0, 1.0),
++                              167.5,
++                              1e-9,
++                              "sa scales the dynamic part");
++
++    // P_UL = P3 + sa*(P5-P3).
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->CalcUlPowerW(1.0), 110.0, 1e-9, "full UL reaches P5");
++
++    // PA efficiency: single mode is constant, dual mode drops below sf*sp = 0.5.
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetEta(0.4, 1.0), 1.0, 1e-9, "single eta");
++    gnb->SetAttribute("EtaMode", EnumValue(NrGnbEnergyModel::EtaDual));
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetEta(0.4, 1.0), 0.76, 1e-9, "dual eta, low load");
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetEta(0.6, 1.0), 1.0, 1e-9, "dual eta, high load");
++}
++
++/**
++ * @brief Symbol-level slot energy accumulation (TR 38.864 Section 5.2).
++ */
++class NrGnbEnergyModelSlotAccumTestCase : public TestCase
++{
++  public:
++    NrGnbEnergyModelSlotAccumTestCase()
++        : TestCase("NrGnbEnergyModel symbol-level slot accumulation")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrGnbEnergyModelSlotAccumTestCase::DoRun()
++{
++    Ptr<NrGnbEnergyModel> gnb = CreateObject<NrGnbEnergyModel>();
++
++    // Numerology 1: slot = 0.5 ms, symbol = 0.5 ms / 14. GetSymbolDuration()
++    // returns an ns-3 Time, which is quantized to the simulator resolution
++    // (1 ns), so allow a sub-nanosecond tolerance rather than exact real
++    // arithmetic. The 14-symbol slot energy below is computed from this actual
++    // quantized tSym so the assertion tracks the model's own time base.
++    double tSym = gnb->GetSymbolDuration().GetSeconds();
++    NS_TEST_ASSERT_MSG_EQ_TOL(tSym, 0.5e-3 / 14.0, 1e-9, "symbol duration for mu=1");
++    double slotS = tSym * 14.0; // slot duration actually used by the accumulation
++
++    // Pure helper: a fully idle slot (no allocation) costs 14 symbols at P3.
++    std::vector<NrGnbSymbolType> idleSlot(14, NrGnbSymbolType::Idle);
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->ComputeSlotEnergyJ(idleSlot, 1.0, 0.0, 1.0),
++                              55.0 * slotS,
++                              1e-12,
++                              "all-idle slot at P3");
++
++    // Accumulation path: a full-load DL slot commits 14 symbols at P4.
++    for (uint32_t s = 0; s < 14; ++s)
++    {
++        gnb->UpdateSymbolPower(1.0, 1.0, 1.0, NrGnbSymbolType::Dl);
++    }
++    gnb->FinalizeSlotEnergy();
++    NS_TEST_ASSERT_MSG_EQ_TOL(gnb->GetTotalEnergyJ(),
++                              280.0 * slotS,
++                              1e-12,
++                              "full DL slot energy committed");
++
++    Simulator::Destroy();
++}
++
++/**
++ * @brief DRX onDuration / inactivity / sleep-depth cycling.
++ */
++class NrUeDrxModelCycleTestCase : public TestCase
++{
++  public:
++    NrUeDrxModelCycleTestCase()
++        : TestCase("NrUeDrxModel DRX cycle drives the UE power states")
++    {
++    }
++
++  private:
++    void DoRun() override;
++
++    /**
++     * @brief Assert the UE power state at the current simulation time.
++     * @param expected Expected state.
++     * @param context  Failure message context.
++     */
++    void CheckState(NrUePowerState expected, std::string context);
++
++    Ptr<NrUeEnergyModel> m_ue; //!< Driven energy model
++    Ptr<NrUeDrxModel> m_drx;   //!< DRX model under test
++};
++
++void
++NrUeDrxModelCycleTestCase::CheckState(NrUePowerState expected, std::string context)
++{
++    NS_TEST_ASSERT_MSG_EQ(m_ue->GetCurrentState(), expected, context);
++}
++
++void
++NrUeDrxModelCycleTestCase::DoRun()
++{
++    m_ue = CreateObject<NrUeEnergyModel>();
++    m_drx = CreateObject<NrUeDrxModel>();
++    m_drx->SetEnergyModel(m_ue);
++
++    // Defaults: long cycle 160 ms, onDuration 8 ms, inactivity 10 ms,
++    // deep-sleep threshold 20 ms.
++    m_drx->Start(Seconds(0));
++
++    // Inside the first onDuration: PDCCH monitoring.
++    Simulator::Schedule(MilliSeconds(4),
++                        &NrUeDrxModelCycleTestCase::CheckState,
++                        this,
++                        NR_UE_PDCCH_ONLY,
++                        std::string("onDuration monitors PDCCH"));
++    // After onDuration with no activity: gap 152 ms >= 20 ms -> deep sleep.
++    Simulator::Schedule(MilliSeconds(12),
++                        &NrUeDrxModelCycleTestCase::CheckState,
++                        this,
++                        NR_UE_DEEP_SLEEP,
++                        std::string("sleeps deep after an idle onDuration"));
++    // Second cycle wakes at 160 ms.
++    Simulator::Schedule(MilliSeconds(164),
++                        &NrUeDrxModelCycleTestCase::CheckState,
++                        this,
++                        NR_UE_PDCCH_ONLY,
++                        std::string("second cycle wakes the UE"));
++    // Data activity at 166 ms arms the inactivity timer (expires at 176 ms).
++    Simulator::Schedule(MilliSeconds(166), &NrUeDrxModel::NotifyDataActivity, m_drx);
++    // Past the onDuration end (168 ms) the inactivity timer keeps the UE awake.
++    Simulator::Schedule(MilliSeconds(172),
++                        &NrUeDrxModelCycleTestCase::CheckState,
++                        this,
++                        NR_UE_PDCCH_ONLY,
++                        std::string("inactivity timer keeps the UE awake"));
++    // After the inactivity expiry: gap to 320 ms is 144 ms -> deep sleep.
++    Simulator::Schedule(MilliSeconds(180),
++                        &NrUeDrxModelCycleTestCase::CheckState,
++                        this,
++                        NR_UE_DEEP_SLEEP,
++                        std::string("sleeps again after inactivity expiry"));
++
++    Simulator::Stop(MilliSeconds(200));
++    Simulator::Run();
++    Simulator::Destroy();
++}
++
++/**
++ * @brief Test suite for the NR energy models and the DRX power model.
++ */
++class NrEnergyModelsTestSuite : public TestSuite
++{
++  public:
++    NrEnergyModelsTestSuite()
++        : TestSuite("nr-energy-models", Type::UNIT)
++    {
++        AddTestCase(new NrUeEnergyModelPowerTestCase(), Duration::QUICK);
++        AddTestCase(new NrUeEnergyModelAccountingTestCase(), Duration::QUICK);
++        AddTestCase(new NrGnbEnergyModelFormulaTestCase(), Duration::QUICK);
++        AddTestCase(new NrGnbEnergyModelSlotAccumTestCase(), Duration::QUICK);
++        AddTestCase(new NrUeDrxModelCycleTestCase(), Duration::QUICK);
++    }
++};
++
++static NrEnergyModelsTestSuite g_nrEnergyModelsTestSuite; //!< the test suite
++
++} // namespace ns3
+diff --git a/test/nr-test-gnb-phy-energy-listener.cc b/test/nr-test-gnb-phy-energy-listener.cc
+index 296518b1..a265f686 100644
+--- a/test/nr-test-gnb-phy-energy-listener.cc
++++ b/test/nr-test-gnb-phy-energy-listener.cc
+@@ -3,7 +3,7 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ 
+ #include "ns3/nr-gnb-phy-energy-listener.h"
+ #include "ns3/test.h"
+@@ -68,7 +68,7 @@ class NrGnbPhyEnergyListenerDefaultsTestCase : public TestCase
+ {
+   public:
+     NrGnbPhyEnergyListenerDefaultsTestCase()
+-        : TestCase("NrGnbPhyEnergyListener default sa/sf/sp values")
++        : TestCase("NrGnbPhyEnergyListener default sa, sf, sp values")
+     {
+     }
+ 
+diff --git a/test/nr-test-ue-phy-energy-listener.cc b/test/nr-test-ue-phy-energy-listener.cc
+index e59c841b..f8aa1fc5 100644
+--- a/test/nr-test-ue-phy-energy-listener.cc
++++ b/test/nr-test-ue-phy-energy-listener.cc
+@@ -3,9 +3,11 @@
+ //
+ // SPDX-License-Identifier: GPL-2.0-only
+ //
+-// Authors: nipuna dulara (nipuna.21@cse.mrt.ac.lk)
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
+ 
++#include "ns3/nr-ue-energy-model.h"
+ #include "ns3/nr-ue-phy-energy-listener.h"
++#include "ns3/simulator.h"
+ #include "ns3/test.h"
+ 
+ /**
+@@ -15,10 +17,15 @@
+  * @brief Unit tests for NrUePhyEnergyListener, the bridge between NR UE PHY
+  * events and the UE energy model.
+  *
+- * At this stage the class is scaffolding: the PHY callbacks are no-ops until
+- * the energy model and PHY trace sources are wired in (Week 6). These tests
+- * therefore cover the behaviour that is observable today: the object is
+- * registered and constructible, and it can be disposed with nothing attached.
++ * Besides the registration / disposal contract, these tests drive the private
++ * DL callback directly (the two behavioural test cases are declared friends of
++ * the listener) to cover the two spec-consistent refinements added on top of
++ * the plain TR 38.840 mapping:
++ *   - symbol-accurate active duration: a DL transport block keeps the UE in
++ *     full PDCCH+PDSCH reception only for its allocated OFDM symbols, not the
++ *     whole slot
++ *   - MIMO-rank scaling: the active-reception power is scaled by the number of
++ *     spatial layers actually in use (TR 38.840 Section 8.1.3 antenna scaling).
+  */
+ namespace ns3
+ {
+@@ -81,6 +88,124 @@ NrUePhyEnergyListenerDisposeTestCase::DoRun()
+                           "Listener handle should remain valid after Dispose()");
+ }
+ 
++/**
++ * @brief A DL transport block must keep the UE in PDCCH+PDSCH reception only for
++ *        its allocated OFDM symbols, then fall back to PDCCH-only monitoring.
++ *
++ * With no PHY attached the listener uses the 1 ms default slot period, so a
++ * 2-of-14-symbol allocation stays active for 2/14 ms (~142.857 us). A whole-slot
++ * model would still be active at 500 us; the symbol-accurate one is not.
++ */
++class NrUePhyEnergyListenerDlDurationTestCase : public TestCase
++{
++  public:
++    NrUePhyEnergyListenerDlDurationTestCase()
++        : TestCase("NrUePhyEnergyListener holds DL reception for the allocated symbols only")
++    {
++    }
++
++  private:
++    void DoRun() override;
++    /// Assert the UE is still in full DL reception (sampled mid-allocation).
++    void CheckActive();
++    /// Assert the UE has fallen back to PDCCH-only (sampled after the allocation).
++    void CheckReturned();
++
++    Ptr<NrUeEnergyModel> m_model; //!< model driven by the listener under test
++};
++
++void
++NrUePhyEnergyListenerDlDurationTestCase::CheckActive()
++{
++    NS_TEST_ASSERT_MSG_EQ(m_model->GetCurrentState(),
++                          NR_UE_PDCCH_PDSCH,
++                          "UE must stay in PDCCH+PDSCH for the allocated symbols");
++}
++
++void
++NrUePhyEnergyListenerDlDurationTestCase::CheckReturned()
++{
++    NS_TEST_ASSERT_MSG_EQ(m_model->GetCurrentState(),
++                          NR_UE_PDCCH_ONLY,
++                          "UE must return to PDCCH-only after the allocated symbols, "
++                          "not hold the whole slot");
++}
++
++void
++NrUePhyEnergyListenerDlDurationTestCase::DoRun()
++{
++    m_model = CreateObject<NrUeEnergyModel>();
++    Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
++    listener->SetEnergyModel(m_model);
++    // No SetPhy(): slot period stays at the 1 ms default and BWP refresh is a no-op.
++
++    // DL TB using 2 of the 14 symbols at t = 0 -> active for 2/14 ms (~142.857 us).
++    listener->DlTbReceivedCallback(/*imsi*/ 1,
++                                   /*tbSize*/ 100,
++                                   /*symStart*/ 0,
++                                   /*numSym*/ 2,
++                                   /*rank*/ 1);
++    NS_TEST_ASSERT_MSG_EQ(m_model->GetCurrentState(),
++                          NR_UE_PDCCH_PDSCH,
++                          "DL TB should move the UE to full PDCCH+PDSCH reception");
++
++    // 50 us: inside the 2-symbol window -> still active.
++    Simulator::Schedule(NanoSeconds(50000),
++                        &NrUePhyEnergyListenerDlDurationTestCase::CheckActive,
++                        this);
++    // 500 us: past the 2-symbol window but still inside the 1 ms slot -> a
++    // whole-slot model would be active here, the symbol-accurate one is not.
++    Simulator::Schedule(NanoSeconds(500000),
++                        &NrUePhyEnergyListenerDlDurationTestCase::CheckReturned,
++                        this);
++    Simulator::Run();
++    Simulator::Destroy();
++    m_model = nullptr;
++}
++
++/**
++ * @brief A DL transport block must scale the UE active-reception power by the
++ *        number of MIMO layers (rank) actually in use.
++ *
++ * With the reference receive-antenna count at its default of 4, a full-rank
++ * (rank 4) TB draws the reference power, and a rank-1 TB draws 0.7^2 = 0.49 of
++ * it (one 0.7 factor per halving of the active receive chains, 4 -> 2 -> 1).
++ */
++class NrUePhyEnergyListenerRankScalingTestCase : public TestCase
++{
++  public:
++    NrUePhyEnergyListenerRankScalingTestCase()
++        : TestCase("NrUePhyEnergyListener scales UE active power by MIMO rank")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrUePhyEnergyListenerRankScalingTestCase::DoRun()
++{
++    Ptr<NrUeEnergyModel> model = CreateObject<NrUeEnergyModel>();
++    Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
++    listener->SetEnergyModel(model);
++
++    // Full-rank DL TB: ApplyAntennaScaling(4) with the reference of 4 -> factor 1.0.
++    listener->DlTbReceivedCallback(1, 100, 0, 14, /*rank*/ 4);
++    double pFull = model->GetStatePowerW(NR_UE_PDCCH_PDSCH);
++
++    // Rank-1 DL TB: ApplyAntennaScaling(1) -> two halvings from 4 -> 0.7^2 = 0.49.
++    listener->DlTbReceivedCallback(1, 100, 0, 14, /*rank*/ 1);
++    double pRank1 = model->GetStatePowerW(NR_UE_PDCCH_PDSCH);
++
++    NS_TEST_ASSERT_MSG_GT(pFull, 0.0, "reference active power must be positive");
++    NS_TEST_ASSERT_MSG_EQ_TOL(pRank1 / pFull,
++                              0.49,
++                              1e-9,
++                              "rank-1 active power must be 0.7^2 of the full-rank power");
++    Simulator::Destroy();
++}
++
+ /**
+  * @brief Test suite for NrUePhyEnergyListener.
+  */
+@@ -92,6 +217,8 @@ class NrUePhyEnergyListenerTestSuite : public TestSuite
+     {
+         AddTestCase(new NrUePhyEnergyListenerCreationTestCase(), Duration::QUICK);
+         AddTestCase(new NrUePhyEnergyListenerDisposeTestCase(), Duration::QUICK);
++        AddTestCase(new NrUePhyEnergyListenerDlDurationTestCase(), Duration::QUICK);
++        AddTestCase(new NrUePhyEnergyListenerRankScalingTestCase(), Duration::QUICK);
+     }
+ };
+ 
+-- 
+2.43.0
+

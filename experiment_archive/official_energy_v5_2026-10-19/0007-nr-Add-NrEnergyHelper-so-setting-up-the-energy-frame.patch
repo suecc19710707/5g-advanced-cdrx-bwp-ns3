@@ -1,0 +1,727 @@
+From cdd9614e3f56eceb9ea31563de201ddfb1996f64 Mon Sep 17 00:00:00 2001
+From: "nipuna.dulara" <pererannd.21@uom.lk>
+Date: Sat, 29 Aug 2026 09:03:09 +0530
+Subject: [PATCH 7/9] nr: Add NrEnergyHelper so setting up the energy framework
+ is one call
+
+Without this, a scenario has to create the gNB/UE energy models by
+hand, attach a listener to each PHY, and connect everything to an
+energy source itself. NrEnergyHelper does all of that in one call:
+InstallGnb/InstallUe take the device containers and the energy sources
+and wire up the rest. Also add cttc-nr-energy-example, which shows the
+whole flow end to end and prints the energy each device used.
+---
+ .gitlab-ci.yml                     |   8 +-
+ CMakeLists.txt                     |   2 +
+ examples/CMakeLists.txt            |   9 +
+ examples/cttc-nr-energy-example.cc | 258 +++++++++++++++++++++++++++++
+ helper/nr-energy-helper.cc         | 180 ++++++++++++++++++++
+ helper/nr-energy-helper.h          | 178 ++++++++++++++++++++
+ 6 files changed, 631 insertions(+), 4 deletions(-)
+ create mode 100644 examples/cttc-nr-energy-example.cc
+ create mode 100644 helper/nr-energy-helper.cc
+ create mode 100644 helper/nr-energy-helper.h
+
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+index d74434c2..3f4b3a7b 100644
+--- a/.gitlab-ci.yml
++++ b/.gitlab-ci.yml
+@@ -132,8 +132,8 @@ per-commit-gcc-default:
+   variables:
+     MODE: default
+     COMPILER: g++
+-  tags:
+-    - CTTC
++  # tags:
++  #   - CTTC
+ 
+ per-commit-gcc-release-no-lte:
+   extends: .base-per-commit-compile
+@@ -156,8 +156,8 @@ per-commit-gcc-release-sanitizers:
+     MODE: release
+     COMPILER: g++
+     EXTRAS: --enable-sanitizers
+-  tags:
+-    - CTTC
++  # tags:
++  #   - CTTC
+ 
+ # MemorySanitizer catches reads of uninitialized memory, which the other
+ # sanitizers and valgrind miss. It requires every linked C++ library to be
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 24fdfff7..11649c69 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -62,6 +62,7 @@ set(source_files
+     helper/nr-bearer-stats-connector.cc
+     helper/nr-bearer-stats-simple.cc
+     helper/nr-channel-helper.cc
++    helper/nr-energy-helper.cc
+     helper/nr-epc-helper.cc
+     helper/nr-helper.cc
+     helper/nr-mac-rx-trace.cc
+@@ -262,6 +263,7 @@ set(header_files
+     helper/nr-bearer-stats-connector.h
+     helper/nr-bearer-stats-simple.h
+     helper/nr-channel-helper.h
++    helper/nr-energy-helper.h
+     helper/nr-epc-helper.h
+     helper/nr-helper.h
+     helper/nr-mac-rx-trace.h
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index f5984dd6..6f7ede1a 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -37,6 +37,15 @@ foreach(
+   )
+ endforeach()
+ 
++# Energy framework example: also needs the ns-3 energy module for the
++# BasicEnergySource the scenario feeds into NrEnergyHelper.
++build_lib_example(
++  NAME cttc-nr-energy-example
++  SOURCE_FILES cttc-nr-energy-example.cc
++  LIBRARIES_TO_LINK ${libnr}
++                    ${libenergy}
++)
++
+ check_deps(
+   nr_sionna_deps
+   PYTHON_PACKAGES
+diff --git a/examples/cttc-nr-energy-example.cc b/examples/cttc-nr-energy-example.cc
+new file mode 100644
+index 00000000..12879ec1
+--- /dev/null
++++ b/examples/cttc-nr-energy-example.cc
+@@ -0,0 +1,258 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.864 V18.1.0 (2023-03): Section 5 - gNB energy model
++//   TR 38.840 V16.0.0 (2019-06): Section 8 - UE energy model
++
++/**
++ * @file cttc-nr-energy-example.cc
++ * @ingroup examples
++ *
++ * @brief Minimal end-to-end example of the NR energy framework via NrEnergyHelper.
++ *
++ * Builds a standard 5G-LENA downlink scenario (1 gNB, a few UEs, UDP traffic on
++ * a single FR1 band matching the gNB model's TR 38.864 Set 1 defaults) and
++ * installs the whole energy stack with NrEnergyHelper. The helper creates each
++ * device's energy model, connects it to a caller-provided energy::EnergySource,
++ * and attaches the PHY listeners that translate live scheduler / PHY events into
++ * TR 38.864 (gNB) and TR 38.840 (UE) power-state changes; with EnableDrx() it
++ * also installs a C-DRX model per UE.
++ *
++ * The flow mirrors the six steps a user scenario follows:
++ *   1. build the NR scenario (unchanged);
++ *   2. install energy sources with the standard ns-3 energy module;
++ *   3. create NrEnergyHelper and configure only what differs from the defaults;
++ *   4. InstallGnb() / InstallUe() - the whole energy integration;
++ *   5. (optional) connect traces / read results however the user likes;
++ *   6. Run(), then read the energy off the returned model containers.
++ *
++ *
++ * Usage:
++ *   ./ns3 run "cttc-nr-energy-example --ueNumPergNb=4 --simTime=400ms --enableDrx=1"
++ */
++
++#include "ns3/antenna-module.h"
++#include "ns3/applications-module.h"
++#include "ns3/basic-energy-source-helper.h"
++#include "ns3/core-module.h"
++#include "ns3/energy-source-container.h"
++#include "ns3/internet-module.h"
++#include "ns3/nr-energy-helper.h"
++#include "ns3/nr-module.h"
++#include "ns3/point-to-point-module.h"
++
++#include <iomanip>
++#include <iostream>
++
++using namespace ns3;
++
++NS_LOG_COMPONENT_DEFINE("CttcNrEnergyExample");
++
++int
++main(int argc, char* argv[])
++{
++    uint16_t gNbNum = 1;
++    uint16_t ueNumPergNb = 4;
++    Time simTime = MilliSeconds(400);
++    Time udpAppStartTime = MilliSeconds(100);
++    uint16_t numerology = 1;         // 30 kHz SCS (TR 38.864 Set 1)
++    double centralFrequency = 3.5e9; // FR1
++    double bandwidth = 100e6;        // 100 MHz (TR 38.864 Set 1)
++    double totalTxPower = 43;        // dBm
++    uint32_t udpPacketSize = 1252;
++    uint32_t lambda = 10000; // packets/s per UE
++    bool enableDrx = true;
++
++    CommandLine cmd(__FILE__);
++    cmd.AddValue("ueNumPergNb", "Number of UEs per gNB", ueNumPergNb);
++    cmd.AddValue("simTime", "Simulation time", simTime);
++    cmd.AddValue("numerology", "BWP numerology", numerology);
++    cmd.AddValue("lambda", "UDP packets per second per UE", lambda);
++    cmd.AddValue("enableDrx", "Install a C-DRX model on each UE", enableDrx);
++    cmd.Parse(argc, argv);
++
++    Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(999999999));
++
++    // ---------------------------------------------------------------------
++    // 1. Build the NR scenario (nothing energy-specific here).
++    // ---------------------------------------------------------------------
++    int64_t randomStream = 1;
++    GridScenarioHelper gridScenario;
++    gridScenario.SetRows(1);
++    gridScenario.SetColumns(gNbNum);
++    gridScenario.SetHorizontalBsDistance(10.0);
++    gridScenario.SetBsHeight(10.0);
++    gridScenario.SetUtHeight(1.5);
++    gridScenario.SetSectorization(GridScenarioHelper::SINGLE);
++    gridScenario.SetBsNumber(gNbNum);
++    gridScenario.SetUtNumber(ueNumPergNb * gNbNum);
++    gridScenario.SetScenarioHeight(3);
++    gridScenario.SetScenarioLength(3);
++    randomStream += gridScenario.AssignStreams(randomStream);
++    gridScenario.CreateScenario();
++
++    NodeContainer ueContainer = gridScenario.GetUserTerminals();
++    NodeContainer gnbContainer = gridScenario.GetBaseStations();
++
++    Ptr<NrPointToPointEpcHelper> nrEpcHelper = CreateObject<NrPointToPointEpcHelper>();
++    Ptr<IdealBeamformingHelper> idealBeamformingHelper = CreateObject<IdealBeamformingHelper>();
++    Ptr<NrHelper> nrHelper = CreateObject<NrHelper>();
++    nrHelper->SetBeamformingHelper(idealBeamformingHelper);
++    nrHelper->SetEpcHelper(nrEpcHelper);
++
++    // Single operational band, single CC, single BWP.
++    BandwidthPartInfoPtrVector allBwps;
++    CcBwpCreator ccBwpCreator;
++    const uint8_t numCcPerBand = 1;
++    CcBwpCreator::SimpleOperationBandConf bandConf(centralFrequency, bandwidth, numCcPerBand);
++    OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
++
++    Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
++    channelHelper->ConfigureFactories("UMi", "Default", "ThreeGpp");
++    channelHelper->SetChannelConditionModelAttribute("UpdatePeriod", TimeValue(MilliSeconds(0)));
++    channelHelper->SetPathlossAttribute("ShadowingEnabled", BooleanValue(false));
++    channelHelper->AssignChannelsToBands({band});
++    allBwps = CcBwpCreator::GetAllBwps({band});
++
++    idealBeamformingHelper->SetAttribute("BeamformingMethod",
++                                         TypeIdValue(DirectPathBeamforming::GetTypeId()));
++    nrEpcHelper->SetAttribute("S1uLinkDelay", TimeValue(MilliSeconds(0)));
++
++    nrHelper->SetUeAntennaAttribute("NumRows", UintegerValue(2));
++    nrHelper->SetUeAntennaAttribute("NumColumns", UintegerValue(4));
++    nrHelper->SetUeAntennaAttribute("AntennaElement",
++                                    PointerValue(CreateObject<IsotropicAntennaModel>()));
++    nrHelper->SetGnbAntennaAttribute("NumRows", UintegerValue(4));
++    nrHelper->SetGnbAntennaAttribute("NumColumns", UintegerValue(8));
++    nrHelper->SetGnbAntennaAttribute("AntennaElement",
++                                     PointerValue(CreateObject<IsotropicAntennaModel>()));
++    nrHelper->SetGnbBwpManagerAlgorithmAttribute("NGBR_LOW_LAT_EMBB", UintegerValue(0));
++    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_LOW_LAT_EMBB", UintegerValue(0));
++
++    NetDeviceContainer gnbNetDev = nrHelper->InstallGnbDevice(gnbContainer, allBwps);
++    NetDeviceContainer ueNetDev = nrHelper->InstallUeDevice(ueContainer, allBwps);
++    randomStream += nrHelper->AssignStreams(gnbNetDev, randomStream);
++    randomStream += nrHelper->AssignStreams(ueNetDev, randomStream);
++
++    NrHelper::GetGnbPhy(gnbNetDev.Get(0), 0)->SetAttribute("Numerology", UintegerValue(numerology));
++    NrHelper::GetGnbPhy(gnbNetDev.Get(0), 0)->SetAttribute("TxPower", DoubleValue(totalTxPower));
++
++    // Internet / IP / attach.
++    auto [remoteHost, remoteHostIpv4Address] =
++        nrEpcHelper->SetupRemoteHost("100Gb/s", 2500, Seconds(0.0));
++    InternetStackHelper internet;
++    internet.Install(ueContainer);
++    Ipv4InterfaceContainer ueIpIface =
++        nrEpcHelper->AssignUeIpv4Address(NetDeviceContainer(ueNetDev));
++    nrHelper->AttachToClosestGnb(ueNetDev, gnbNetDev);
++
++    // Downlink UDP traffic.
++    uint16_t dlPort = 1234;
++    ApplicationContainer serverApps;
++    UdpServerHelper dlPacketSink(dlPort);
++    serverApps.Add(dlPacketSink.Install(ueContainer));
++
++    UdpClientHelper dlClient;
++    dlClient.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
++    dlClient.SetAttribute("PacketSize", UintegerValue(udpPacketSize));
++    dlClient.SetAttribute("Interval", TimeValue(Seconds(1.0 / lambda)));
++
++    NrQosFlow dlFlow(NrQosFlow::NGBR_LOW_LAT_EMBB);
++    ApplicationContainer clientApps;
++    for (uint32_t i = 0; i < ueContainer.GetN(); ++i)
++    {
++        Address ueAddress = ueIpIface.GetAddress(i);
++        dlClient.SetAttribute(
++            "Remote",
++            AddressValue(addressUtils::ConvertToSocketAddress(ueAddress, dlPort)));
++        clientApps.Add(dlClient.Install(remoteHost));
++        Ptr<NrQosRule> rule = Create<NrQosRule>();
++        NrQosRule::PacketFilter pf;
++        pf.localPortStart = dlPort;
++        pf.localPortEnd = dlPort;
++        rule->Add(pf);
++        nrHelper->ActivateDedicatedQosFlow(ueNetDev.Get(i), dlFlow, rule);
++    }
++    // Send traffic only in the first half of the active window and leave an
++    // idle tail: with DRX on, the UEs sleep through the tail (deep/light sleep);
++    // with DRX off they keep monitoring PDCCH. This is what makes the DRX knob
++    // visible in the reported UE energy. Under continuous back-to-back load the
++    // inactivity timer never lapses, so DRX on and off would be nearly equal.
++    Time trafficStopTime = udpAppStartTime + (simTime - udpAppStartTime) / 2;
++    serverApps.Start(udpAppStartTime);
++    clientApps.Start(udpAppStartTime);
++    serverApps.Stop(simTime);
++    clientApps.Stop(trafficStopTime);
++
++    // ---------------------------------------------------------------------
++    // 2. Install energy sources with the standard ns-3 energy module: one
++    //    BasicEnergySource per node, index-aligned with the device containers.
++    // ---------------------------------------------------------------------
++    BasicEnergySourceHelper srcHelper;
++    srcHelper.Set("BasicEnergySourceInitialEnergyJ", DoubleValue(1e9)); // large reservoir
++    energy::EnergySourceContainer gnbSources = srcHelper.Install(gnbContainer);
++    energy::EnergySourceContainer ueSources = srcHelper.Install(ueContainer);
++
++    // ---------------------------------------------------------------------
++    // 3. Create the energy helper and override only what we care about; every
++    //    other knob keeps its TR 38.864 / TR 38.840 default.
++    // ---------------------------------------------------------------------
++    NrEnergyHelper energyHelper;
++    energyHelper.SetGnbEnergyModelAttribute("ReferenceTxPowerDbm", DoubleValue(totalTxPower));
++    energyHelper.EnableDrx(enableDrx);
++
++    // ---------------------------------------------------------------------
++    // 4. Install - one call per side. This is the whole energy integration.
++    // ---------------------------------------------------------------------
++    energy::DeviceEnergyModelContainer gnbModels = energyHelper.InstallGnb(gnbNetDev, gnbSources);
++    energy::DeviceEnergyModelContainer ueModels = energyHelper.InstallUe(ueNetDev, ueSources);
++
++    // ---------------------------------------------------------------------
++    // 5. (optional) connect traces here, e.g. the model's TotalEnergyConsumption
++    //    trace source, if a time series is wanted.
++    // 6. Run and read the numbers off the returned containers afterwards.
++    // ---------------------------------------------------------------------
++    Simulator::Stop(simTime);
++    Simulator::Run();
++
++    double simSeconds = simTime.GetSeconds();
++    uint64_t rxPackets = 0;
++    for (uint32_t i = 0; i < serverApps.GetN(); ++i)
++    {
++        rxPackets += DynamicCast<UdpServer>(serverApps.Get(i))->GetReceived();
++    }
++    double rxBits = static_cast<double>(rxPackets) * udpPacketSize * 8.0;
++
++    std::cout << std::fixed << std::setprecision(3);
++    std::cout << "\n================ NR Energy Example Results ================\n";
++    std::cout << "Sim time: " << simSeconds << " s, UEs: " << ueContainer.GetN()
++              << ", DRX: " << (enableDrx ? "on" : "off") << "\n\n";
++
++    double gnbEnergy = gnbModels.Get(0)->GetTotalEnergyConsumption();
++    std::cout << "gNB:\n";
++    std::cout << "  Total energy : " << gnbEnergy << " J\n";
++    std::cout << "  Average power: " << gnbEnergy / simSeconds << " W\n\n";
++
++    double ueEnergyTotal = 0.0;
++    for (uint32_t i = 0; i < ueModels.GetN(); ++i)
++    {
++        double e = ueModels.Get(i)->GetTotalEnergyConsumption();
++        ueEnergyTotal += e;
++        std::cout << "  UE" << i << " energy: " << e << " J  (avg " << e / simSeconds << " W)\n";
++    }
++    std::cout << "  UE energy total: " << ueEnergyTotal << " J\n\n";
++
++    if (gnbEnergy > 0.0)
++    {
++        std::cout << "Network efficiency: " << (rxBits / gnbEnergy) / 1e6 << " Mbit/J\n";
++    }
++    std::cout << "===========================================================\n";
++
++    Simulator::Destroy();
++    return 0;
++}
+diff --git a/helper/nr-energy-helper.cc b/helper/nr-energy-helper.cc
+new file mode 100644
+index 00000000..6d986beb
+--- /dev/null
++++ b/helper/nr-energy-helper.cc
+@@ -0,0 +1,180 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.864 V18.1.0 (2023-03): Section 5 - Energy consumption model for BS
++//   TR 38.840 V16.0.0 (2019-06): Section 8 - UE energy consumption evaluation
++
++#include "nr-energy-helper.h"
++
++#include "nr-helper.h"
++
++#include "ns3/energy-source.h"
++#include "ns3/log.h"
++#include "ns3/net-device.h"
++#include "ns3/node.h"
++#include "ns3/nr-gnb-energy-model.h"
++#include "ns3/nr-gnb-phy-energy-listener.h"
++#include "ns3/nr-gnb-phy.h"
++#include "ns3/nr-ue-drx-model.h"
++#include "ns3/nr-ue-energy-model.h"
++#include "ns3/nr-ue-phy-energy-listener.h"
++#include "ns3/nr-ue-phy.h"
++#include "ns3/simulator.h"
++
++namespace ns3
++{
++
++NS_LOG_COMPONENT_DEFINE("NrEnergyHelper");
++
++namespace
++{
++// The energy listeners drive the first BWP of each device, matching the
++// GetGnbPhy/GetUePhy(dev, 0) convention used throughout the NR examples.
++constexpr uint32_t ENERGY_BWP_INDEX = 0;
++} // namespace
++
++NrEnergyHelper::NrEnergyHelper()
++    : m_enableDrx(false)
++{
++    NS_LOG_FUNCTION(this);
++    m_gnbModelFactory.SetTypeId(NrGnbEnergyModel::GetTypeId());
++    m_ueModelFactory.SetTypeId(NrUeEnergyModel::GetTypeId());
++    m_drxFactory.SetTypeId(NrUeDrxModel::GetTypeId());
++}
++
++NrEnergyHelper::~NrEnergyHelper()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++NrEnergyHelper::SetGnbEnergyModelAttribute(std::string n, const AttributeValue& v)
++{
++    NS_LOG_FUNCTION(this << n);
++    m_gnbModelFactory.Set(n, v);
++}
++
++void
++NrEnergyHelper::SetUeEnergyModelAttribute(std::string n, const AttributeValue& v)
++{
++    NS_LOG_FUNCTION(this << n);
++    m_ueModelFactory.Set(n, v);
++}
++
++void
++NrEnergyHelper::SetDrxModelAttribute(std::string n, const AttributeValue& v)
++{
++    NS_LOG_FUNCTION(this << n);
++    m_drxFactory.Set(n, v);
++}
++
++void
++NrEnergyHelper::EnableDrx(bool enable)
++{
++    NS_LOG_FUNCTION(this << enable);
++    m_enableDrx = enable;
++}
++
++void
++NrEnergyHelper::AttachToSource(Ptr<energy::DeviceEnergyModel> model,
++                               Ptr<energy::EnergySource> source)
++{
++    NS_LOG_FUNCTION(this << model << source);
++    NS_ASSERT_MSG(source, "Every device needs an energy source");
++    source->AppendDeviceEnergyModel(model);
++    model->SetEnergySource(source);
++}
++
++energy::DeviceEnergyModelContainer
++NrEnergyHelper::InstallGnb(NetDeviceContainer gnbDevs, energy::EnergySourceContainer sources)
++{
++    NS_LOG_FUNCTION(this << gnbDevs.GetN());
++    NS_ASSERT_MSG(gnbDevs.GetN() == sources.GetN(),
++                  "One energy source per gNB device is required (index-aligned)");
++
++    energy::DeviceEnergyModelContainer models;
++    for (uint32_t i = 0; i < gnbDevs.GetN(); ++i)
++    {
++        Ptr<NetDevice> dev = gnbDevs.Get(i);
++        Ptr<energy::EnergySource> source = sources.Get(i);
++        NS_ASSERT_MSG(source->GetNode() == dev->GetNode(),
++                      "Energy source " << i << " is not on the same node as gNB device " << i
++                                       << "; the two containers must be index-aligned");
++
++        Ptr<NrGnbEnergyModel> model = m_gnbModelFactory.Create<NrGnbEnergyModel>();
++        AttachToSource(model, source);
++
++        // Wire the PHY listener: SetEnergyModel() before SetPhy() so the
++        // listener can push the PHY's symbol duration into the model.
++        Ptr<NrGnbPhyEnergyListener> listener = CreateObject<NrGnbPhyEnergyListener>();
++        listener->SetEnergyModel(model);
++        listener->SetPhy(NrHelper::GetGnbPhy(dev, ENERGY_BWP_INDEX));
++
++        // Keep the listener alive for the whole simulation: this helper is
++        // usually stack-allocated and nothing else holds the listener.
++        dev->GetNode()->AggregateObject(listener);
++
++        models.Add(model);
++    }
++    return models;
++}
++
++energy::DeviceEnergyModelContainer
++NrEnergyHelper::InstallUe(NetDeviceContainer ueDevs, energy::EnergySourceContainer sources)
++{
++    NS_LOG_FUNCTION(this << ueDevs.GetN());
++    NS_ASSERT_MSG(ueDevs.GetN() == sources.GetN(),
++                  "One energy source per UE device is required (index-aligned)");
++
++    energy::DeviceEnergyModelContainer models;
++    for (uint32_t i = 0; i < ueDevs.GetN(); ++i)
++    {
++        Ptr<NetDevice> dev = ueDevs.Get(i);
++        Ptr<energy::EnergySource> source = sources.Get(i);
++        NS_ASSERT_MSG(source->GetNode() == dev->GetNode(),
++                      "Energy source " << i << " is not on the same node as UE device " << i
++                                       << "; the two containers must be index-aligned");
++
++        Ptr<NrUeEnergyModel> model = m_ueModelFactory.Create<NrUeEnergyModel>();
++        AttachToSource(model, source);
++
++        Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
++        listener->SetEnergyModel(model);
++        listener->SetPhy(NrHelper::GetUePhy(dev, ENERGY_BWP_INDEX));
++
++        if (m_enableDrx)
++        {
++            // The DRX model owns the sleep transitions; the listener restarts
++            // its inactivity timer on each transport block.
++            Ptr<NrUeDrxModel> drx = m_drxFactory.Create<NrUeDrxModel>();
++            drx->SetEnergyModel(model);
++            listener->SetDrxModel(drx);
++            drx->Start(Simulator::Now());
++            dev->GetNode()->AggregateObject(drx);
++        }
++
++        dev->GetNode()->AggregateObject(listener);
++
++        models.Add(model);
++    }
++    return models;
++}
++
++energy::DeviceEnergyModelContainer
++NrEnergyHelper::Install(NetDeviceContainer gnbDevs,
++                        energy::EnergySourceContainer gnbSources,
++                        NetDeviceContainer ueDevs,
++                        energy::EnergySourceContainer ueSources)
++{
++    NS_LOG_FUNCTION(this);
++    energy::DeviceEnergyModelContainer models = InstallGnb(gnbDevs, gnbSources);
++    models.Add(InstallUe(ueDevs, ueSources));
++    return models;
++}
++
++} // namespace ns3
+diff --git a/helper/nr-energy-helper.h b/helper/nr-energy-helper.h
+new file mode 100644
+index 00000000..b9e9a0f5
+--- /dev/null
++++ b/helper/nr-energy-helper.h
+@@ -0,0 +1,178 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.864 V18.1.0 (2023-03): Section 5 - Energy consumption model for BS
++//   TR 38.840 V16.0.0 (2019-06): Section 8 - UE energy consumption evaluation
++
++#ifndef NR_ENERGY_HELPER_H
++#define NR_ENERGY_HELPER_H
++
++#include "ns3/device-energy-model-container.h"
++#include "ns3/energy-source-container.h"
++#include "ns3/net-device-container.h"
++#include "ns3/object-factory.h"
++
++namespace ns3
++{
++
++/**
++ * @ingroup nr
++ * @brief One-call installer for the NR energy framework.
++ *
++ * Wires the NR energy stack onto already built NR devices, so a user scenario
++ * never has to touch the individual models or the PHY-to-model callback
++ * bridges. For each device it creates the per-device energy model, connects it
++ * to the caller's energy::EnergySource, and attaches the matching PHY listener
++ * that translates PHY events into TR 38.864 / TR 38.840 power-state changes:
++ *   - gNB: NrGnbEnergyModel + NrGnbPhyEnergyListener (TR 38.864 Section 5);
++ *   - UE:  NrUeEnergyModel  + NrUePhyEnergyListener  (TR 38.840 Section 8), and
++ *          an optional NrUeDrxModel when EnableDrx() is set.
++ *
++ * The energy sources themselves are NOT created here: they are standard ns-3
++ * energy::EnergySource objects the caller installs with e.g.
++ * BasicEnergySourceHelper, one per node, passed in index aligned with the
++ * device container. The created device models are returned in a
++ * DeviceEnergyModelContainer so the caller can read GetTotalEnergyConsumption()
++ * afterwards; the listeners and DRX models are aggregated onto their node so
++ * they outlive this (typically stack-allocated) helper.
++ *
++ * @warning Read the consumed energy from the returned device models
++ * (GetTotalEnergyConsumption()), NOT from the energy sources. The gNB model
++ * accounts energy symbol-by-symbol (TR 38.864 Section 5.2) and never drives the
++ * source through the discrete ChangeState() path, so the source's own remaining
++ * energy does not reflect the gNB's real consumption. The returned models are
++ * the single source of truth.
++ *
++ * Typical use (see the cttc-nr-energy examples):
++ * @code
++ *   NrEnergyHelper energyHelper;
++ *   energyHelper.EnableDrx(true); // optional
++ *   auto gnbModels = energyHelper.InstallGnb(gnbDevs, gnbSources);
++ *   auto ueModels  = energyHelper.InstallUe(ueDevs, ueSources);
++ * @endcode
++ */
++class NrEnergyHelper
++{
++  public:
++    /**
++     * @brief NrEnergyHelper constructor.
++     *
++     * Configures the internal object factories with the default NR energy
++     * model / DRX TypeIds; the 3GPP defaults on those models apply until
++     * overridden with the SetXxxAttribute() methods below.
++     */
++    NrEnergyHelper();
++
++    /**
++     * @brief ~NrEnergyHelper
++     */
++    ~NrEnergyHelper();
++
++    // ----- Model configuration (optional; sensible 3GPP defaults otherwise) -----
++
++    /**
++     * @brief Set an attribute on every gNB energy model created afterwards.
++     * @param n Attribute name on NrGnbEnergyModel.
++     * @param v Attribute value.
++     */
++    void SetGnbEnergyModelAttribute(std::string n, const AttributeValue& v);
++
++    /**
++     * @brief Set an attribute on every UE energy model created afterwards.
++     * @param n Attribute name on NrUeEnergyModel.
++     * @param v Attribute value.
++     */
++    void SetUeEnergyModelAttribute(std::string n, const AttributeValue& v);
++
++    /**
++     * @brief Set an attribute on every DRX model created afterwards.
++     * @param n Attribute name on NrUeDrxModel.
++     * @param v Attribute value.
++     */
++    void SetDrxModelAttribute(std::string n, const AttributeValue& v);
++
++    /**
++     * @brief Enable or disable C-DRX on the UEs installed afterwards.
++     *
++     * When enabled, InstallUe() also creates an NrUeDrxModel per UE, connects
++     * it to the UE energy model and the PHY listener, and starts its cycling.
++     * When disabled (the default) the UE stays in PDCCH-only monitoring between
++     * transport blocks with no sleep cycling.
++     *
++     * @param enable True to install a DRX model on each UE.
++     */
++    void EnableDrx(bool enable);
++
++    // ----- Installation -----
++
++    /**
++     * @brief Install the gNB energy stack on a set of gNB devices.
++     *
++     * For each device i: creates an NrGnbEnergyModel, connects it to
++     * sources.Get(i), and attaches an NrGnbPhyEnergyListener to the device's
++     * first-BWP NrGnbPhy. @p gnbDevs and @p sources must be index-aligned and
++     * of equal size (one source per node, in the same order the devices were
++     * installed).
++     *
++     * @param gnbDevs gNB NetDevices from NrHelper::InstallGnbDevice.
++     * @param sources One energy::EnergySource per gNB node, index-aligned.
++     * @return Container of the created gNB device energy models.
++     */
++    energy::DeviceEnergyModelContainer InstallGnb(NetDeviceContainer gnbDevs,
++                                                  energy::EnergySourceContainer sources);
++
++    /**
++     * @brief Install the UE energy stack on a set of UE devices.
++     *
++     * For each device i: creates an NrUeEnergyModel, connects it to
++     * sources.Get(i), attaches an NrUePhyEnergyListener to the device's
++     * first-BWP NrUePhy, and (if EnableDrx() was set) an NrUeDrxModel. @p ueDevs
++     * and @p sources must be index-aligned and of equal size.
++     *
++     * @param ueDevs  UE NetDevices from NrHelper::InstallUeDevice.
++     * @param sources One energy::EnergySource per UE node, index-aligned.
++     * @return Container of the created UE device energy models.
++     */
++    energy::DeviceEnergyModelContainer InstallUe(NetDeviceContainer ueDevs,
++                                                 energy::EnergySourceContainer sources);
++
++    /**
++     * @brief Install both sides in one call.
++     *
++     * Convenience wrapper around InstallGnb() and InstallUe(); the returned
++     * container concatenates the gNB models followed by the UE models.
++     *
++     * @param gnbDevs    gNB NetDevices.
++     * @param gnbSources One energy::EnergySource per gNB node, index-aligned.
++     * @param ueDevs     UE NetDevices.
++     * @param ueSources  One energy::EnergySource per UE node, index-aligned.
++     * @return Container of all created device energy models (gNB then UE).
++     */
++    energy::DeviceEnergyModelContainer Install(NetDeviceContainer gnbDevs,
++                                               energy::EnergySourceContainer gnbSources,
++                                               NetDeviceContainer ueDevs,
++                                               energy::EnergySourceContainer ueSources);
++
++  private:
++    /**
++     * @brief Connect a device energy model to an energy source both ways.
++     * @param model  The device energy model to attach.
++     * @param source The energy source that drains it.
++     */
++    void AttachToSource(Ptr<energy::DeviceEnergyModel> model, Ptr<energy::EnergySource> source);
++
++    ObjectFactory m_gnbModelFactory; //!< Builds NrGnbEnergyModel instances
++    ObjectFactory m_ueModelFactory;  //!< Builds NrUeEnergyModel instances
++    ObjectFactory m_drxFactory;      //!< Builds NrUeDrxModel instances
++
++    bool m_enableDrx; //!< Install a DRX model on each UE (default false)
++};
++
++} // namespace ns3
++
++#endif // NR_ENERGY_HELPER_H
+-- 
+2.43.0
+

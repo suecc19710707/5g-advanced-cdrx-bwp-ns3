@@ -1,0 +1,176 @@
+From 0563f8028256fde3b220d05950788acda6b28653 Mon Sep 17 00:00:00 2001
+From: suecc0707 <suecc0707@gmail.com>
+Date: Mon, 19 Oct 2026 09:33:37 +0800
+Subject: [PATCH 9/9] nr: expose scheduler observations for joint energy
+ control
+
+---
+ model/nr-mac-scheduler-ns3.cc | 70 ++++++++++++++++++++++++++++++++++-
+ model/nr-mac-scheduler-ns3.h  | 48 ++++++++++++++++++++++++
+ 2 files changed, 117 insertions(+), 1 deletion(-)
+
+diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
+index 09099852..05e2a49e 100644
+--- a/model/nr-mac-scheduler-ns3.cc
++++ b/model/nr-mac-scheduler-ns3.cc
+@@ -25,7 +25,9 @@
+ #include "ns3/uinteger.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <memory>
++#include <numeric>
+ #include <ranges>
+ #include <unordered_set>
+ 
+@@ -487,6 +489,72 @@ NrMacSchedulerNs3::IsHarqReTxEnable() const
+     return m_enableHarqReTx && m_maxHarqReTx > 0;
+ }
+ 
++void
++NrMacSchedulerNs3::SetDlDataSchedulingEnabled(bool enabled)
++{
++    m_dlDataSchedulingEnabled = enabled;
++}
++
++bool
++NrMacSchedulerNs3::IsDlDataSchedulingEnabled() const
++{
++    return m_dlDataSchedulingEnabled;
++}
++
++uint64_t
++NrMacSchedulerNs3::GetTotalDlBufferBytes() const
++{
++    uint64_t totalBytes = 0;
++    for (const auto& entry : m_ueMap)
++    {
++        totalBytes += entry.second->GetTotalDlBuffer();
++    }
++    return totalBytes;
++}
++
++NrMacSchedulerNs3::DlObservationStats
++NrMacSchedulerNs3::GetDlObservationStats() const
++{
++    DlObservationStats stats;
++    std::vector<double> validCqis;
++    double mcsSum = 0.0;
++
++    for (const auto& entry : m_ueMap)
++    {
++        const auto& ue = entry.second;
++        const uint32_t ueBufferBytes = ue->GetTotalDlBuffer();
++        stats.totalBufferBytes += ueBufferBytes;
++        stats.maxUeBufferBytes = std::max(stats.maxUeBufferBytes, ueBufferBytes);
++        mcsSum += static_cast<double>(ue->GetDlMcs());
++        stats.ueCount++;
++
++        // A non-zero timer identifies CQI from actual CSI feedback instead of
++        // the scheduler's initial/fallback value.
++        if (ue->m_dlCqi.m_timer > 0)
++        {
++            validCqis.push_back(static_cast<double>(ue->m_dlCqi.m_wbCqi));
++        }
++    }
++
++    if (stats.ueCount > 0)
++    {
++        stats.meanMcs = mcsSum / static_cast<double>(stats.ueCount);
++    }
++    if (!validCqis.empty())
++    {
++        std::sort(validCqis.begin(), validCqis.end());
++        const std::size_t p10Index = static_cast<std::size_t>(
++            std::floor(0.10 * static_cast<double>(validCqis.size() - 1)));
++        stats.validCqiCount = validCqis.size();
++        stats.minCqi = validCqis.front();
++        stats.p10Cqi = validCqis.at(p10Index);
++        stats.meanCqi = std::accumulate(validCqis.begin(), validCqis.end(), 0.0) /
++                        static_cast<double>(validCqis.size());
++    }
++
++    return stats;
++}
++
+ void
+ NrMacSchedulerNs3::SetNrFhSchedSapProvider(NrFhSchedSapProvider* s)
+ {
+@@ -2634,7 +2702,7 @@ NrMacSchedulerNs3::DoScheduleDl(const std::vector<DlHarqInfo>& dlHarqFeedback,
+ 
+     NS_ASSERT(dlAssignationStartPoint.m_rbg == 0);
+ 
+-    if (dlSymAvail > 0 && !activeDlUe->empty())
++    if (m_dlDataSchedulingEnabled && dlSymAvail > 0 && !activeDlUe->empty())
+     {
+         uint8_t usedDl =
+             DoScheduleDlData(&dlAssignationStartPoint, dlSymAvail, *activeDlUe, allocInfo);
+diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
+index 1654877d..253f05bd 100644
+--- a/model/nr-mac-scheduler-ns3.h
++++ b/model/nr-mac-scheduler-ns3.h
+@@ -560,6 +560,53 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+      */
+     bool IsHarqReTxEnable() const override;
+ 
++    /**
++     * @brief Enable or disable scheduling of new downlink data.
++     *
++     * HARQ retransmissions and control signaling remain enabled while new data
++     * scheduling is disabled. This allows a cell sleep controller to stop
++     * serving queued RLC data without changing the offered application load.
++     *
++     * @param enabled true to schedule new DL data; false to keep it queued
++     */
++    void SetDlDataSchedulingEnabled(bool enabled);
++
++    /**
++     * @brief Check whether new downlink data scheduling is enabled.
++     * @return true when new DL data may be scheduled
++     */
++    bool IsDlDataSchedulingEnabled() const;
++
++    /**
++     * @brief Return the aggregate downlink RLC buffer across all UEs.
++     * @return queued downlink bytes reported to the scheduler
++     */
++    uint64_t GetTotalDlBufferBytes() const;
++
++    /**
++     * @brief Fixed-size aggregate statistics for an external controller.
++     *
++     * These statistics retain information about the worst UE without making
++     * the controller input dimension depend on the number of attached UEs.
++     */
++    struct DlObservationStats
++    {
++        uint64_t totalBufferBytes{0};
++        uint32_t maxUeBufferBytes{0};
++        double meanCqi{0.0};
++        double p10Cqi{0.0};
++        double minCqi{0.0};
++        double meanMcs{0.0};
++        uint32_t ueCount{0};
++        uint32_t validCqiCount{0};
++    };
++
++    /**
++     * @brief Return aggregate per-UE DL buffer, CQI, and MCS statistics.
++     * @return fixed-size statistics suitable for a scalable controller input
++     */
++    DlObservationStats GetDlObservationStats() const;
++
+     /**
+      * @brief Sets the default RACH UL
+      * grant MCS
+@@ -1006,6 +1053,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+     int8_t m_maxDlMcs{0};        //!< Maximum index for DL MCS
+     Time m_cqiTimersThreshold;   //!< The time while a CQI is valid
+     bool m_enableHarqReTx{true}; //!< Whether HARQ retransmissions are enabled
++    bool m_dlDataSchedulingEnabled{true}; //!< Whether new DL data can be scheduled
+     uint8_t m_maxHarqReTx{3};    //!< Maximum number of HARQ retransmissions per TB
+ 
+     uint8_t m_rachUlGrantMcs{0}; //!< The MCS that will be used for UL RACH grant
+-- 
+2.43.0
+

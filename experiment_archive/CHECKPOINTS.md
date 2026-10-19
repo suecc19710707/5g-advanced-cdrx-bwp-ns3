@@ -27,3 +27,12 @@ and custom-energy-v4.
 
 Future official-energy work starts after this checkpoint and must not rewrite
 the checkpoint tag.
+
+## `official-energy-v5` development branch
+
+Development after the custom-energy checkpoint replaces the custom slot
+trackers with the candidate 5G-LENA TR 38.864/TR 38.840 framework from official
+GitLab merge requests !408 and !417.  Provenance, assumptions, validation, and
+the complete nested `contrib/nr` patch series are stored in:
+
+- `official_energy_v5_2026-10-19/`

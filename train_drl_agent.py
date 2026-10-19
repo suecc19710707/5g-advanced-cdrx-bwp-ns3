@@ -188,14 +188,12 @@ def train_ppo_agent(
     burst_mean_on_ms=80.0,
     burst_mean_off_ms=120.0,
     gnb_tx_power_dbm=30.0,
-    gnb_p0_active_w=150.0,
-    gnb_p_micro_sleep_w=15.0,
-    gnb_p_tx_max_w=40.0,
-    gnb_delta_p=4.7,
-    gnb_narrow_capacity_mbps=100.0,
-    gnb_wide_capacity_mbps=100.0,
-    gnb_wide_active_power_overhead_w=0.0,
-    gnb_wide_sleep_power_overhead_w=0.0,
+    gnb_energy_bs_category="BsCat1",
+    gnb_energy_ref_config="Set1",
+    gnb_energy_eta_mode="Dual",
+    gnb_energy_antenna_ratio=0.4,
+    gnb_energy_power_unit_w=1.0,
+    ue_energy_power_unit_mw=1.0,
     history_csv="ppo_training_history.csv",
     ns3_csv="multi_user_rl_step.csv",
     model_out="ppo_5g_joint2d_model.pt",
@@ -229,6 +227,11 @@ def train_ppo_agent(
     )
     print(f"📡 流量: {traffic_label}")
     print(f"🎯 SLA={qos_target_ms:.1f}ms | Active Window=10–{max_active_ms:.0f}ms (initial {initial_active_ms:.0f}ms) | gNB Tx={gnb_tx_power_dbm:.1f}dBm | warm-up={warmup_ms:.0f}ms | seed={seed}")
+    print(
+        "🔋 Energy: 5G-LENA TR 38.864/38.840 | "
+        f"{gnb_energy_bs_category}/{gnb_energy_ref_config}/{gnb_energy_eta_mode} | "
+        f"gNB unit={gnb_energy_power_unit_w:g}W | UE unit={ue_energy_power_unit_mw:g}mW"
+    )
     print(f"⚡ 運算硬體裝置: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
     print("=" * 110)
 
@@ -241,14 +244,12 @@ def train_ppo_agent(
         burst_mean_on_ms=burst_mean_on_ms,
         burst_mean_off_ms=burst_mean_off_ms,
         gnb_tx_power_dbm=gnb_tx_power_dbm,
-        gnb_p0_active_w=gnb_p0_active_w,
-        gnb_p_micro_sleep_w=gnb_p_micro_sleep_w,
-        gnb_p_tx_max_w=gnb_p_tx_max_w,
-        gnb_delta_p=gnb_delta_p,
-        gnb_narrow_capacity_mbps=gnb_narrow_capacity_mbps,
-        gnb_wide_capacity_mbps=gnb_wide_capacity_mbps,
-        gnb_wide_active_power_overhead_w=gnb_wide_active_power_overhead_w,
-        gnb_wide_sleep_power_overhead_w=gnb_wide_sleep_power_overhead_w,
+        gnb_energy_bs_category=gnb_energy_bs_category,
+        gnb_energy_ref_config=gnb_energy_ref_config,
+        gnb_energy_eta_mode=gnb_energy_eta_mode,
+        gnb_energy_antenna_ratio=gnb_energy_antenna_ratio,
+        gnb_energy_power_unit_w=gnb_energy_power_unit_w,
+        ue_energy_power_unit_mw=ue_energy_power_unit_mw,
         enable_mock=False,
         sim_time=episode_sim_time,
         csv_filename=ns3_csv,
@@ -315,6 +316,13 @@ def train_ppo_agent(
             "WideBwpRatePct",
             "SlaViolationRate",
             "Loss",
+            "EnergyModel",
+            "GnbEnergyBsCategory",
+            "GnbEnergyRefConfig",
+            "GnbEnergyEtaMode",
+            "GnbEnergyAntennaRatio",
+            "GnbEnergyPowerUnitW",
+            "UeEnergyPowerUnitMw",
         ],
     )
     history_writer.writeheader()
@@ -457,6 +465,13 @@ def train_ppo_agent(
                 "WideBwpRatePct": wide_bwp_rate_pct,
                 "SlaViolationRate": sla_violation_rate,
                 "Loss": loss_val,
+                "EnergyModel": "5G-LENA-TR38.864-TR38.840",
+                "GnbEnergyBsCategory": gnb_energy_bs_category,
+                "GnbEnergyRefConfig": gnb_energy_ref_config,
+                "GnbEnergyEtaMode": gnb_energy_eta_mode,
+                "GnbEnergyAntennaRatio": gnb_energy_antenna_ratio,
+                "GnbEnergyPowerUnitW": gnb_energy_power_unit_w,
+                "UeEnergyPowerUnitMw": ue_energy_power_unit_mw,
             })
             history_file.flush()
 
@@ -502,14 +517,12 @@ def parse_args():
     parser.add_argument("--burst-mean-on-ms", type=float, default=80.0)
     parser.add_argument("--burst-mean-off-ms", type=float, default=120.0)
     parser.add_argument("--gnb-tx-power-dbm", type=float, default=30.0)
-    parser.add_argument("--gnb-p0-active-w", type=float, default=150.0)
-    parser.add_argument("--gnb-p-micro-sleep-w", type=float, default=15.0)
-    parser.add_argument("--gnb-p-tx-max-w", type=float, default=40.0)
-    parser.add_argument("--gnb-delta-p", type=float, default=4.7)
-    parser.add_argument("--gnb-narrow-capacity-mbps", type=float, default=100.0)
-    parser.add_argument("--gnb-wide-capacity-mbps", type=float, default=100.0)
-    parser.add_argument("--gnb-wide-active-power-overhead-w", type=float, default=0.0)
-    parser.add_argument("--gnb-wide-sleep-power-overhead-w", type=float, default=0.0)
+    parser.add_argument("--gnb-energy-bs-category", choices=("BsCat1", "BsCat2"), default="BsCat1")
+    parser.add_argument("--gnb-energy-ref-config", choices=("Set1", "Set2", "Set3"), default="Set1")
+    parser.add_argument("--gnb-energy-eta-mode", choices=("Single", "Dual"), default="Dual")
+    parser.add_argument("--gnb-energy-antenna-ratio", type=float, default=0.4)
+    parser.add_argument("--gnb-energy-power-unit-w", type=float, default=1.0)
+    parser.add_argument("--ue-energy-power-unit-mw", type=float, default=1.0)
     parser.add_argument("--history-csv", default="ppo_training_history.csv")
     parser.add_argument("--ns3-csv", default="multi_user_rl_step.csv")
     parser.add_argument("--model-out", default="ppo_5g_joint2d_model.pt")
@@ -542,18 +555,10 @@ def parse_args():
         parser.error("burst On/Off means must be greater than zero")
     if not -50.0 <= args.gnb_tx_power_dbm <= 60.0:
         parser.error("--gnb-tx-power-dbm must be between -50 and 60")
-    gnb_nonnegative = [
-        args.gnb_p0_active_w,
-        args.gnb_p_micro_sleep_w,
-        args.gnb_p_tx_max_w,
-        args.gnb_delta_p,
-        args.gnb_wide_active_power_overhead_w,
-        args.gnb_wide_sleep_power_overhead_w,
-    ]
-    if any(value < 0.0 for value in gnb_nonnegative):
-        parser.error("gNB energy-model power parameters cannot be negative")
-    if args.gnb_narrow_capacity_mbps <= 0.0 or args.gnb_wide_capacity_mbps <= 0.0:
-        parser.error("gNB energy-model capacities must be greater than zero")
+    if args.gnb_energy_power_unit_w <= 0.0 or args.ue_energy_power_unit_mw <= 0.0:
+        parser.error("official Energy model PowerUnit values must be greater than zero")
+    if not 0.0 <= args.gnb_energy_antenna_ratio <= 1.0:
+        parser.error("--gnb-energy-antenna-ratio must be inside [0, 1]")
     if args.qos_target_ms <= 0:
         parser.error("--qos-target-ms must be greater than zero")
     if args.warmup_ms < 0:
@@ -589,14 +594,12 @@ if __name__ == "__main__":
         burst_mean_on_ms=cli_args.burst_mean_on_ms,
         burst_mean_off_ms=cli_args.burst_mean_off_ms,
         gnb_tx_power_dbm=cli_args.gnb_tx_power_dbm,
-        gnb_p0_active_w=cli_args.gnb_p0_active_w,
-        gnb_p_micro_sleep_w=cli_args.gnb_p_micro_sleep_w,
-        gnb_p_tx_max_w=cli_args.gnb_p_tx_max_w,
-        gnb_delta_p=cli_args.gnb_delta_p,
-        gnb_narrow_capacity_mbps=cli_args.gnb_narrow_capacity_mbps,
-        gnb_wide_capacity_mbps=cli_args.gnb_wide_capacity_mbps,
-        gnb_wide_active_power_overhead_w=cli_args.gnb_wide_active_power_overhead_w,
-        gnb_wide_sleep_power_overhead_w=cli_args.gnb_wide_sleep_power_overhead_w,
+        gnb_energy_bs_category=cli_args.gnb_energy_bs_category,
+        gnb_energy_ref_config=cli_args.gnb_energy_ref_config,
+        gnb_energy_eta_mode=cli_args.gnb_energy_eta_mode,
+        gnb_energy_antenna_ratio=cli_args.gnb_energy_antenna_ratio,
+        gnb_energy_power_unit_w=cli_args.gnb_energy_power_unit_w,
+        ue_energy_power_unit_mw=cli_args.ue_energy_power_unit_mw,
         history_csv=cli_args.history_csv,
         ns3_csv=cli_args.ns3_csv,
         model_out=cli_args.model_out,

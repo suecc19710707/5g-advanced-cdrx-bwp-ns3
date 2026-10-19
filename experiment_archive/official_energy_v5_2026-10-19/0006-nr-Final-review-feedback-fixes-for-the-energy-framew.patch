@@ -1,0 +1,351 @@
+From e413cd815b1cb1f488bc98968d6d2a7e281b80e8 Mon Sep 17 00:00:00 2001
+From: "nipuna.dulara" <pererannd.21@uom.lk>
+Date: Fri, 28 Aug 2026 13:06:20 +0530
+Subject: [PATCH 6/9] nr: Final review-feedback fixes for the energy framework
+
+Fix a codespell false positive in the gNB listener test, skip the
+per-symbol energy stats work entirely when nothing is listening for it,
+keep the DRX inactivity condition alive across a cycle boundary instead
+of clearing it early, scale GetAverageRelativePower's active states the
+same way GetStatePowerW does, remove
+NrGnbPhyEnergyListener::GetLastUlSf, which was dead since it was added,
+and dispose of the aggregator explicitly in its BasicEnergySource test
+to break the Ptr cycle SetEnergySource()/AppendDeviceEnergyModel()
+creates between them, which LeakSanitizer caught in CI.
+---
+ model/nr-gnb-phy-energy-listener.cc     |   7 --
+ model/nr-gnb-phy-energy-listener.h      |   7 --
+ model/nr-gnb-phy.cc                     | 130 +++++++++++++-----------
+ model/nr-ue-drx-model.cc                |   8 +-
+ model/nr-ue-energy-model.cc             |  14 ++-
+ model/nr-ue-energy-model.h              |   5 +-
+ test/nr-test-energy-models.cc           |  23 ++++-
+ test/nr-test-gnb-phy-energy-listener.cc |   8 +-
+ 8 files changed, 115 insertions(+), 87 deletions(-)
+
+diff --git a/model/nr-gnb-phy-energy-listener.cc b/model/nr-gnb-phy-energy-listener.cc
+index 8983f1cc..c96ee455 100644
+--- a/model/nr-gnb-phy-energy-listener.cc
++++ b/model/nr-gnb-phy-energy-listener.cc
+@@ -40,7 +40,6 @@ NrGnbPhyEnergyListener::GetTypeId()
+ 
+ NrGnbPhyEnergyListener::NrGnbPhyEnergyListener()
+     : m_lastDlSf(0.0),
+-      m_lastUlSf(0.0),
+       m_lastSp(1.0), // Default: full power (sp=1)
+       m_lastSa(1.0), // Default: all antennas active (sa=1)
+       m_totalBwpRbs(0),
+@@ -167,12 +166,6 @@ NrGnbPhyEnergyListener::GetLastDlSf() const
+     return m_lastDlSf;
+ }
+ 
+-double
+-NrGnbPhyEnergyListener::GetLastUlSf() const
+-{
+-    return m_lastUlSf;
+-}
+-
+ double
+ NrGnbPhyEnergyListener::GetLastSp() const
+ {
+diff --git a/model/nr-gnb-phy-energy-listener.h b/model/nr-gnb-phy-energy-listener.h
+index 171023c5..94d743e8 100644
+--- a/model/nr-gnb-phy-energy-listener.h
++++ b/model/nr-gnb-phy-energy-listener.h
+@@ -89,12 +89,6 @@ class NrGnbPhyEnergyListener : public Object
+      */
+     double GetLastDlSf() const;
+ 
+-    /**
+-     * @brief Get the most recently computed UL bandwidth utilization sf.
+-     * @return Last UL sf value in [0.0, 1.0].
+-     */
+-    double GetLastUlSf() const;
+-
+     /**
+      * @brief Get the most recently computed Tx power ratio sp.
+      *
+@@ -185,7 +179,6 @@ class NrGnbPhyEnergyListener : public Object
+     Ptr<NrGnbEnergyModel> m_model; //!< Attached gNB energy model (may be null)
+ 
+     double m_lastDlSf; //!< Last DL sf computed: used_REGs / (available_RBs * used_sym)
+-    double m_lastUlSf; //!< Last UL sf computed
+     double m_lastSp;   //!< Last sp computed: currentTxPower_lin / refTxPower_lin
+     double m_lastSa;   //!< Last sa: activeTRxRUs / totalTRxRUs. Fixed at 1.0
+                        //!< until antenna muting is added (no source in PHY yet).
+diff --git a/model/nr-gnb-phy.cc b/model/nr-gnb-phy.cc
+index 72486f70..bf07da48 100644
+--- a/model/nr-gnb-phy.cc
++++ b/model/nr-gnb-phy.cc
+@@ -1057,73 +1057,79 @@ NrGnbPhy::GenerateAllocationStatistics(const SlotAllocInfo& allocInfo) const
+                        GetCellId());
+ 
+     // Per-direction split for the energy framework (additive; the aggregate
+-    // stats above are untouched). DL/UL data and DL/UL control occupy disjoint
+-    // symbol ranges within a slot, so a per-symbol class map is exac. It
+-    // captures F slots (DL data + UL data) and HARQ retransmissions, which the
+-    // MAC scheduling traces do not.
+-    std::vector<uint8_t> symClass(GetSymbolsPerSlot(),
+-                                  0); // 0 idle, 1 DL data, 2 UL data, 3 DL ctrl, 4 UL ctrl
+-    uint32_t dlDataReg = 0;
+-    uint32_t dlCtrlReg = 0;
+-    for (const auto& allocation : allocInfo.m_varTtiAllocInfo)
+-    {
+-        const auto& dci = allocation.m_dci;
+-        const bool ul = (dci->m_format == DciInfoElementTdma::UL);
+-        const bool isData =
+-            (dci->m_type & (DciInfoElementTdma::DATA | DciInfoElementTdma::MSG3)) != 0;
+-        const uint8_t cls = isData ? (ul ? 2 : 1) : (ul ? 4 : 3);
+-        const uint32_t rbg = std::count(dci->m_rbgBitmask.begin(), dci->m_rbgBitmask.end(), 1);
+-        const uint32_t reg = rbg * GetNumRbPerRbg() * dci->m_numSym;
+-        for (uint32_t s = dci->m_symStart;
+-             s < dci->m_symStart + dci->m_numSym && s < symClass.size();
+-             ++s)
+-        {
+-            symClass[s] = cls;
+-        }
+-        if (isData && !ul)
+-        {
+-            dlDataReg += reg;
+-        }
+-        else if (!isData && !ul)
++    // stats above are untouched). Skipped entirely when nothing is listening,
++    // so a simulation that doesn't use the energy framework pays nothing for
++    // it beyond this one check.
++    if (!m_phySlotEnergyStats.IsEmpty())
++    {
++        // DL/UL data and DL/UL control occupy disjoint symbol ranges within a
++        // slot, so a per-symbol class map is exact. It captures F slots (DL
++        // data + UL data) and HARQ retransmissions, which the MAC scheduling
++        // traces do not.
++        std::vector<uint8_t> symClass(GetSymbolsPerSlot(),
++                                      0); // 0 idle, 1 DL data, 2 UL data, 3 DL ctrl, 4 UL ctrl
++        uint32_t dlDataReg = 0;
++        uint32_t dlCtrlReg = 0;
++        for (const auto& allocation : allocInfo.m_varTtiAllocInfo)
+         {
+-            dlCtrlReg += reg;
++            const auto& dci = allocation.m_dci;
++            const bool ul = (dci->m_format == DciInfoElementTdma::UL);
++            const bool isData =
++                (dci->m_type & (DciInfoElementTdma::DATA | DciInfoElementTdma::MSG3)) != 0;
++            const uint8_t cls = isData ? (ul ? 2 : 1) : (ul ? 4 : 3);
++            const uint32_t rbg = std::count(dci->m_rbgBitmask.begin(), dci->m_rbgBitmask.end(), 1);
++            const uint32_t reg = rbg * GetNumRbPerRbg() * dci->m_numSym;
++            for (uint32_t s = dci->m_symStart;
++                 s < dci->m_symStart + dci->m_numSym && s < symClass.size();
++                 ++s)
++            {
++                symClass[s] = cls;
++            }
++            if (isData && !ul)
++            {
++                dlDataReg += reg;
++            }
++            else if (!isData && !ul)
++            {
++                dlCtrlReg += reg;
++            }
+         }
+-    }
+-    // Report positions, not just counts. Bit s is set when symbol s carries that
+-    // class. UL data and UL control are folded together because P_UL has no sf
+-    // dependence, so nothing downstream needs to tell them apart.
+-    uint16_t dlDataMask = 0;
+-    uint16_t dlCtrlMask = 0;
+-    uint16_t ulMask = 0;
+-    for (size_t sym = 0; sym < symClass.size() && sym < 16; ++sym)
+-    {
+-        const auto bit = static_cast<uint16_t>(1U << sym);
+-        switch (symClass[sym])
++        // Report positions, not just counts. Bit s is set when symbol s carries
++        // that class. UL data and UL control are folded together because P_UL
++        // has no sf dependence, so nothing downstream needs to tell them apart.
++        uint16_t dlDataMask = 0;
++        uint16_t dlCtrlMask = 0;
++        uint16_t ulMask = 0;
++        for (size_t sym = 0; sym < symClass.size() && sym < 16; ++sym)
+         {
+-        case 1:
+-            dlDataMask |= bit;
+-            break;
+-        case 3:
+-            dlCtrlMask |= bit;
+-            break;
+-        case 2:
+-        case 4:
+-            ulMask |= bit;
+-            break;
+-        default:
+-            break; // idle
++            const auto bit = static_cast<uint16_t>(1U << sym);
++            switch (symClass[sym])
++            {
++            case 1:
++                dlDataMask |= bit;
++                break;
++            case 3:
++                dlCtrlMask |= bit;
++                break;
++            case 2:
++            case 4:
++                ulMask |= bit;
++                break;
++            default:
++                break; // idle
++            }
+         }
+-    }
+ 
+-    m_phySlotEnergyStats(allocInfo.m_sfnSf,
+-                         availRb,
+-                         dlDataMask,
+-                         dlDataReg,
+-                         ulMask,
+-                         dlCtrlMask,
+-                         dlCtrlReg,
+-                         GetBwpId(),
+-                         GetCellId());
++        m_phySlotEnergyStats(allocInfo.m_sfnSf,
++                             availRb,
++                             dlDataMask,
++                             dlDataReg,
++                             ulMask,
++                             dlCtrlMask,
++                             dlCtrlReg,
++                             GetBwpId(),
++                             GetCellId());
++    }
+ }
+ 
+ void
+diff --git a/model/nr-ue-drx-model.cc b/model/nr-ue-drx-model.cc
+index 6c09c662..a5611535 100644
+--- a/model/nr-ue-drx-model.cc
++++ b/model/nr-ue-drx-model.cc
+@@ -154,7 +154,13 @@ NrUeDrxModel::StartCycle()
+     {
+         m_energyModel->ChangeState(NR_UE_PDCCH_ONLY);
+     }
+-    m_inactivityRunning = false;
++    // Do NOT reset m_inactivityRunning here. TS 38.321 5.7 defines Active Time
++    // as onDurationTimer OR InactivityTimer running - these are independent
++    // conditions. Activity late in the previous cycle can leave a real,
++    // still-scheduled InactivityExpired() event pending past this cycle's
++    // start; clearing the flag would desync it from that event and let
++    // EndOnDuration() sleep early. Only InactivityExpired() clears it, when
++    // the timer it actually tracks fires.
+     m_onDurationRunning = true;
+     m_nextCycleTime = Simulator::Now() + m_longCycle;
+     m_onDurationEvent = Simulator::Schedule(m_onDuration, &NrUeDrxModel::EndOnDuration, this);
+diff --git a/model/nr-ue-energy-model.cc b/model/nr-ue-energy-model.cc
+index 05da115c..f640af63 100644
+--- a/model/nr-ue-energy-model.cc
++++ b/model/nr-ue-energy-model.cc
+@@ -497,8 +497,18 @@ NrUeEnergyModel::GetAverageRelativePower() const
+     double avg = 0.0;
+     for (int s = 0; s < NR_UE_NUM_STATES; ++s)
+     {
+-        avg += GetStateTimeFraction(static_cast<NrUePowerState>(s)) *
+-               GetRelativePower(static_cast<NrUePowerState>(s));
++        const auto state = static_cast<NrUePowerState>(s);
++        // Same scaling GetStatePowerW() applies to the active DL states, minus
++        // the PowerUnit conversion to Watts: this stays in relative power-units,
++        // but must reflect the same BWP/antenna/blind-decoding factors actually
++        // charged, or it under-reports whenever the modelled BWP is narrower
++        // than the reference bandwidth.
++        double relative = GetRelativePower(state);
++        if (IsActiveDlState(state))
++        {
++            relative *= m_bwpScale * m_antennaScale * m_bdScale;
++        }
++        avg += GetStateTimeFraction(state) * relative;
+     }
+     return avg;
+ }
+diff --git a/model/nr-ue-energy-model.h b/model/nr-ue-energy-model.h
+index 76d19630..8ee547b8 100644
+--- a/model/nr-ue-energy-model.h
++++ b/model/nr-ue-energy-model.h
+@@ -204,7 +204,10 @@ class NrUeEnergyModel : public energy::DeviceEnergyModel
+     /**
+      * @brief Average relative power over the tracked window [power-units].
+      *
+-     * sum_state ( occupancy(state) * relativePower(state) ). This is the
++     * sum_state ( occupancy(state) * relativePower(state) ), with the active DL
++     * states' relative power scaled by the same BWP/antenna/blind-decoding
++     * factors GetStatePowerW() applies, so this matches the power actually
++     * accounted rather than the unscaled TR 38.840 table value. This is the
+      * quantity TR 38.840 reports for power-saving comparisons.
+      *
+      * @return Average relative power in power-units.
+diff --git a/test/nr-test-energy-models.cc b/test/nr-test-energy-models.cc
+index 4020427b..37462f7a 100644
+--- a/test/nr-test-energy-models.cc
++++ b/test/nr-test-energy-models.cc
+@@ -1244,6 +1244,7 @@ NrGnbEnergyAggregatorSourceTestCase::DoRun()
+                           modelJ * 1e-6,
+                           "the device total must differ from the unweighted carrier sum");
+ 
++    agg->Dispose();
+     Simulator::Destroy();
+ }
+ 
+@@ -1446,7 +1447,27 @@ NrUeDrxModelCycleTestCase::DoRun()
+                         NR_UE_DEEP_SLEEP,
+                         std::string("sleeps again after inactivity expiry"));
+ 
+-    Simulator::Stop(MilliSeconds(200));
++    // Third cycle boundary: activity 1 ms before the 320 ms cycle start, so
++    // the inactivity timer it arms (expires at 329 ms) is still pending when
++    // StartCycle() runs at 320 ms. TS 38.321 5.7: Active Time is onDuration OR
++    // inactivity running - StartCycle() must not clear a still-pending
++    // inactivity condition just because a new cycle began.
++    Simulator::Schedule(MilliSeconds(319), &NrUeDrxModel::NotifyDataActivity, m_drx);
++    // Past this cycle's onDuration end (328 ms) the still-pending inactivity
++    // timer (due 329 ms) must keep the UE awake, not asleep.
++    Simulator::Schedule(MilliSeconds(328) + MicroSeconds(500),
++                        &NrUeDrxModelCycleTestCase::CheckState,
++                        this,
++                        NR_UE_PDCCH_ONLY,
++                        std::string("pending inactivity timer survives the cycle boundary"));
++    // Once the inactivity timer actually expires, sleep follows.
++    Simulator::Schedule(MilliSeconds(329) + MicroSeconds(500),
++                        &NrUeDrxModelCycleTestCase::CheckState,
++                        this,
++                        NR_UE_DEEP_SLEEP,
++                        std::string("sleeps once the pending inactivity timer expires"));
++
++    Simulator::Stop(MilliSeconds(340));
+     Simulator::Run();
+     Simulator::Destroy();
+ }
+diff --git a/test/nr-test-gnb-phy-energy-listener.cc b/test/nr-test-gnb-phy-energy-listener.cc
+index 0ad82f1f..b789baf7 100644
+--- a/test/nr-test-gnb-phy-energy-listener.cc
++++ b/test/nr-test-gnb-phy-energy-listener.cc
+@@ -98,10 +98,6 @@ NrGnbPhyEnergyListenerDefaultsTestCase::DoRun()
+                               0.0,
+                               1e-12,
+                               "Default DL sf should be 0 (no allocation yet)");
+-    NS_TEST_ASSERT_MSG_EQ_TOL(listener->GetLastUlSf(),
+-                              0.0,
+-                              1e-12,
+-                              "Default UL sf should be 0 (no allocation yet)");
+     NS_TEST_ASSERT_MSG_EQ_TOL(listener->GetLastSp(),
+                               1.0,
+                               1e-12,
+@@ -195,8 +191,8 @@ class NrGnbPhyEnergyListenerSlotTestCase : public TestCase
+  *
+  * TR 38.864 Table 5.1-2 defines Active DL as the P4 state, so a slot occupying
+  * the whole carrier in every symbol must report P4 and nothing else. This fails
+- * if the listener mis-scales the REGs, reports the wrong sf, or never reaches
+- * the model at all.
++ * if the listener scales the REGs incorrectly, reports the wrong sf, or never
++ * reaches the model at all.
+  */
+ class NrGnbPhyEnergyListenerFullDlTestCase : public NrGnbPhyEnergyListenerSlotTestCase
+ {
+-- 
+2.43.0
+

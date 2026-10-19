@@ -1,0 +1,1437 @@
+From 56fffa2c838adfad9f359973fe868f1216cd7193 Mon Sep 17 00:00:00 2001
+From: "nipuna.dulara" <pererannd.21@uom.lk>
+Date: Sat, 29 Aug 2026 09:03:35 +0530
+Subject: [PATCH 8/9] nr: Let NrEnergyHelper handle a gNB with more than one
+ carrier
+
+Add an InstallGnb overload that takes the bands the scenario already
+built for CcBwpCreator, figures out which bandwidth part belongs to
+which carrier, and wires an aggregator in automatically when there is
+more than one. Add a bwpIndex argument to InstallUe too, so a UE
+listener does not have to sit on bandwidth part 0. Rename the examples
+to the gsoc prefix and add gsoc-nr-energy-ca-example, which sets up a
+carrier-aggregated gNB and shows the per-carrier energy coming out of
+it.
+---
+ examples/CMakeLists.txt                       |  11 +-
+ examples/gsoc-nr-energy-ca-example.cc         | 314 ++++++++++++++++++
+ ...y-example.cc => gsoc-nr-energy-example.cc} | 112 ++++++-
+ helper/nr-energy-helper.cc                    | 225 ++++++++++++-
+ helper/nr-energy-helper.h                     | 185 ++++++++++-
+ test/nr-test-energy-integration.cc            | 304 +++++++++++++++++
+ 6 files changed, 1108 insertions(+), 43 deletions(-)
+ create mode 100644 examples/gsoc-nr-energy-ca-example.cc
+ rename examples/{cttc-nr-energy-example.cc => gsoc-nr-energy-example.cc} (67%)
+
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 6f7ede1a..7c6a8964 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -40,8 +40,15 @@ endforeach()
+ # Energy framework example: also needs the ns-3 energy module for the
+ # BasicEnergySource the scenario feeds into NrEnergyHelper.
+ build_lib_example(
+-  NAME cttc-nr-energy-example
+-  SOURCE_FILES cttc-nr-energy-example.cc
++  NAME gsoc-nr-energy-example
++  SOURCE_FILES gsoc-nr-energy-example.cc
++  LIBRARIES_TO_LINK ${libnr}
++                    ${libenergy}
++)
++
++build_lib_example(
++  NAME gsoc-nr-energy-ca-example
++  SOURCE_FILES gsoc-nr-energy-ca-example.cc
+   LIBRARIES_TO_LINK ${libnr}
+                     ${libenergy}
+ )
+diff --git a/examples/gsoc-nr-energy-ca-example.cc b/examples/gsoc-nr-energy-ca-example.cc
+new file mode 100644
+index 00000000..73802c5d
+--- /dev/null
++++ b/examples/gsoc-nr-energy-ca-example.cc
+@@ -0,0 +1,314 @@
++// Copyright (c) 2026 University of Moratuwa
++// Copyright (c) 2026 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
++//
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Authors: Nipuna Dulara (nipuna.21@cse.mrt.ac.lk)
++//
++// 3GPP References:
++//   TR 38.864 V18.1.0 (2023-03): Section 5.1 - multi-carrier BS power consumption
++
++/**
++ * @file gsoc-nr-energy-ca-example.cc
++ * @ingroup examples
++ *
++ * @brief NR energy framework on a carrier-aggregated gNB (TR 38.864 Section 5.1).
++ *
++ * The companion gsoc-nr-energy-example runs one carrier with one bandwidth part.
++ * This one builds several component carriers, each split into several bandwidth
++ * parts, because the two are charged very differently and the difference is the
++ * whole point of the multi-carrier support:
++ *
++ *   - bandwidth parts of ONE carrier -> their occupancy is aggregated and the
++ *     TR 38.864 formula is evaluated once. P_DL carries the static baseline P3
++ *     and the load-independent share A, so evaluating per bandwidth part and
++ *     then combining would count both once per part.
++ *
++ *   - carriers -> their POWERS are summed, each keeping its own full P3, with
++ *     each additional intra-band contiguous carrier scaled by 0.7:
++ *     *"For multi-carrier, the total power consumption of BS is calculated as is
++ *     the sum of the power consumption of each CC; for intra-band multi-carrier
++ *     with contiguous CCs, the power consumption of each additional CC is scaled
++ *     by 0.7."*
++ *
++ * All of that is handled by passing the operation bands to InstallGnb(). The
++ * helper groups bandwidth parts into carriers, gives each carrier's model to an
++ * NrGnbEnergyAggregator together with its band and frequency edges, and the
++ * aggregator derives the weights itself. Nothing in this file decides what is
++ * contiguous.
++ *
++ * Traffic is split across two carriers by mapping two QoS flow types to
++ * bandwidth parts in different carriers, so the reported per-carrier energies
++ * differ and the aggregation is actually exercised.
++ *
++ * Usage:
++ *   ./ns3 run "gsoc-nr-energy-ca-example"
++ *   ./ns3 run "gsoc-nr-energy-ca-example --numCc=3 --numBwpPerCc=1"
++ *   ./ns3 run "gsoc-nr-energy-ca-example --numCc=1 --numBwpPerCc=2"
++ */
++
++#include "ns3/antenna-module.h"
++#include "ns3/applications-module.h"
++#include "ns3/basic-energy-source-helper.h"
++#include "ns3/core-module.h"
++#include "ns3/energy-source-container.h"
++#include "ns3/internet-module.h"
++#include "ns3/nr-energy-helper.h"
++#include "ns3/nr-module.h"
++#include "ns3/point-to-point-module.h"
++
++#include <iomanip>
++#include <iostream>
++
++using namespace ns3;
++
++NS_LOG_COMPONENT_DEFINE("GsocNrEnergyCaExample");
++
++int
++main(int argc, char* argv[])
++{
++    uint16_t ueNumPergNb = 4;
++    Time simTime = MilliSeconds(400);
++    Time udpAppStartTime = MilliSeconds(100);
++    uint16_t numerology = 1;         // 30 kHz SCS (TR 38.864 Set 1)
++    double centralFrequency = 3.5e9; // FR1
++    double bandwidth = 200e6;        // split across the carriers below
++    double totalTxPower = 43;        // dBm, per bandwidth part
++    uint32_t udpPacketSize = 1252;
++    uint32_t lambda = 5000;  // packets/s per UE
++    uint8_t numCc = 2;       // component carriers in the band
++    uint8_t numBwpPerCc = 2; // bandwidth parts inside each carrier
++    bool enableDrx = false;
++
++    CommandLine cmd(__FILE__);
++    cmd.AddValue("ueNumPergNb", "Number of UEs", ueNumPergNb);
++    cmd.AddValue("simTime", "Simulation time", simTime);
++    cmd.AddValue("numerology", "BWP numerology", numerology);
++    cmd.AddValue("lambda", "UDP packets per second per UE", lambda);
++    cmd.AddValue("numCc", "Component carriers in the operation band", numCc);
++    cmd.AddValue("numBwpPerCc", "Bandwidth parts per component carrier", numBwpPerCc);
++    cmd.AddValue("enableDrx", "Install a C-DRX model on each UE", enableDrx);
++    cmd.Parse(argc, argv);
++
++    NS_ABORT_MSG_IF(numCc < 1 || numBwpPerCc < 1, "numCc and numBwpPerCc must be at least 1");
++
++    Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(999999999));
++
++    // ---------------------------------------------------------------------
++    // 1. Scenario. Nothing energy-specific.
++    // ---------------------------------------------------------------------
++    int64_t randomStream = 1;
++    GridScenarioHelper gridScenario;
++    gridScenario.SetRows(1);
++    gridScenario.SetColumns(1);
++    gridScenario.SetHorizontalBsDistance(10.0);
++    gridScenario.SetBsHeight(10.0);
++    gridScenario.SetUtHeight(1.5);
++    gridScenario.SetSectorization(GridScenarioHelper::SINGLE);
++    gridScenario.SetBsNumber(1);
++    gridScenario.SetUtNumber(ueNumPergNb);
++    gridScenario.SetScenarioHeight(3);
++    gridScenario.SetScenarioLength(3);
++    randomStream += gridScenario.AssignStreams(randomStream);
++    gridScenario.CreateScenario();
++
++    NodeContainer ueContainer = gridScenario.GetUserTerminals();
++    NodeContainer gnbContainer = gridScenario.GetBaseStations();
++
++    Ptr<NrPointToPointEpcHelper> nrEpcHelper = CreateObject<NrPointToPointEpcHelper>();
++    Ptr<IdealBeamformingHelper> idealBeamformingHelper = CreateObject<IdealBeamformingHelper>();
++    Ptr<NrHelper> nrHelper = CreateObject<NrHelper>();
++    nrHelper->SetBeamformingHelper(idealBeamformingHelper);
++    nrHelper->SetEpcHelper(nrEpcHelper);
++
++    // ONE operation band holding numCc contiguous carriers, each split into
++    // numBwpPerCc bandwidth parts. Contiguous is what earns the 0.7 on every
++    // carrier after the first; a non-contiguous band would not.
++    CcBwpCreator ccBwpCreator;
++    CcBwpCreator::SimpleOperationBandConf bandConf(centralFrequency, bandwidth, numCc);
++    bandConf.m_numBwp = numBwpPerCc;
++    OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
++
++    Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
++    channelHelper->ConfigureFactories("UMi", "Default", "ThreeGpp");
++    channelHelper->SetChannelConditionModelAttribute("UpdatePeriod", TimeValue(MilliSeconds(0)));
++    channelHelper->SetPathlossAttribute("ShadowingEnabled", BooleanValue(false));
++    channelHelper->AssignChannelsToBands({band});
++
++    // This flattening - band, then carriers, then bandwidth parts - is what
++    // fixes the bandwidth part indices on the device. The energy helper replays
++    // it to recover which bandwidth part belongs to which carrier, so the SAME
++    // band object must be handed to both calls.
++    BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({band});
++    const uint32_t totalBwps = allBwps.size();
++
++    idealBeamformingHelper->SetAttribute("BeamformingMethod",
++                                         TypeIdValue(DirectPathBeamforming::GetTypeId()));
++    nrEpcHelper->SetAttribute("S1uLinkDelay", TimeValue(MilliSeconds(0)));
++
++    nrHelper->SetUeAntennaAttribute("NumRows", UintegerValue(2));
++    nrHelper->SetUeAntennaAttribute("NumColumns", UintegerValue(4));
++    nrHelper->SetUeAntennaAttribute("AntennaElement",
++                                    PointerValue(CreateObject<IsotropicAntennaModel>()));
++    nrHelper->SetGnbAntennaAttribute("NumRows", UintegerValue(4));
++    nrHelper->SetGnbAntennaAttribute("NumColumns", UintegerValue(8));
++    nrHelper->SetGnbAntennaAttribute("AntennaElement",
++                                     PointerValue(CreateObject<IsotropicAntennaModel>()));
++
++    // Put the two traffic types on bandwidth parts belonging to DIFFERENT
++    // carriers where possible, so the per-carrier energies below actually
++    // differ. With one carrier both land on it and the totals simply add.
++    const uint32_t bwpForEmbb = 0;
++    const uint32_t bwpForVoice = (numCc > 1) ? numBwpPerCc : (totalBwps - 1);
++
++    nrHelper->SetGnbBwpManagerAlgorithmAttribute("NGBR_LOW_LAT_EMBB", UintegerValue(bwpForEmbb));
++    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_LOW_LAT_EMBB", UintegerValue(bwpForEmbb));
++    nrHelper->SetGnbBwpManagerAlgorithmAttribute("GBR_CONV_VOICE", UintegerValue(bwpForVoice));
++    nrHelper->SetUeBwpManagerAlgorithmAttribute("GBR_CONV_VOICE", UintegerValue(bwpForVoice));
++
++    NetDeviceContainer gnbNetDev = nrHelper->InstallGnbDevice(gnbContainer, allBwps);
++    NetDeviceContainer ueNetDev = nrHelper->InstallUeDevice(ueContainer, allBwps);
++    randomStream += nrHelper->AssignStreams(gnbNetDev, randomStream);
++    randomStream += nrHelper->AssignStreams(ueNetDev, randomStream);
++
++    // Every bandwidth part needs its numerology and power: the energy listeners
++    // read the symbol period off each PHY as they attach.
++    for (uint32_t bwp = 0; bwp < totalBwps; ++bwp)
++    {
++        NrHelper::GetGnbPhy(gnbNetDev.Get(0), bwp)
++            ->SetAttribute("Numerology", UintegerValue(numerology));
++        NrHelper::GetGnbPhy(gnbNetDev.Get(0), bwp)
++            ->SetAttribute("TxPower", DoubleValue(totalTxPower));
++    }
++
++    auto [remoteHost, remoteHostIpv4Address] =
++        nrEpcHelper->SetupRemoteHost("100Gb/s", 2500, Seconds(0.0));
++    InternetStackHelper internet;
++    internet.Install(ueContainer);
++    Ipv4InterfaceContainer ueIpIface =
++        nrEpcHelper->AssignUeIpv4Address(NetDeviceContainer(ueNetDev));
++    nrHelper->AttachToClosestGnb(ueNetDev, gnbNetDev);
++
++    // ---- downlink traffic: alternate UEs between the two flow types ----
++    uint16_t dlPortEmbb = 1234;
++    uint16_t dlPortVoice = 1235;
++    ApplicationContainer serverApps;
++    ApplicationContainer clientApps;
++    serverApps.Add(UdpServerHelper(dlPortEmbb).Install(ueContainer));
++    serverApps.Add(UdpServerHelper(dlPortVoice).Install(ueContainer));
++
++    NrQosFlow embbFlow(NrQosFlow::NGBR_LOW_LAT_EMBB);
++    NrQosFlow voiceFlow(NrQosFlow::GBR_CONV_VOICE);
++
++    for (uint32_t i = 0; i < ueContainer.GetN(); ++i)
++    {
++        const bool useVoice = (i % 2 == 1);
++        const uint16_t port = useVoice ? dlPortVoice : dlPortEmbb;
++
++        UdpClientHelper dlClient;
++        dlClient.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
++        dlClient.SetAttribute("PacketSize", UintegerValue(udpPacketSize));
++        dlClient.SetAttribute("Interval", TimeValue(Seconds(1.0 / lambda)));
++        dlClient.SetAttribute(
++            "Remote",
++            AddressValue(addressUtils::ConvertToSocketAddress(ueIpIface.GetAddress(i), port)));
++        clientApps.Add(dlClient.Install(remoteHost));
++
++        Ptr<NrQosRule> rule = Create<NrQosRule>();
++        NrQosRule::PacketFilter pf;
++        pf.localPortStart = port;
++        pf.localPortEnd = port;
++        rule->Add(pf);
++        nrHelper->ActivateDedicatedQosFlow(ueNetDev.Get(i), useVoice ? voiceFlow : embbFlow, rule);
++    }
++
++    Time trafficStopTime = udpAppStartTime + (simTime - udpAppStartTime) / 2;
++    serverApps.Start(udpAppStartTime);
++    clientApps.Start(udpAppStartTime);
++    serverApps.Stop(simTime);
++    clientApps.Stop(trafficStopTime);
++
++    // ---------------------------------------------------------------------
++    // 2. Energy sources, exactly as in the single-carrier example.
++    // ---------------------------------------------------------------------
++    BasicEnergySourceHelper srcHelper;
++    srcHelper.Set("BasicEnergySourceInitialEnergyJ", DoubleValue(1e9));
++    energy::EnergySourceContainer gnbSources = srcHelper.Install(gnbContainer);
++    energy::EnergySourceContainer ueSources = srcHelper.Install(ueContainer);
++
++    // ---------------------------------------------------------------------
++    // 3./4. Install. The band is the only extra argument, and it is what turns
++    //       "one model per device" into "one model per component carrier".
++    // ---------------------------------------------------------------------
++    NrEnergyHelper energyHelper;
++    energyHelper.SetGnbEnergyModelAttribute("ReferenceTxPowerDbm", DoubleValue(totalTxPower));
++    energyHelper.EnableDrx(enableDrx);
++
++    energy::DeviceEnergyModelContainer gnbModels =
++        energyHelper.InstallGnb(gnbNetDev, gnbSources, {band});
++    energy::DeviceEnergyModelContainer ueModels = energyHelper.InstallUe(ueNetDev, ueSources);
++
++    Simulator::Stop(simTime);
++    Simulator::Run();
++
++    // ---------------------------------------------------------------------
++    // 5. Results. With more than one carrier the device model IS the
++    //    aggregator, so the per-carrier breakdown is available through it.
++    // ---------------------------------------------------------------------
++    const double simSeconds = simTime.GetSeconds();
++    uint64_t rxPackets = 0;
++    for (uint32_t i = 0; i < serverApps.GetN(); ++i)
++    {
++        rxPackets += DynamicCast<UdpServer>(serverApps.Get(i))->GetReceived();
++    }
++    const double rxBits = static_cast<double>(rxPackets) * udpPacketSize * 8.0;
++
++    std::cout << std::fixed << std::setprecision(3);
++    std::cout << "\n=========== NR Energy Example - Carrier Aggregation ===========\n";
++    std::cout << "Band " << +band.m_bandId << ": " << +numCc << " CC x " << +numBwpPerCc
++              << " BWP = " << totalBwps << " bandwidth parts, " << simSeconds << " s\n";
++    std::cout << "eMBB traffic on BWP " << bwpForEmbb << ", voice on BWP " << bwpForVoice << "\n\n";
++
++    const double deviceJ = gnbModels.Get(0)->GetTotalEnergyConsumption();
++    Ptr<NrGnbEnergyAggregator> aggregator = DynamicCast<NrGnbEnergyAggregator>(gnbModels.Get(0));
++
++    if (aggregator)
++    {
++        std::cout << "Per carrier (weight from TR 38.864 Section 5.1):\n";
++        double weightedSum = 0.0;
++        for (uint32_t cc = 0; cc < aggregator->GetNCarriers(); ++cc)
++        {
++            const double w = aggregator->GetCarrierWeight(cc);
++            const double e = aggregator->GetCarrier(cc)->GetTotalEnergyJ();
++            weightedSum += w * e;
++            std::cout << "  CC" << cc << "  weight " << std::setprecision(2) << w
++                      << std::setprecision(3) << "   own energy " << e << " J"
++                      << "   contributes " << w * e << " J\n";
++        }
++        std::cout << "\n  sum of contributions : " << weightedSum << " J\n";
++        std::cout << "  device total         : " << deviceJ << " J\n";
++    }
++    else
++    {
++        std::cout << "Single carrier: the device model is the carrier model.\n";
++    }
++
++    std::cout << "\ngNB total energy : " << deviceJ << " J\n";
++    std::cout << "gNB average power: " << deviceJ / simSeconds << " W\n\n";
++
++    double ueEnergyTotal = 0.0;
++    for (uint32_t i = 0; i < ueModels.GetN(); ++i)
++    {
++        ueEnergyTotal += ueModels.Get(i)->GetTotalEnergyConsumption();
++    }
++    std::cout << "UE energy total  : " << ueEnergyTotal << " J\n";
++
++    if (deviceJ > 0.0)
++    {
++        std::cout << "Network efficiency: " << (rxBits / deviceJ) / 1e6 << " Mbit/J\n";
++    }
++    std::cout << "===============================================================\n";
++
++    Simulator::Destroy();
++    return 0;
++}
+diff --git a/examples/cttc-nr-energy-example.cc b/examples/gsoc-nr-energy-example.cc
+similarity index 67%
+rename from examples/cttc-nr-energy-example.cc
+rename to examples/gsoc-nr-energy-example.cc
+index 12879ec1..6f4afaf7 100644
+--- a/examples/cttc-nr-energy-example.cc
++++ b/examples/gsoc-nr-energy-example.cc
+@@ -10,7 +10,7 @@
+ //   TR 38.840 V16.0.0 (2019-06): Section 8 - UE energy model
+ 
+ /**
+- * @file cttc-nr-energy-example.cc
++ * @file gsoc-nr-energy-example.cc
+  * @ingroup examples
+  *
+  * @brief Minimal end-to-end example of the NR energy framework via NrEnergyHelper.
+@@ -31,9 +31,36 @@
+  *   5. (optional) connect traces / read results however the user likes;
+  *   6. Run(), then read the energy off the returned model containers.
+  *
++ * @section out What the example prints
++ *
++ * After the run it reports, from the model containers the helper returned:
++ *   - gNB total energy [J] and average power [W] over the simulated time. The
++ *     average power sits between the TR 38.864 Table 5.1-3 micro sleep value
++ *     (P3, the floor of an idle but awake carrier) and the active DL value
++ *     (P4), and moves with the offered load;
++ *   - per-UE energy [J] and average power [W], plus the UE total. With
++ *     --enableDrx=1 the UEs sleep through the idle tail, so this figure drops
++ *     against --enableDrx=0 while the gNB figure barely moves;
++ *   - network efficiency in Mbit/J: received application bits over gNB energy,
++ *     the usual "bits per Joule" energy-efficiency metric.
++ *
++ * The same numbers are available live rather than as totals: every model
++ * exposes an "InstantaneousPower" and a "TotalEnergyConsumption" trace source.
++ *
++ * @section cfg 3GPP configuration
++ *
++ * --refConfigSet selects a named TR 38.864 Table 5.1-1 reference
++ * configuration. A named set is one coherent bundle - it fixes the reference
++ * Tx power and the P1..P5 row of Table 5.1-3, and it requires the PHY
++ * numerology to match the set's subcarrier spacing - so the example derives
++ * the numerology and the gNB Tx power from it rather than letting them drift
++ * apart. Custom applies no preset and leaves every reference parameter as
++ * configured here.
+  *
+  * Usage:
+- *   ./ns3 run "cttc-nr-energy-example --ueNumPergNb=4 --simTime=400ms --enableDrx=1"
++ *   ./ns3 run "gsoc-nr-energy-example --ueNumPergNb=4 --simTime=400ms --enableDrx=1"
++ *   ./ns3 run "gsoc-nr-energy-example --numBwp=2"
++ *   ./ns3 run "gsoc-nr-energy-example --refConfigSet=Set3"
+  */
+ 
+ #include "ns3/antenna-module.h"
+@@ -51,7 +78,7 @@
+ 
+ using namespace ns3;
+ 
+-NS_LOG_COMPONENT_DEFINE("CttcNrEnergyExample");
++NS_LOG_COMPONENT_DEFINE("GsocNrEnergyExample");
+ 
+ int
+ main(int argc, char* argv[])
+@@ -60,10 +87,10 @@ main(int argc, char* argv[])
+     uint16_t ueNumPergNb = 4;
+     Time simTime = MilliSeconds(400);
+     Time udpAppStartTime = MilliSeconds(100);
+-    uint16_t numerology = 1;         // 30 kHz SCS (TR 38.864 Set 1)
+     double centralFrequency = 3.5e9; // FR1
+     double bandwidth = 100e6;        // 100 MHz (TR 38.864 Set 1)
+-    double totalTxPower = 43;        // dBm
++    uint8_t numBwp = 1;              // bandwidth parts in the single carrier
++    std::string refConfigSet = "Set1";
+     uint32_t udpPacketSize = 1252;
+     uint32_t lambda = 10000; // packets/s per UE
+     bool enableDrx = true;
+@@ -71,11 +98,40 @@ main(int argc, char* argv[])
+     CommandLine cmd(__FILE__);
+     cmd.AddValue("ueNumPergNb", "Number of UEs per gNB", ueNumPergNb);
+     cmd.AddValue("simTime", "Simulation time", simTime);
+-    cmd.AddValue("numerology", "BWP numerology", numerology);
++    cmd.AddValue("numBwp", "Bandwidth parts in the component carrier", numBwp);
++    cmd.AddValue("refConfigSet",
++                 "TR 38.864 Table 5.1-1 reference configuration: Set1, Set2, Set3 or Custom",
++                 refConfigSet);
+     cmd.AddValue("lambda", "UDP packets per second per UE", lambda);
+     cmd.AddValue("enableDrx", "Install a C-DRX model on each UE", enableDrx);
+     cmd.Parse(argc, argv);
+ 
++    NS_ABORT_MSG_IF(numBwp < 1, "numBwp must be at least 1");
++
++    // A named reference set is a bundle, not a single number: Table 5.1-1 fixes
++    // the frequency range, the subcarrier spacing and the reference Tx power
++    // together, and Table 5.1-3 keys P1..P5 off the same set. Deriving the
++    // numerology and the Tx power from it here is what keeps the scenario and
++    // the energy model describing the same base station.
++    uint16_t numerology = 1;    // Set1: 30 kHz SCS
++    double totalTxPower = 55;   // Set1: 55 dBm reference Tx power
++    if (refConfigSet == "Set2") //  FR1 FDD, 20 MHz, 15 kHz, 49 dBm
++    {
++        numerology = 0;
++        totalTxPower = 49;
++        bandwidth = 20e6;
++    }
++    else if (refConfigSet == "Set3") // FR2 TDD, 100 MHz, 120 kHz, 33 dBm
++    {
++        numerology = 3;
++        totalTxPower = 33;
++        centralFrequency = 28e9;
++    }
++    else if (refConfigSet == "Custom") // no preset; the values below stand alone
++    {
++        totalTxPower = 43;
++    }
++
+     Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(999999999));
+ 
+     // ---------------------------------------------------------------------
+@@ -105,11 +161,16 @@ main(int argc, char* argv[])
+     nrHelper->SetBeamformingHelper(idealBeamformingHelper);
+     nrHelper->SetEpcHelper(nrEpcHelper);
+ 
+-    // Single operational band, single CC, single BWP.
++    // One operation band, one component carrier, numBwp bandwidth parts inside
++    // it. All of them report into the SAME energy model: bandwidth parts of one
++    // carrier have their occupancy aggregated and the TR 38.864 formula applied
++    // once, so the static baseline P3 is counted once and not once per part.
++    // For several CARRIERS see gsoc-nr-energy-ca-example.
+     BandwidthPartInfoPtrVector allBwps;
+     CcBwpCreator ccBwpCreator;
+     const uint8_t numCcPerBand = 1;
+     CcBwpCreator::SimpleOperationBandConf bandConf(centralFrequency, bandwidth, numCcPerBand);
++    bandConf.m_numBwp = numBwp;
+     OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
+ 
+     Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
+@@ -139,8 +200,16 @@ main(int argc, char* argv[])
+     randomStream += nrHelper->AssignStreams(gnbNetDev, randomStream);
+     randomStream += nrHelper->AssignStreams(ueNetDev, randomStream);
+ 
+-    NrHelper::GetGnbPhy(gnbNetDev.Get(0), 0)->SetAttribute("Numerology", UintegerValue(numerology));
+-    NrHelper::GetGnbPhy(gnbNetDev.Get(0), 0)->SetAttribute("TxPower", DoubleValue(totalTxPower));
++    // Every bandwidth part needs its numerology and power: each has its own PHY
++    // and its own listener, and the listener reads the symbol period off the PHY
++    // as it attaches.
++    for (uint32_t bwp = 0; bwp < allBwps.size(); ++bwp)
++    {
++        NrHelper::GetGnbPhy(gnbNetDev.Get(0), bwp)
++            ->SetAttribute("Numerology", UintegerValue(numerology));
++        NrHelper::GetGnbPhy(gnbNetDev.Get(0), bwp)
++            ->SetAttribute("TxPower", DoubleValue(totalTxPower));
++    }
+ 
+     // Internet / IP / attach.
+     auto [remoteHost, remoteHostIpv4Address] =
+@@ -203,7 +272,26 @@ main(int argc, char* argv[])
+     //    other knob keeps its TR 38.864 / TR 38.840 default.
+     // ---------------------------------------------------------------------
+     NrEnergyHelper energyHelper;
+-    energyHelper.SetGnbEnergyModelAttribute("ReferenceTxPowerDbm", DoubleValue(totalTxPower));
++
++    // A 3GPP-compliant gNB configuration is these four together. BsCategory
++    // picks the hardware class (Cat 1 macro or Cat 2 small cell) and
++    // RefConfigSet the Table 5.1-1 bundle; between them they select the
++    // Table 5.1-3 row that gives P1..P5. AntennaRatio_A is the share of the
++    // dynamic power that belongs to the antenna (Section 5.1 baseline 0.4;
++    // 0.1 and 0.7 are the values the spec offers as alternatives), and EtaMode
++    // chooses between a constant PA efficiency and the two-valued one that
++    // drops to 0.76 below sf*sp = 0.5.
++    energyHelper.SetGnbEnergyModelAttribute("BsCategory", StringValue("BsCat1"));
++    energyHelper.SetGnbEnergyModelAttribute("RefConfigSet", StringValue(refConfigSet));
++    energyHelper.SetGnbEnergyModelAttribute("AntennaRatio_A", DoubleValue(0.4));
++    energyHelper.SetGnbEnergyModelAttribute("EtaMode", StringValue("Dual"));
++
++    // Only meaningful with RefConfigSet=Custom: a named set fixes the reference
++    // Tx power itself, and overriding it would break the bundle.
++    if (refConfigSet == "Custom")
++    {
++        energyHelper.SetGnbEnergyModelAttribute("ReferenceTxPowerDbm", DoubleValue(totalTxPower));
++    }
+     energyHelper.EnableDrx(enableDrx);
+ 
+     // ---------------------------------------------------------------------
+@@ -231,7 +319,9 @@ main(int argc, char* argv[])
+     std::cout << std::fixed << std::setprecision(3);
+     std::cout << "\n================ NR Energy Example Results ================\n";
+     std::cout << "Sim time: " << simSeconds << " s, UEs: " << ueContainer.GetN()
+-              << ", DRX: " << (enableDrx ? "on" : "off") << "\n\n";
++              << ", DRX: " << (enableDrx ? "on" : "off") << "\n";
++    std::cout << "TR 38.864 " << refConfigSet << " (BsCat1), " << +numBwp
++              << " BWP in 1 CC, numerology " << numerology << ", Tx " << totalTxPower << " dBm\n\n";
+ 
+     double gnbEnergy = gnbModels.Get(0)->GetTotalEnergyConsumption();
+     std::cout << "gNB:\n";
+diff --git a/helper/nr-energy-helper.cc b/helper/nr-energy-helper.cc
+index 6d986beb..2c5a4c4c 100644
+--- a/helper/nr-energy-helper.cc
++++ b/helper/nr-energy-helper.cc
+@@ -17,15 +17,21 @@
+ #include "ns3/log.h"
+ #include "ns3/net-device.h"
+ #include "ns3/node.h"
++#include "ns3/nr-gnb-energy-aggregator.h"
+ #include "ns3/nr-gnb-energy-model.h"
++#include "ns3/nr-gnb-net-device.h"
+ #include "ns3/nr-gnb-phy-energy-listener.h"
+ #include "ns3/nr-gnb-phy.h"
+ #include "ns3/nr-ue-drx-model.h"
+ #include "ns3/nr-ue-energy-model.h"
++#include "ns3/nr-ue-net-device.h"
+ #include "ns3/nr-ue-phy-energy-listener.h"
+ #include "ns3/nr-ue-phy.h"
+ #include "ns3/simulator.h"
+ 
++#include <algorithm>
++#include <map>
++
+ namespace ns3
+ {
+ 
+@@ -33,8 +39,9 @@ NS_LOG_COMPONENT_DEFINE("NrEnergyHelper");
+ 
+ namespace
+ {
+-// The energy listeners drive the first BWP of each device, matching the
+-// GetGnbPhy/GetUePhy(dev, 0) convention used throughout the NR examples.
++// The UE listener drives the first BWP, matching the GetUePhy(dev, 0)
++// convention used throughout the NR examples. The gNB side no longer has a
++// single index: it wires every bandwidth part of the device.
+ constexpr uint32_t ENERGY_BWP_INDEX = 0;
+ } // namespace
+ 
+@@ -59,6 +66,37 @@ NrEnergyHelper::SetGnbEnergyModelAttribute(std::string n, const AttributeValue&
+     m_gnbModelFactory.Set(n, v);
+ }
+ 
++void
++NrEnergyHelper::SetGnbEnergyModelAttributeForCc(uint32_t ccIndex,
++                                                std::string n,
++                                                const AttributeValue& v)
++{
++    NS_LOG_FUNCTION(this << ccIndex << n);
++    // Copy the value: the caller's temporary is gone by the time the carrier is
++    // built, which happens inside InstallGnb().
++    m_ccAttributes[ccIndex].emplace_back(n, v.Copy());
++}
++
++Ptr<NrGnbEnergyModel>
++NrEnergyHelper::CreateCarrierModel(uint32_t ccIndex)
++{
++    NS_LOG_FUNCTION(this << ccIndex);
++    Ptr<NrGnbEnergyModel> model = m_gnbModelFactory.Create<NrGnbEnergyModel>();
++
++    // Per-carrier overrides last, so they win over the device-wide defaults.
++    // Carriers in different frequency ranges need different TR 38.864
++    // Table 5.1-1 reference sets, and so different P1..P5 rows.
++    const auto it = m_ccAttributes.find(ccIndex);
++    if (it != m_ccAttributes.end())
++    {
++        for (const auto& [name, value] : it->second)
++        {
++            model->SetAttribute(name, *value);
++        }
++    }
++    return model;
++}
++
+ void
+ NrEnergyHelper::SetUeEnergyModelAttribute(std::string n, const AttributeValue& v)
+ {
+@@ -90,6 +128,64 @@ NrEnergyHelper::AttachToSource(Ptr<energy::DeviceEnergyModel> model,
+     model->SetEnergySource(source);
+ }
+ 
++uint32_t
++NrEnergyHelper::GetGnbBwpCount(Ptr<NetDevice> dev)
++{
++    Ptr<NrGnbNetDevice> nrDev = DynamicCast<NrGnbNetDevice>(dev);
++    NS_ABORT_MSG_IF(!nrDev, "NrEnergyHelper::InstallGnb needs NrGnbNetDevice objects");
++    return std::max(1u, nrDev->GetCcMapSize());
++}
++
++void
++NrEnergyHelper::AttachGnbListener(Ptr<NetDevice> dev,
++                                  uint32_t bwpIndex,
++                                  Ptr<NrGnbEnergyModel> model)
++{
++    NS_LOG_FUNCTION(this << bwpIndex);
++    Ptr<NrGnbPhy> phy = NrHelper::GetGnbPhy(dev, bwpIndex);
++    NS_ASSERT_MSG(phy, "gNB device has no PHY for bandwidth part " << bwpIndex);
++
++    // SetEnergyModel() before SetPhy(): the listener pushes the PHY's symbol
++    // duration into the model as soon as it attaches.
++    Ptr<NrGnbPhyEnergyListener> listener = CreateObject<NrGnbPhyEnergyListener>();
++    listener->SetEnergyModel(model);
++    listener->SetPhy(phy);
++
++    // Aggregate onto the PHY rather than the node. A node holds at most one
++    // object of a given TypeId, so a second listener aggregated there aborts the
++    // simulation the moment a device has two bandwidth parts. One listener per
++    // PHY collides with nothing, and the PHY outlives this (stack-allocated)
++    // helper just as the node would.
++    phy->AggregateObject(listener);
++}
++
++std::vector<NrEnergyHelper::BwpToCarrier>
++NrEnergyHelper::MapBwpsToCarriers(
++    const std::vector<std::reference_wrapper<OperationBandInfo>>& bands)
++{
++    // Reproduce the CcBwpCreator::GetAllBwps() flattening exactly: bands in the
++    // order given, then each band's component carriers in order, then each
++    // carrier's bandwidth parts in order. The position in that walk IS the
++    // bandwidth part index the device was built with.
++    std::vector<BwpToCarrier> map;
++    uint32_t carrierKey = 0;
++
++    for (const auto& bandRef : bands)
++    {
++        const OperationBandInfo& band = bandRef.get();
++        for (const auto& cc : band.m_cc)
++        {
++            for (size_t bwp = 0; bwp < cc->m_bwp.size(); ++bwp)
++            {
++                map.push_back(
++                    {carrierKey, band.m_bandId, cc->m_lowerFrequency, cc->m_higherFrequency});
++            }
++            ++carrierKey;
++        }
++    }
++    return map;
++}
++
+ energy::DeviceEnergyModelContainer
+ NrEnergyHelper::InstallGnb(NetDeviceContainer gnbDevs, energy::EnergySourceContainer sources)
+ {
+@@ -106,28 +202,119 @@ NrEnergyHelper::InstallGnb(NetDeviceContainer gnbDevs, energy::EnergySourceConta
+                       "Energy source " << i << " is not on the same node as gNB device " << i
+                                        << "; the two containers must be index-aligned");
+ 
+-        Ptr<NrGnbEnergyModel> model = m_gnbModelFactory.Create<NrGnbEnergyModel>();
++        Ptr<NrGnbEnergyModel> model = CreateCarrierModel(0);
+         AttachToSource(model, source);
+ 
+-        // Wire the PHY listener: SetEnergyModel() before SetPhy() so the
+-        // listener can push the PHY's symbol duration into the model.
+-        Ptr<NrGnbPhyEnergyListener> listener = CreateObject<NrGnbPhyEnergyListener>();
+-        listener->SetEnergyModel(model);
+-        listener->SetPhy(NrHelper::GetGnbPhy(dev, ENERGY_BWP_INDEX));
+-
+-        // Keep the listener alive for the whole simulation: this helper is
+-        // usually stack-allocated and nothing else holds the listener.
+-        dev->GetNode()->AggregateObject(listener);
++        // Every bandwidth part of the device reports into this one model, which
++        // aggregates their occupancy and applies the formula once. Treating the
++        // device as a single carrier is what makes that correct; a device with
++        // several carriers must use the band-aware overload.
++        const uint32_t nBwps = GetGnbBwpCount(dev);
++        for (uint32_t bwp = 0; bwp < nBwps; ++bwp)
++        {
++            AttachGnbListener(dev, bwp, model);
++        }
+ 
+         models.Add(model);
+     }
+     return models;
+ }
+ 
++energy::DeviceEnergyModelContainer
++NrEnergyHelper::InstallGnb(NetDeviceContainer gnbDevs,
++                           energy::EnergySourceContainer sources,
++                           const std::vector<std::reference_wrapper<OperationBandInfo>>& bands)
++{
++    NS_LOG_FUNCTION(this << gnbDevs.GetN() << bands.size());
++    NS_ASSERT_MSG(gnbDevs.GetN() == sources.GetN(),
++                  "One energy source per gNB device is required (index-aligned)");
++
++    const std::vector<BwpToCarrier> bwpMap = MapBwpsToCarriers(bands);
++    NS_ABORT_MSG_IF(bwpMap.empty(), "The operation bands describe no bandwidth part at all");
++
++    energy::DeviceEnergyModelContainer models;
++    for (uint32_t i = 0; i < gnbDevs.GetN(); ++i)
++    {
++        Ptr<NetDevice> dev = gnbDevs.Get(i);
++        Ptr<energy::EnergySource> source = sources.Get(i);
++        NS_ASSERT_MSG(source->GetNode() == dev->GetNode(),
++                      "Energy source " << i << " is not on the same node as gNB device " << i
++                                       << "; the two containers must be index-aligned");
++
++        const uint32_t nBwps = GetGnbBwpCount(dev);
++        NS_ABORT_MSG_IF(nBwps > bwpMap.size(),
++                        "gNB device " << i << " has " << nBwps
++                                      << " bandwidth parts but the operation bands passed here "
++                                         "describe only "
++                                      << bwpMap.size()
++                                      << ". Pass the same bands that were given to "
++                                         "CcBwpCreator::GetAllBwps() when the devices were built.");
++
++        // One model per component carrier, created on first sight of a BWP that
++        // belongs to it. Insertion order follows the BWP order, so the carriers
++        // come out in frequency order for a normally built band.
++        std::map<uint32_t, Ptr<NrGnbEnergyModel>> byCarrier;
++        std::vector<uint32_t> carrierOrder;
++
++        for (uint32_t bwp = 0; bwp < nBwps; ++bwp)
++        {
++            const uint32_t key = bwpMap[bwp].carrierKey;
++            auto it = byCarrier.find(key);
++            if (it == byCarrier.end())
++            {
++                it = byCarrier.emplace(key, CreateCarrierModel(carrierOrder.size())).first;
++                carrierOrder.push_back(key);
++            }
++            AttachGnbListener(dev, bwp, it->second);
++        }
++
++        if (carrierOrder.size() == 1)
++        {
++            // Single carrier: no aggregator, so the result is bit for bit what
++            // the other overload produces.
++            Ptr<NrGnbEnergyModel> only = byCarrier.at(carrierOrder.front());
++            AttachToSource(only, source);
++            models.Add(only);
++            continue;
++        }
++
++        // Several carriers: the aggregator is the device model. It derives the
++        // TR 38.864 Section 5.1 weights from the band and the frequency edges,
++        // so nothing here decides what is contiguous.
++        Ptr<NrGnbEnergyAggregator> aggregator = CreateObject<NrGnbEnergyAggregator>();
++        for (const uint32_t key : carrierOrder)
++        {
++            const auto& info =
++                *std::find_if(bwpMap.begin(), bwpMap.end(), [key](const BwpToCarrier& b) {
++                    return b.carrierKey == key;
++                });
++            aggregator->AddCarrier(byCarrier.at(key),
++                                   info.bandId,
++                                   info.lowerFrequencyHz,
++                                   info.higherFrequencyHz);
++        }
++
++        // ONLY the aggregator is appended: an EnergySource sums DoGetCurrentA()
++        // over its models without weights, so appending the per-carrier models
++        // as well would drain the unweighted sum and lose the 0.7.
++        AttachToSource(aggregator, source);
++        models.Add(aggregator);
++    }
++    return models;
++}
++
+ energy::DeviceEnergyModelContainer
+ NrEnergyHelper::InstallUe(NetDeviceContainer ueDevs, energy::EnergySourceContainer sources)
+ {
+-    NS_LOG_FUNCTION(this << ueDevs.GetN());
++    return InstallUe(ueDevs, sources, ENERGY_BWP_INDEX);
++}
++
++energy::DeviceEnergyModelContainer
++NrEnergyHelper::InstallUe(NetDeviceContainer ueDevs,
++                          energy::EnergySourceContainer sources,
++                          uint32_t bwpIndex)
++{
++    NS_LOG_FUNCTION(this << ueDevs.GetN() << bwpIndex);
+     NS_ASSERT_MSG(ueDevs.GetN() == sources.GetN(),
+                   "One energy source per UE device is required (index-aligned)");
+ 
+@@ -140,12 +327,18 @@ NrEnergyHelper::InstallUe(NetDeviceContainer ueDevs, energy::EnergySourceContain
+                       "Energy source " << i << " is not on the same node as UE device " << i
+                                        << "; the two containers must be index-aligned");
+ 
++        Ptr<NrUeNetDevice> nrDev = DynamicCast<NrUeNetDevice>(dev);
++        NS_ABORT_MSG_IF(!nrDev, "NrEnergyHelper::InstallUe needs NrUeNetDevice objects");
++        NS_ASSERT_MSG(bwpIndex < nrDev->GetCcMapSize(),
++                      "UE device " << i << " has no bandwidth part " << bwpIndex);
++
+         Ptr<NrUeEnergyModel> model = m_ueModelFactory.Create<NrUeEnergyModel>();
+         AttachToSource(model, source);
+ 
++        Ptr<NrUePhy> uePhy = NrHelper::GetUePhy(dev, bwpIndex);
+         Ptr<NrUePhyEnergyListener> listener = CreateObject<NrUePhyEnergyListener>();
+         listener->SetEnergyModel(model);
+-        listener->SetPhy(NrHelper::GetUePhy(dev, ENERGY_BWP_INDEX));
++        listener->SetPhy(uePhy);
+ 
+         if (m_enableDrx)
+         {
+@@ -158,7 +351,9 @@ NrEnergyHelper::InstallUe(NetDeviceContainer ueDevs, energy::EnergySourceContain
+             dev->GetNode()->AggregateObject(drx);
+         }
+ 
+-        dev->GetNode()->AggregateObject(listener);
++        // On the PHY, not the node: one listener per PHY can never collide with
++        // another of the same TypeId, which a node would not allow.
++        uePhy->AggregateObject(listener);
+ 
+         models.Add(model);
+     }
+diff --git a/helper/nr-energy-helper.h b/helper/nr-energy-helper.h
+index b9e9a0f5..42b0743e 100644
+--- a/helper/nr-energy-helper.h
++++ b/helper/nr-energy-helper.h
+@@ -12,14 +12,24 @@
+ #ifndef NR_ENERGY_HELPER_H
+ #define NR_ENERGY_HELPER_H
+ 
++#include "cc-bwp-helper.h"
++
+ #include "ns3/device-energy-model-container.h"
+ #include "ns3/energy-source-container.h"
+ #include "ns3/net-device-container.h"
+ #include "ns3/object-factory.h"
+ 
++#include <functional>
++#include <map>
++#include <string>
++#include <utility>
++#include <vector>
++
+ namespace ns3
+ {
+ 
++class NrGnbEnergyModel;
++
+ /**
+  * @ingroup nr
+  * @brief One-call installer for the NR energy framework.
+@@ -41,12 +51,10 @@ namespace ns3
+  * afterwards; the listeners and DRX models are aggregated onto their node so
+  * they outlive this (typically stack-allocated) helper.
+  *
+- * @warning Read the consumed energy from the returned device models
+- * (GetTotalEnergyConsumption()), NOT from the energy sources. The gNB model
+- * accounts energy symbol-by-symbol (TR 38.864 Section 5.2) and never drives the
+- * source through the discrete ChangeState() path, so the source's own remaining
+- * energy does not reflect the gNB's real consumption. The returned models are
+- * the single source of truth.
++ * The returned models and their energy sources agree: each model refreshes its
++ * source over the same intervals it charges internally, so
++ * GetTotalEnergyConsumption() and the source's drain report the same energy.
++ * Either may be read.
+  *
+  * Typical use (see the cttc-nr-energy examples):
+  * @code
+@@ -82,6 +90,31 @@ class NrEnergyHelper
+      */
+     void SetGnbEnergyModelAttribute(std::string n, const AttributeValue& v);
+ 
++    /**
++     * @brief Set an attribute on the energy model of ONE component carrier.
++     *
++     * Carriers of a device need not share a 3GPP configuration. TR 38.864
++     * Table 5.1-1 defines separate reference sets for FR1 and FR2, so a device
++     * whose carriers span both ranges needs a different RefConfigSet, and with
++     * it a different P1..P5 row, on each. Anything set here applies to that
++     * carrier only and overrides SetGnbEnergyModelAttribute() for it.
++     *
++     * Carrier indices follow the order the carriers appear in the operation
++     * bands passed to InstallGnb(), which is also the order
++     * NrGnbEnergyAggregator::GetCarrier() reports them in.
++     *
++     * @code
++     *   // carrier 0 on FR1, carrier 1 on FR2
++     *   helper.SetGnbEnergyModelAttributeForCc(0, "RefConfigSet", EnumValue(Set1));
++     *   helper.SetGnbEnergyModelAttributeForCc(1, "RefConfigSet", EnumValue(Set3));
++     * @endcode
++     *
++     * @param ccIndex Component carrier index.
++     * @param n Attribute name on NrGnbEnergyModel.
++     * @param v Attribute value.
++     */
++    void SetGnbEnergyModelAttributeForCc(uint32_t ccIndex, std::string n, const AttributeValue& v);
++
+     /**
+      * @brief Set an attribute on every UE energy model created afterwards.
+      * @param n Attribute name on NrUeEnergyModel.
+@@ -111,21 +144,65 @@ class NrEnergyHelper
+     // ----- Installation -----
+ 
+     /**
+-     * @brief Install the gNB energy stack on a set of gNB devices.
++     * @brief Install the gNB energy stack, treating each device as ONE carrier.
++     *
++     * For each device i: creates one NrGnbEnergyModel, connects it to
++     * sources.Get(i), and attaches an NrGnbPhyEnergyListener to *every* bandwidth
++     * part of the device. All of them report into that single model, which
++     * aggregates their occupancy and evaluates the TR 38.864 formula once - the
++     * right thing for a device whose bandwidth parts belong to one component
++     * carrier, and the common case.
+      *
+-     * For each device i: creates an NrGnbEnergyModel, connects it to
+-     * sources.Get(i), and attaches an NrGnbPhyEnergyListener to the device's
+-     * first-BWP NrGnbPhy. @p gnbDevs and @p sources must be index-aligned and
+-     * of equal size (one source per node, in the same order the devices were
+-     * installed).
++     * @p gnbDevs and @p sources must be index-aligned and of equal size (one
++     * source per node, in the same order the devices were installed).
++     *
++     * @note A device carrying several component CARRIERS needs the overload
++     * below. Without the band topology this class cannot tell two bandwidth
++     * parts of one carrier from two carriers, and the two are charged
++     * differently: occupancy composes inside a carrier, power composes across
++     * carriers with 0.7 on each additional intra-band contiguous one.
+      *
+      * @param gnbDevs gNB NetDevices from NrHelper::InstallGnbDevice.
+      * @param sources One energy::EnergySource per gNB node, index-aligned.
+-     * @return Container of the created gNB device energy models.
++     * @return Container of the created gNB device energy models, one per device.
+      */
+     energy::DeviceEnergyModelContainer InstallGnb(NetDeviceContainer gnbDevs,
+                                                   energy::EnergySourceContainer sources);
+ 
++    /**
++     * @brief Install the gNB energy stack for a multi-carrier device.
++     *
++     * Pass the same operation bands that were given to CcBwpCreator::GetAllBwps()
++     * to build the devices. That flattening - bands in order, then component
++     * carriers, then bandwidth parts - is what fixes the bandwidth part indices
++     * on the device, so replaying it here recovers which BWP belongs to which
++     * carrier. The device itself cannot answer that: its "CC map" is keyed by
++     * bandwidth part, and the carrier grouping exists only in OperationBandInfo.
++     *
++     * For each device this creates one NrGnbEnergyModel **per component
++     * carrier**, attaches a listener to each bandwidth part pointing at its
++     * carrier's model, and then:
++     *   - one carrier  -> that model is attached to the energy source directly,
++     *     which is exactly what the single-carrier overload produces;
++     *   - several      -> an NrGnbEnergyAggregator is created, each carrier is
++     *     registered with its band and frequency edges so the aggregator derives
++     *     the TR 38.864 Section 5.1 weights itself, and **only the aggregator**
++     *     is appended to the source.
++     *
++     * @param gnbDevs gNB NetDevices from NrHelper::InstallGnbDevice.
++     * @param sources One energy::EnergySource per gNB node, index-aligned.
++     * @param bands   The operation bands the devices were built from, in the same
++     *                order they were passed to CcBwpCreator::GetAllBwps().
++     * @return Container of the created device-level models: the aggregator for a
++     *         multi-carrier device, the carrier's model for a single-carrier one.
++     *         Per-carrier models remain reachable through
++     *         NrGnbEnergyAggregator::GetCarrier().
++     */
++    energy::DeviceEnergyModelContainer InstallGnb(
++        NetDeviceContainer gnbDevs,
++        energy::EnergySourceContainer sources,
++        const std::vector<std::reference_wrapper<OperationBandInfo>>& bands);
++
+     /**
+      * @brief Install the UE energy stack on a set of UE devices.
+      *
+@@ -141,6 +218,25 @@ class NrEnergyHelper
+     energy::DeviceEnergyModelContainer InstallUe(NetDeviceContainer ueDevs,
+                                                  energy::EnergySourceContainer sources);
+ 
++    /**
++     * @brief Install the UE energy stack on a set of UE devices, listening on
++     *        a caller-chosen bandwidth part.
++     *
++     * For each device i: creates an NrUeEnergyModel, connects it to
++     * sources.Get(i), attaches an NrUePhyEnergyListener to the device's PHY
++     * for @p bwpIndex, and (if EnableDrx() was set) an NrUeDrxModel. @p ueDevs
++     * and @p sources must be index-aligned and of equal size. @p bwpIndex must
++     * exist on every device in @p ueDevs.
++     *
++     * @param ueDevs   UE NetDevices from NrHelper::InstallUeDevice.
++     * @param sources  One energy::EnergySource per UE node, index-aligned.
++     * @param bwpIndex Bandwidth part to attach the energy listener to.
++     * @return Container of the created UE device energy models.
++     */
++    energy::DeviceEnergyModelContainer InstallUe(NetDeviceContainer ueDevs,
++                                                 energy::EnergySourceContainer sources,
++                                                 uint32_t bwpIndex);
++
+     /**
+      * @brief Install both sides in one call.
+      *
+@@ -166,9 +262,68 @@ class NrEnergyHelper
+      */
+     void AttachToSource(Ptr<energy::DeviceEnergyModel> model, Ptr<energy::EnergySource> source);
+ 
++    /// Which component carrier a bandwidth part belongs to, and where it sits.
++    struct BwpToCarrier
++    {
++        uint32_t carrierKey;      //!< Unique per (band, CC); groups the BWPs
++        uint8_t bandId;           //!< Operation band of that carrier
++        double lowerFrequencyHz;  //!< Lower edge of the carrier
++        double higherFrequencyHz; //!< Upper edge of the carrier
++    };
++
++    /**
++     * @brief Replay the CcBwpCreator flattening to map BWP index -> carrier.
++     *
++     * CcBwpCreator::GetAllBwps() concatenates the bands in order, and
++     * OperationBandInfo::GetBwps() walks that band's carriers in order and each
++     * carrier's bandwidth parts in order. Indexing the result the same way
++     * reproduces the bandwidth part numbering the devices were built with.
++     *
++     * @param bands The operation bands, in the order given to GetAllBwps().
++     * @return One entry per bandwidth part, indexed by its device BWP index.
++     */
++    static std::vector<BwpToCarrier> MapBwpsToCarriers(
++        const std::vector<std::reference_wrapper<OperationBandInfo>>& bands);
++
++    /**
++     * @brief Attach a listener to one bandwidth part's PHY.
++     *
++     * The listener is aggregated onto the **NrGnbPhy**, not onto the node: a
++     * node accepts only one object of a given TypeId, so a second listener there
++     * aborts the simulation as soon as a device has two bandwidth parts. There
++     * is exactly one listener per PHY, and the PHY lives as long as the device.
++     *
++     * @param dev      The gNB device.
++     * @param bwpIndex Bandwidth part index on that device.
++     * @param model    The carrier energy model this bandwidth part reports into.
++     */
++    void AttachGnbListener(Ptr<NetDevice> dev, uint32_t bwpIndex, Ptr<NrGnbEnergyModel> model);
++
++    /**
++     * @brief Number of bandwidth parts on a gNB device.
++     *
++     * NrGnbNetDevice's "CC map" is keyed by bandwidth part rather than by
++     * component carrier, so its size is the bandwidth part count. Which of them
++     * share a carrier is not recorded on the device at all - only
++     * OperationBandInfo knows that.
++     *
++     * @param dev The gNB device.
++     * @return Bandwidth part count, at least 1.
++     */
++    static uint32_t GetGnbBwpCount(Ptr<NetDevice> dev);
++
++    /**
++     * @brief Build the model for one carrier, applying any per-carrier overrides.
++     * @param ccIndex Component carrier index.
++     * @return A configured NrGnbEnergyModel.
++     */
++    Ptr<NrGnbEnergyModel> CreateCarrierModel(uint32_t ccIndex);
++
+     ObjectFactory m_gnbModelFactory; //!< Builds NrGnbEnergyModel instances
+-    ObjectFactory m_ueModelFactory;  //!< Builds NrUeEnergyModel instances
+-    ObjectFactory m_drxFactory;      //!< Builds NrUeDrxModel instances
++    /// Per-carrier attribute overrides, applied on top of m_gnbModelFactory.
++    std::map<uint32_t, std::vector<std::pair<std::string, Ptr<AttributeValue>>>> m_ccAttributes;
++    ObjectFactory m_ueModelFactory; //!< Builds NrUeEnergyModel instances
++    ObjectFactory m_drxFactory;     //!< Builds NrUeDrxModel instances
+ 
+     bool m_enableDrx; //!< Install a DRX model on each UE (default false)
+ };
+diff --git a/test/nr-test-energy-integration.cc b/test/nr-test-energy-integration.cc
+index f300e8e3..a2990e6c 100644
+--- a/test/nr-test-energy-integration.cc
++++ b/test/nr-test-energy-integration.cc
+@@ -726,6 +726,305 @@ NrGnbEnergyAggregatorIntegrationTestCase::DoRun()
+     Simulator::Destroy();
+ }
+ 
++/**
++ * @brief NrEnergyHelper wires the whole stack, for one carrier and for several.
++ *
++ * The helper is the only place that sees the band topology, so it is the only
++ * place that can decide how many energy models a device needs. This runs the
++ * same scenario at one and at two component carriers and checks that the shape
++ * of what comes back changes accordingly, that a multi-carrier device gets its
++ * TR 38.864 weights, and that the source still agrees in both cases.
++ */
++class NrEnergyHelperInstallTestCase : public TestCase
++{
++  public:
++    /**
++     * @brief Constructor.
++     * @param numCc Component carriers to build the band with.
++     * @param name  Test case name.
++     */
++    NrEnergyHelperInstallTestCase(uint8_t numCc, std::string name)
++        : TestCase(name),
++          m_numCc(numCc)
++    {
++    }
++
++  private:
++    void DoRun() override;
++    uint8_t m_numCc; //!< Component carriers under test
++};
++
++void
++NrEnergyHelperInstallTestCase::DoRun()
++{
++    constexpr double INITIAL_J = 1.0e6;
++    const Time SIM_TIME = MilliSeconds(150);
++
++    NodeContainer gnbNodes;
++    NodeContainer ueNodes;
++    gnbNodes.Create(1);
++    ueNodes.Create(1);
++
++    MobilityHelper mobility;
++    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
++    Ptr<ListPositionAllocator> pos = CreateObject<ListPositionAllocator>();
++    pos->Add(Vector(0.0, 0.0, 10.0));
++    pos->Add(Vector(20.0, 0.0, 1.5));
++    mobility.SetPositionAllocator(pos);
++    mobility.Install(gnbNodes);
++    mobility.Install(ueNodes);
++
++    Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
++    Ptr<IdealBeamformingHelper> bfHelper = CreateObject<IdealBeamformingHelper>();
++    Ptr<NrHelper> nrHelper = CreateObject<NrHelper>();
++    Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
++    channelHelper->ConfigureFactories("UMi", "LOS");
++    channelHelper->SetPathlossAttribute("ShadowingEnabled", BooleanValue(false));
++    nrHelper->SetBeamformingHelper(bfHelper);
++    nrHelper->SetEpcHelper(epcHelper);
++
++    CcBwpCreator ccBwpCreator;
++    CcBwpCreator::SimpleOperationBandConf bandConf(3.5e9, 40e6, m_numCc);
++    OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
++    channelHelper->AssignChannelsToBands({band});
++    BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({band});
++
++    nrHelper->SetGnbAntennaAttribute("AntennaElement",
++                                     PointerValue(CreateObject<IsotropicAntennaModel>()));
++    nrHelper->SetUeAntennaAttribute("AntennaElement",
++                                    PointerValue(CreateObject<IsotropicAntennaModel>()));
++    nrHelper->SetGnbPhyAttribute("Numerology", UintegerValue(1));
++    nrHelper->SetGnbPhyAttribute("TxPower", DoubleValue(30.0));
++
++    NetDeviceContainer gnbDev = nrHelper->InstallGnbDevice(gnbNodes, allBwps);
++    NetDeviceContainer ueDev = nrHelper->InstallUeDevice(ueNodes, allBwps);
++
++    Ptr<Node> pgw = epcHelper->GetPgwNode();
++    NodeContainer remoteHostContainer;
++    remoteHostContainer.Create(1);
++    Ptr<Node> remoteHost = remoteHostContainer.Get(0);
++    InternetStackHelper internet;
++    internet.Install(remoteHostContainer);
++
++    PointToPointHelper p2ph;
++    p2ph.SetDeviceAttribute("DataRate", DataRateValue(DataRate("100Gb/s")));
++    p2ph.SetDeviceAttribute("Mtu", UintegerValue(2500));
++    p2ph.SetChannelAttribute("Delay", TimeValue(Seconds(0)));
++    NetDeviceContainer internetDevices = p2ph.Install(pgw, remoteHost);
++    Ipv4AddressHelper ipv4h;
++    ipv4h.SetBase("1.0.0.0", "255.0.0.0");
++    Ipv4InterfaceContainer internetIpIfaces = ipv4h.Assign(internetDevices);
++    Ipv4StaticRoutingHelper ipv4RoutingHelper;
++    ipv4RoutingHelper.GetStaticRouting(remoteHost->GetObject<Ipv4>())
++        ->AddNetworkRouteTo(Ipv4Address("7.0.0.0"), Ipv4Mask("255.0.0.0"), 1);
++    internet.Install(ueNodes);
++    Ipv4InterfaceContainer ueIpIface = epcHelper->AssignUeIpv4Address(NetDeviceContainer(ueDev));
++    ipv4RoutingHelper.GetStaticRouting(ueNodes.Get(0)->GetObject<Ipv4>())
++        ->SetDefaultRoute(epcHelper->GetUeDefaultGatewayAddress(), 1);
++    nrHelper->AttachToClosestGnb(ueDev, gnbDev);
++
++    UdpClientHelper client(ueIpIface.GetAddress(0), 1234);
++    client.SetAttribute("MaxPackets", UintegerValue(100000));
++    client.SetAttribute("Interval", TimeValue(MicroSeconds(200)));
++    client.SetAttribute("PacketSize", UintegerValue(1000));
++    ApplicationContainer clientApp = client.Install(remoteHost);
++    clientApp.Start(MilliSeconds(20));
++    clientApp.Stop(SIM_TIME);
++    PacketSinkHelper sink("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), 1234));
++    ApplicationContainer sinkApp = sink.Install(ueNodes.Get(0));
++    sinkApp.Start(Seconds(0));
++    sinkApp.Stop(SIM_TIME);
++
++    // ----- the helper does all the energy wiring -----
++
++    Ptr<energy::BasicEnergySource> source = CreateObject<energy::BasicEnergySource>();
++    source->SetInitialEnergy(INITIAL_J);
++    source->SetSupplyVoltage(12.0);
++    source->SetNode(gnbNodes.Get(0));
++    gnbNodes.Get(0)->AggregateObject(source);
++    energy::EnergySourceContainer sources;
++    sources.Add(source);
++
++    NrEnergyHelper energyHelper;
++    energy::DeviceEnergyModelContainer models = energyHelper.InstallGnb(gnbDev, sources, {band});
++
++    NS_TEST_ASSERT_MSG_EQ(models.GetN(), 1, "one device model per gNB device");
++    Ptr<NrGnbEnergyAggregator> agg = DynamicCast<NrGnbEnergyAggregator>(models.Get(0));
++    // PeekPointer: the test macros stream their operands, and streaming a null
++    // Ptr<> dereferences it, turning a clean failure into an abort.
++    const bool isAggregator = (PeekPointer(agg) != nullptr);
++
++    // EXPECT rather than ASSERT: a failing ASSERT returns from DoRun before
++    // Simulator::Destroy(), and the next test case then starts on a live
++    // simulator and aborts. These record the failure and let cleanup happen.
++    if (m_numCc == 1)
++    {
++        NS_TEST_EXPECT_MSG_EQ(isAggregator,
++                              false,
++                              "a single-carrier device must not get an aggregator");
++        NS_TEST_EXPECT_MSG_EQ(PeekPointer(DynamicCast<NrGnbEnergyModel>(models.Get(0))) != nullptr,
++                              true,
++                              "it gets the carrier model directly");
++    }
++    else
++    {
++        NS_TEST_EXPECT_MSG_EQ(isAggregator,
++                              true,
++                              "a multi-carrier device gets an aggregator: a helper that wired "
++                              "only one bandwidth part would fall back to a single model");
++        if (isAggregator)
++        {
++            NS_TEST_EXPECT_MSG_EQ(agg->GetNCarriers(), m_numCc, "one model per component carrier");
++            NS_TEST_EXPECT_MSG_EQ_TOL(agg->GetCarrierWeight(0), 1.0, 1e-12, "anchor carrier");
++            NS_TEST_EXPECT_MSG_EQ_TOL(agg->GetCarrierWeight(1),
++                                      NrGnbEnergyAggregator::CONTIGUOUS_CC_SCALING,
++                                      1e-12,
++                                      "the helper's band data must yield the 0.7 for the "
++                                      "second CC of a contiguous pair");
++        }
++    }
++
++    Simulator::Stop(SIM_TIME);
++    Simulator::Run();
++
++    const double modelJ = models.Get(0)->GetTotalEnergyConsumption();
++    const double drainedJ = INITIAL_J - source->GetRemainingEnergy();
++
++    NS_TEST_ASSERT_MSG_GT(modelJ, 1.0, "the gNB should have drawn real energy");
++    NS_TEST_ASSERT_MSG_EQ_TOL(drainedJ,
++                              modelJ,
++                              1e-6,
++                              "whatever the helper built, the source and the device model "
++                              "must still account the same energy");
++
++    if (isAggregator)
++    {
++        // Every bandwidth part must actually be feeding its carrier: a helper
++        // that wired only BWP 0 would leave the second carrier at its idle
++        // baseline and still pass every assertion above.
++        for (uint32_t cc = 0; cc < agg->GetNCarriers(); ++cc)
++        {
++            // A carrier with no listener is not zero-energy: it sits at the P3
++            // baseline for the whole run. Compare against exactly that, which is
++            // what a helper wiring only BWP 0 would leave behind.
++            const double idleJ =
++                agg->GetCarrier(cc)->CalcDlPowerW(0.0, 0.0, 0.0) * SIM_TIME.GetSeconds();
++            NS_TEST_ASSERT_MSG_GT(agg->GetCarrier(cc)->GetTotalEnergyJ(),
++                                  idleJ * 1.0001,
++                                  "carrier " << cc
++                                             << " never rose above its idle baseline, so no "
++                                                "listener was wired to its bandwidth part");
++        }
++    }
++
++    Simulator::Destroy();
++}
++
++/**
++ * @brief Carriers in different frequency ranges take different 3GPP configs.
++ *
++ * TR 38.864 Table 5.1-1 defines separate reference configurations per frequency
++ * range, and Table 5.1-3 keys P1..P5 off them, so a device whose carriers span
++ * FR1 and FR2 cannot use one power table for both. This builds exactly that -
++ * an FR1 band and an FR2 band on one gNB - gives each carrier its own
++ * RefConfigSet through the helper, and checks the carriers really do sit at
++ * different idle powers.
++ */
++class NrEnergyHelperMixedFrTestCase : public TestCase
++{
++  public:
++    NrEnergyHelperMixedFrTestCase()
++        : TestCase("NrEnergyHelper gives each carrier its own 3GPP configuration")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrEnergyHelperMixedFrTestCase::DoRun()
++{
++    NodeContainer gnbNodes;
++    NodeContainer ueNodes;
++    gnbNodes.Create(1);
++    ueNodes.Create(1);
++
++    MobilityHelper mobility;
++    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
++    Ptr<ListPositionAllocator> pos = CreateObject<ListPositionAllocator>();
++    pos->Add(Vector(0.0, 0.0, 10.0));
++    pos->Add(Vector(15.0, 0.0, 1.5));
++    mobility.SetPositionAllocator(pos);
++    mobility.Install(gnbNodes);
++    mobility.Install(ueNodes);
++
++    Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
++    Ptr<IdealBeamformingHelper> bfHelper = CreateObject<IdealBeamformingHelper>();
++    Ptr<NrHelper> nrHelper = CreateObject<NrHelper>();
++    Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
++    channelHelper->ConfigureFactories("UMi", "LOS");
++    channelHelper->SetPathlossAttribute("ShadowingEnabled", BooleanValue(false));
++    nrHelper->SetBeamformingHelper(bfHelper);
++    nrHelper->SetEpcHelper(epcHelper);
++
++    // Two bands: one FR1 carrier and one FR2 carrier on the same gNB. Separate
++    // bands also mean these are NOT intra-band contiguous, so neither earns the
++    // 0.7 - which the weights below confirm.
++    CcBwpCreator ccBwpCreator;
++    CcBwpCreator::SimpleOperationBandConf fr1Conf(3.5e9, 40e6, 1);
++    CcBwpCreator::SimpleOperationBandConf fr2Conf(28.0e9, 100e6, 1);
++    OperationBandInfo fr1 = ccBwpCreator.CreateOperationBandContiguousCc(fr1Conf);
++    OperationBandInfo fr2 = ccBwpCreator.CreateOperationBandContiguousCc(fr2Conf);
++    channelHelper->AssignChannelsToBands({fr1, fr2});
++    BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({fr1, fr2});
++
++    nrHelper->SetGnbAntennaAttribute("AntennaElement",
++                                     PointerValue(CreateObject<IsotropicAntennaModel>()));
++    nrHelper->SetUeAntennaAttribute("AntennaElement",
++                                    PointerValue(CreateObject<IsotropicAntennaModel>()));
++
++    NetDeviceContainer gnbDev = nrHelper->InstallGnbDevice(gnbNodes, allBwps);
++    NetDeviceContainer ueDev = nrHelper->InstallUeDevice(ueNodes, allBwps);
++
++    // Set1 is FR1 TDD 30 kHz, Set3 is FR2 TDD 120 kHz; the PHY numerology has to
++    // match the set's subcarrier spacing or the model rejects it.
++    NrHelper::GetGnbPhy(gnbDev.Get(0), 0)->SetAttribute("Numerology", UintegerValue(1));
++    NrHelper::GetGnbPhy(gnbDev.Get(0), 1)->SetAttribute("Numerology", UintegerValue(3));
++
++    Ptr<energy::BasicEnergySource> source = CreateObject<energy::BasicEnergySource>();
++    source->SetInitialEnergy(1.0e6);
++    source->SetSupplyVoltage(12.0);
++    source->SetNode(gnbNodes.Get(0));
++    gnbNodes.Get(0)->AggregateObject(source);
++    energy::EnergySourceContainer sources;
++    sources.Add(source);
++
++    NrEnergyHelper energyHelper;
++    energyHelper.SetGnbEnergyModelAttributeForCc(0, "RefConfigSet", StringValue("Set1"));
++    energyHelper.SetGnbEnergyModelAttributeForCc(1, "RefConfigSet", StringValue("Set3"));
++    energy::DeviceEnergyModelContainer models =
++        energyHelper.InstallGnb(gnbDev, sources, {fr1, fr2});
++
++    Ptr<NrGnbEnergyAggregator> agg = DynamicCast<NrGnbEnergyAggregator>(models.Get(0));
++    const bool isAggregator = (PeekPointer(agg) != nullptr);
++    NS_TEST_ASSERT_MSG_EQ(isAggregator, true, "two carriers must produce an aggregator");
++
++    // Table 5.1-3 micro sleep: Set1 gives 55, Set3 gives 38. An idle carrier
++    // sits exactly there, so the two carriers must differ - which is only true
++    // if the per-carrier override actually reached the model.
++    const double p1 = agg->GetCarrier(0)->CalcDlPowerW(0.0, 0.0, 0.0);
++    const double p2 = agg->GetCarrier(1)->CalcDlPowerW(0.0, 0.0, 0.0);
++    NS_TEST_ASSERT_MSG_EQ_TOL(p1, 55.0, 1e-9, "carrier 0 must use the FR1 Set1 table");
++    NS_TEST_ASSERT_MSG_EQ_TOL(p2, 38.0, 1e-9, "carrier 1 must use the FR2 Set3 table");
++
++    // Different bands, so no intra-band contiguity and no 0.7 for either.
++    NS_TEST_ASSERT_MSG_EQ_TOL(agg->GetCarrierWeight(0), 1.0, 1e-12, "inter-band: no discount");
++    NS_TEST_ASSERT_MSG_EQ_TOL(agg->GetCarrierWeight(1), 1.0, 1e-12, "inter-band: no discount");
++
++    Simulator::Destroy();
++}
++
+ /**
+  * @brief Energy framework integration test suite.
+  */
+@@ -738,6 +1037,11 @@ class NrEnergyIntegrationTestSuite : public TestSuite
+         AddTestCase(new NrGnbEnergyIntegrationTestCase(), Duration::QUICK);
+         AddTestCase(new NrUeEnergyIntegrationTestCase(), Duration::QUICK);
+         AddTestCase(new NrGnbEnergyAggregatorIntegrationTestCase(), Duration::QUICK);
++        AddTestCase(new NrEnergyHelperInstallTestCase(1, "NrEnergyHelper wires a one-carrier gNB"),
++                    Duration::QUICK);
++        AddTestCase(new NrEnergyHelperInstallTestCase(2, "NrEnergyHelper wires a two-carrier gNB"),
++                    Duration::QUICK);
++        AddTestCase(new NrEnergyHelperMixedFrTestCase(), Duration::QUICK);
+     }
+ };
+ 
+-- 
+2.43.0
+
