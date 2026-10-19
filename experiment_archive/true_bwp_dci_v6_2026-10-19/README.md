@@ -1,9 +1,9 @@
 # True physical BWP v6 — fixed and scripted-switch checkpoints
 
-This directory records both the fixed-mode validation and the deterministic
-`20 -> 100 -> 20 MHz` runtime-switch validation used before connecting the
-policy/DRL controller.  Policy-driven switching is deliberately still
-disabled.
+This directory records fixed-mode, deterministic `20 -> 100 -> 20 MHz`, and
+phase-3 policy/IPC runtime-switch validation. Phase 3 connects the physical
+switch to the rule-based and Python DRL controllers and adds focused scheduler
+buffer and TB-continuity evidence.
 
 ## Provenance
 
@@ -122,10 +122,22 @@ continuous across both switches (`1374948` offered bytes, `1339392` received,
 Full build, `nr-energy-integration`, and `nr-energy-models` passed after the
 change.
 
+## Phase 3 evidence
+
+- `phase3_policy_control/` contains the offered-load sweep, final fixed/rule
+  regression, and real ns-3 IPC smoke test.
+- `phase3_dl_handover/` contains 0.25 ms scheduler-backlog samples and per-TB
+  TX/RX/HARQ events around both switch directions.
+
+The target scheduler receives a non-zero buffer report within 0.25 ms of each
+switch. Already scheduled old-BWP K-pipeline TBs drain successfully: all
+observed TBs were uncorrupted and all processed DL HARQ feedback was ACK.
+
 ## Remaining work and limitation
 
-- Deterministic runtime switching is enabled; rule-based and Python/DRL action
-  integration are not enabled yet.
+- Rule-based and Python/DRL actions now drive physical BWP switching. A
+  single-seed load sweep and IPC smoke test have passed, but long multi-seed
+  PPO training/evaluation remains future work.
 - `NrChannelHelper` creates one `SpectrumChannel` object per BWP. The nested
   spectral ranges are therefore a simulator-level BWP abstraction rather than
   two simultaneously interacting overlapping RF transmissions. Only the
@@ -133,5 +145,9 @@ change.
 - The runtime validation changes primary BWP through the existing ideal RRC
   indication and 5G-LENA `DciInfoElementTdma` BWP ID. It does not bit-encode a
   standards DCI message over a modeled control channel.
-- The next acceptance stage is to route rule-based and IPC/DRL actions through
-  the validated switch event, then run the offered-load sweep.
+- The primary-BWP switch does not stop the old UE PHY event loop. Existing
+  old-BWP K-pipeline TBs can drain after the logical switch, producing a short
+  make-before-break overlap rather than a strict instantaneous RF retune.
+- The next acceptance stage is multi-seed rule/PPO comparison after deciding
+  whether the documented pipeline-drain abstraction is sufficient or whether
+  strict single-active-DL-BWP deactivation must be modeled.

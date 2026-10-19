@@ -59,3 +59,22 @@ as one controlled operation. One official UE model observes all BWP PHYs
 without double-counting the UE. DCI interval counts, traffic continuity,
 energy timing, regression results, and the second nested 5G-LENA patch are
 recorded in the same directory. Policy/IPC integration remains the next phase.
+
+## `true-bwp-dci-v6` phase 3
+
+The rule-based controller and Python socket IPC action now drive the validated
+physical 20/100 MHz BWP switch. Backlog, CQI, and MCS observations follow the
+active BWP scheduler; Cell-DTX gating controls both scheduler instances. A
+3-UE offered-load sweep demonstrates the 20 MHz saturation point and the rule
+controller's transition toward fixed-100 behavior under load. A real-backend
+PPO/IPC smoke test completes without Mock fallback.
+
+Focused 0.25 ms scheduler and per-TB traces show that the target scheduler
+receives backlog within 0.25 ms. Old-BWP K-pipeline TBs drain successfully
+with zero observed TB corruption and no processed HARQ NACK. The current UE
+switch changes the primary BWP but does not deactivate the old PHY event loop;
+this make-before-break behavior is documented as an explicit simulator
+limitation. Evidence and reproduction commands are stored in:
+
+- `true_bwp_dci_v6_2026-10-19/phase3_policy_control/`
+- `true_bwp_dci_v6_2026-10-19/phase3_dl_handover/`

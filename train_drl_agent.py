@@ -194,6 +194,7 @@ def train_ppo_agent(
     gnb_energy_antenna_ratio=0.4,
     gnb_energy_power_unit_w=1.0,
     ue_energy_power_unit_mw=1.0,
+    enable_true_bwp=True,
     history_csv="ppo_training_history.csv",
     ns3_csv="multi_user_rl_step.csv",
     model_out="ppo_5g_joint2d_model.pt",
@@ -232,6 +233,10 @@ def train_ppo_agent(
         f"{gnb_energy_bs_category}/{gnb_energy_ref_config}/{gnb_energy_eta_mode} | "
         f"gNB unit={gnb_energy_power_unit_w:g}W | UE unit={ue_energy_power_unit_mw:g}mW"
     )
+    print(
+        "📶 Frequency control: "
+        + ("physical 20/100 MHz BWP" if enable_true_bwp else "legacy PRB profile")
+    )
     print(f"⚡ 運算硬體裝置: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
     print("=" * 110)
 
@@ -250,6 +255,7 @@ def train_ppo_agent(
         gnb_energy_antenna_ratio=gnb_energy_antenna_ratio,
         gnb_energy_power_unit_w=gnb_energy_power_unit_w,
         ue_energy_power_unit_mw=ue_energy_power_unit_mw,
+        enable_true_bwp=enable_true_bwp,
         enable_mock=False,
         sim_time=episode_sim_time,
         csv_filename=ns3_csv,
@@ -527,6 +533,12 @@ def parse_args():
     parser.add_argument("--gnb-energy-antenna-ratio", type=float, default=0.4)
     parser.add_argument("--gnb-energy-power-unit-w", type=float, default=1.0)
     parser.add_argument("--ue-energy-power-unit-mw", type=float, default=1.0)
+    parser.add_argument(
+        "--true-bwp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use physical 20/100 MHz BWPs (default); --no-true-bwp uses the legacy PRB profile",
+    )
     parser.add_argument("--history-csv", default="ppo_training_history.csv")
     parser.add_argument("--ns3-csv", default="multi_user_rl_step.csv")
     parser.add_argument("--model-out", default="ppo_5g_joint2d_model.pt")
@@ -604,6 +616,7 @@ if __name__ == "__main__":
         gnb_energy_antenna_ratio=cli_args.gnb_energy_antenna_ratio,
         gnb_energy_power_unit_w=cli_args.gnb_energy_power_unit_w,
         ue_energy_power_unit_mw=cli_args.ue_energy_power_unit_mw,
+        enable_true_bwp=cli_args.true_bwp,
         history_csv=cli_args.history_csv,
         ns3_csv=cli_args.ns3_csv,
         model_out=cli_args.model_out,

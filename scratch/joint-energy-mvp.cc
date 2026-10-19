@@ -45,6 +45,211 @@ const BwpResourceProfile g_bwpResourceProfiles[] = {
     {273, 100.0}
 };
 
+class BwpHandoverProbe
+{
+public:
+    BwpHandoverProbe(const std::vector<Ptr<NrMacSchedulerNs3>>& schedulers,
+                     const std::vector<Ptr<NrGnbPhy>>& phys,
+                     std::string csvFileName,
+                     double sampleIntervalMs)
+        : m_schedulers(schedulers),
+          m_csvFileName(std::move(csvFileName)),
+          m_sampleInterval(Seconds(sampleIntervalMs / 1000.0)),
+          m_dlScheduledUes(schedulers.size(), 0),
+          m_dlUsedSymbols(schedulers.size(), 0),
+          m_dlUsedRegs(schedulers.size(), 0)
+    {
+        NS_ABORT_MSG_IF(m_schedulers.size() != phys.size() || m_schedulers.empty(),
+                        "BWP handover probe requires matching scheduler/PHY vectors");
+        NS_ABORT_MSG_IF(sampleIntervalMs <= 0.0,
+                        "BWP handover probe sample interval must be positive");
+        for (const auto& phy : phys)
+        {
+            NS_ABORT_MSG_IF(!phy, "BWP handover probe received a null PHY");
+            phy->TraceConnectWithoutContext(
+                "SlotDataStats",
+                MakeCallback(&BwpHandoverProbe::OnSlotData, this));
+        }
+    }
+
+    void Start(uint8_t initialBwpId)
+    {
+        m_expectedActiveBwp = initialBwpId;
+        m_csv.open(m_csvFileName, std::ios::trunc);
+        NS_ABORT_MSG_IF(!m_csv.is_open(),
+                        "Unable to open BWP handover trace " << m_csvFileName);
+        m_csv << "SimTimeSec,ExpectedActiveBwp,Bwp0BacklogBytes,Bwp1BacklogBytes,"
+                 "Bwp0DlScheduledUes,Bwp1DlScheduledUes,Bwp0DlUsedSymbols,"
+                 "Bwp1DlUsedSymbols,Bwp0DlUsedRegs,Bwp1DlUsedRegs\n";
+        Simulator::ScheduleNow(&BwpHandoverProbe::Sample, this);
+    }
+
+    void SetExpectedActiveBwp(uint8_t bwpId)
+    {
+        NS_ABORT_MSG_IF(bwpId >= m_schedulers.size(),
+                        "BWP handover probe target is out of range");
+        m_expectedActiveBwp = bwpId;
+    }
+
+    void OnSlotData(const SfnSf&,
+                    uint32_t scheduledUe,
+                    uint32_t usedReg,
+                    uint32_t usedSym,
+                    uint32_t,
+                    uint32_t,
+                    uint16_t bwpId,
+                    uint16_t)
+    {
+        NS_ABORT_MSG_IF(bwpId >= m_schedulers.size(),
+                        "SlotDataStats reported an unexpected BWP ID");
+        m_dlScheduledUes[bwpId] += scheduledUe;
+        m_dlUsedSymbols[bwpId] += usedSym;
+        m_dlUsedRegs[bwpId] += usedReg;
+    }
+
+private:
+    void Sample()
+    {
+        NS_ABORT_MSG_IF(m_schedulers.size() < 2,
+                        "The handover trace currently expects BWP0 and BWP1");
+        m_csv << std::fixed << std::setprecision(9)
+              << Simulator::Now().GetSeconds() << ","
+              << +m_expectedActiveBwp << ","
+              << m_schedulers[0]->GetTotalDlBufferBytes() << ","
+              << m_schedulers[1]->GetTotalDlBufferBytes() << ","
+              << m_dlScheduledUes[0] << ","
+              << m_dlScheduledUes[1] << ","
+              << m_dlUsedSymbols[0] << ","
+              << m_dlUsedSymbols[1] << ","
+              << m_dlUsedRegs[0] << ","
+              << m_dlUsedRegs[1] << "\n";
+        std::fill(m_dlScheduledUes.begin(), m_dlScheduledUes.end(), 0);
+        std::fill(m_dlUsedSymbols.begin(), m_dlUsedSymbols.end(), 0);
+        std::fill(m_dlUsedRegs.begin(), m_dlUsedRegs.end(), 0);
+        Simulator::Schedule(m_sampleInterval, &BwpHandoverProbe::Sample, this);
+    }
+
+    std::vector<Ptr<NrMacSchedulerNs3>> m_schedulers;
+    std::string m_csvFileName;
+    Time m_sampleInterval;
+    uint8_t m_expectedActiveBwp{BWP_NARROW_20MHZ};
+    std::vector<uint64_t> m_dlScheduledUes;
+    std::vector<uint64_t> m_dlUsedSymbols;
+    std::vector<uint64_t> m_dlUsedRegs;
+    std::ofstream m_csv;
+};
+
+class TbContinuityProbe
+{
+public:
+    TbContinuityProbe(const NetDeviceContainer& gnbDevices,
+                      const NetDeviceContainer& ueDevices,
+                      uint32_t bwpCount,
+                      std::string csvFileName)
+        : m_csvFileName(std::move(csvFileName))
+    {
+        NS_ABORT_MSG_IF(gnbDevices.GetN() != 1 || bwpCount != 2,
+                        "TB continuity probe currently expects one gNB and two BWPs");
+
+        Ptr<NrGnbPhy> bwp0Phy = NrHelper::GetGnbPhy(gnbDevices.Get(0), BWP_NARROW_20MHZ);
+        Ptr<NrGnbPhy> bwp1Phy = NrHelper::GetGnbPhy(gnbDevices.Get(0), BWP_WIDE_100MHZ);
+        NS_ABORT_MSG_IF(!bwp0Phy || !bwp1Phy, "TB continuity probe could not access gNB PHYs");
+        bwp0Phy->GetSpectrumPhy()->TraceConnectWithoutContext(
+            "TxPacketTraceGnb",
+            MakeCallback(&TbContinuityProbe::OnGnbTxBwp0, this));
+        bwp1Phy->GetSpectrumPhy()->TraceConnectWithoutContext(
+            "TxPacketTraceGnb",
+            MakeCallback(&TbContinuityProbe::OnGnbTxBwp1, this));
+
+        for (uint32_t ueId = 0; ueId < ueDevices.GetN(); ++ueId)
+        {
+            for (uint32_t bwpId = 0; bwpId < bwpCount; ++bwpId)
+            {
+                Ptr<NrUePhy> uePhy = NrHelper::GetUePhy(ueDevices.Get(ueId), bwpId);
+                NS_ABORT_MSG_IF(!uePhy, "TB continuity probe could not access UE PHY");
+                uePhy->GetSpectrumPhy()->TraceConnectWithoutContext(
+                    "RxPacketTraceUe",
+                    MakeCallback(&TbContinuityProbe::OnUeRx, this));
+            }
+        }
+
+        for (uint32_t bwpId = 0; bwpId < bwpCount; ++bwpId)
+        {
+            Ptr<NrGnbMac> mac = NrHelper::GetGnbMac(gnbDevices.Get(0), bwpId);
+            NS_ABORT_MSG_IF(!mac, "TB continuity probe could not access gNB MAC");
+            mac->TraceConnectWithoutContext(
+                "DlHarqFeedback",
+                MakeCallback(&TbContinuityProbe::OnDlHarqFeedback, this));
+        }
+    }
+
+    void Start(uint8_t initialBwpId)
+    {
+        m_expectedActiveBwp = initialBwpId;
+        m_csv.open(m_csvFileName, std::ios::trunc);
+        NS_ABORT_MSG_IF(!m_csv.is_open(),
+                        "Unable to open TB continuity trace " << m_csvFileName);
+        m_csv << "SimTimeSec,Event,ExpectedActiveBwp,ObservedBwp,Rnti,HarqProcessId,"
+                 "Rv,TbSizeBytes,Corrupt,HarqStatus,NumRetx\n";
+    }
+
+    void SetExpectedActiveBwp(uint8_t bwpId)
+    {
+        NS_ABORT_MSG_IF(bwpId > BWP_WIDE_100MHZ,
+                        "TB continuity probe target is out of range");
+        m_expectedActiveBwp = bwpId;
+    }
+
+    void OnGnbTxBwp0(GnbPhyPacketCountParameter params)
+    {
+        WriteTx(BWP_NARROW_20MHZ, params);
+    }
+
+    void OnGnbTxBwp1(GnbPhyPacketCountParameter params)
+    {
+        WriteTx(BWP_WIDE_100MHZ, params);
+    }
+
+    void OnUeRx(RxPacketTraceParams params)
+    {
+        m_csv << std::fixed << std::setprecision(9)
+              << Simulator::Now().GetSeconds() << ",RX,"
+              << +m_expectedActiveBwp << ","
+              << params.m_bwpId << ","
+              << params.m_rnti << ","
+              << +params.m_harqProcessId << ","
+              << +params.m_rv << ","
+              << params.m_tbSize << ","
+              << (params.m_corrupt ? 1 : 0) << ",NA,0\n";
+    }
+
+    void OnDlHarqFeedback(const DlHarqInfo& info)
+    {
+        m_csv << std::fixed << std::setprecision(9)
+              << Simulator::Now().GetSeconds() << ",HARQ,"
+              << +m_expectedActiveBwp << ","
+              << +info.m_bwpIndex << ","
+              << info.m_rnti << ","
+              << +info.m_harqProcessId << ",0,0,0,"
+              << (info.m_harqStatus == DlHarqInfo::ACK ? "ACK" : "NACK") << ","
+              << +info.m_numRetx << "\n";
+    }
+
+private:
+    void WriteTx(uint8_t bwpId, const GnbPhyPacketCountParameter& params)
+    {
+        m_csv << std::fixed << std::setprecision(9)
+              << Simulator::Now().GetSeconds() << ",TX,"
+              << +m_expectedActiveBwp << ","
+              << +bwpId << ",0,0,0,"
+              << params.m_noBytes << ",0,NA,0\n";
+    }
+
+    std::string m_csvFileName;
+    uint8_t m_expectedActiveBwp{BWP_NARROW_20MHZ};
+    std::ofstream m_csv;
+};
+
 static void
 SwitchAllUesToPrimaryBwp(NetDeviceContainer ueDevices, uint8_t targetBwpId)
 {
@@ -86,6 +291,25 @@ SwitchAllUesToPrimaryBwpAndEnergy(
     ApplyUeEnergyBwpScaling(
         ueEnergyModels,
         static_cast<uint32_t>(g_bwpResourceProfiles[targetBwpId].channelBwMhz));
+}
+
+static void
+SwitchAllUesToPrimaryBwpAndEnergyWithProbe(
+    NetDeviceContainer ueDevices,
+    energy::DeviceEnergyModelContainer ueEnergyModels,
+    BwpHandoverProbe* probe,
+    TbContinuityProbe* tbProbe,
+    uint8_t targetBwpId)
+{
+    SwitchAllUesToPrimaryBwpAndEnergy(ueDevices, ueEnergyModels, targetBwpId);
+    if (probe)
+    {
+        probe->SetExpectedActiveBwp(targetBwpId);
+    }
+    if (tbProbe)
+    {
+        tbProbe->SetExpectedActiveBwp(targetBwpId);
+    }
 }
 
 class RlIpcClient
@@ -332,21 +556,58 @@ public:
         m_bwp = bwp;
     }
 
+    void ConfigurePhysicalBwpResources(
+        const std::vector<Ptr<NrMacSchedulerNs3>>& schedulers,
+        const std::vector<Ptr<NrGnbPhy>>& phys)
+    {
+        NS_ABORT_MSG_IF(schedulers.size() != phys.size() || schedulers.size() < 2,
+                        "Physical BWP control requires matching scheduler/PHY vectors");
+        for (uint32_t i = 0; i < schedulers.size(); ++i)
+        {
+            NS_ABORT_MSG_IF(!schedulers[i] || !phys[i],
+                            "Missing scheduler or PHY for physical BWP " << i);
+        }
+        m_physicalBwpSchedulers = schedulers;
+        m_physicalBwpPhys = phys;
+    }
+
     uint64_t GetDlRlcBacklogBytes() const
     {
-        return m_scheduler->GetTotalDlBufferBytes();
+        return GetActiveScheduler()->GetTotalDlBufferBytes();
     }
 
     NrMacSchedulerNs3::DlObservationStats GetDlObservationStats() const
     {
-        return m_scheduler->GetDlObservationStats();
+        return GetActiveScheduler()->GetDlObservationStats();
     }
 
 private:
+    Ptr<NrMacSchedulerNs3> GetActiveScheduler() const
+    {
+        if (!m_physicalBwpSchedulers.empty())
+        {
+            const uint32_t index = static_cast<uint32_t>(m_bwp);
+            NS_ABORT_MSG_IF(index >= m_physicalBwpSchedulers.size(),
+                            "Active physical BWP index is out of range");
+            return m_physicalBwpSchedulers[index];
+        }
+        return m_scheduler;
+    }
+
     void BeginCycle()
     {
         ApplyBwpMask();
-        m_scheduler->SetDlDataSchedulingEnabled(true);
+        if (m_physicalBwpSchedulers.empty())
+        {
+            m_scheduler->SetDlDataSchedulingEnabled(true);
+        }
+        else
+        {
+            for (const auto& scheduler : m_physicalBwpSchedulers)
+            {
+                scheduler->SetDlDataSchedulingEnabled(true);
+            }
+        }
         if (m_enableGating && m_activeWindowMs < m_periodMs)
         {
             Simulator::Schedule(MilliSeconds(m_activeWindowMs),
@@ -360,11 +621,27 @@ private:
 
     void EndActiveWindow()
     {
-        m_scheduler->SetDlDataSchedulingEnabled(false);
+        if (m_physicalBwpSchedulers.empty())
+        {
+            m_scheduler->SetDlDataSchedulingEnabled(false);
+        }
+        else
+        {
+            for (const auto& scheduler : m_physicalBwpSchedulers)
+            {
+                scheduler->SetDlDataSchedulingEnabled(false);
+            }
+        }
     }
 
     void ApplyBwpMask()
     {
+        if (!m_physicalBwpSchedulers.empty())
+        {
+            // Each real BWP PHY already exposes exactly its own bandwidth.
+            // Do not apply the legacy notched-RBG approximation on top.
+            return;
+        }
         uint64_t rbPerRbg = m_scheduler->GetNumRbPerRbg();
         NS_ABORT_MSG_IF(rbPerRbg == 0, "The scheduler RBG size is not configured");
         uint32_t totalRbgs = m_gnbPhy->GetRbNum() / rbPerRbg;
@@ -388,6 +665,8 @@ private:
 
     Ptr<NrMacSchedulerNs3> m_scheduler;
     Ptr<NrGnbPhy> m_gnbPhy;
+    std::vector<Ptr<NrMacSchedulerNs3>> m_physicalBwpSchedulers;
+    std::vector<Ptr<NrGnbPhy>> m_physicalBwpPhys;
     double m_periodMs;
     bool m_enableGating;
     bool m_enableBwpDynamic;
@@ -409,7 +688,11 @@ public:
                          double stepUpMs = 4.0, double stepDownMs = 2.0,
                          uint64_t backlogThresholdBytes = 2000,
                          std::string timelineCsvName = "active_window_timeline.csv",
-                         double warmupMs = 200.0)
+                         double warmupMs = 200.0,
+                         bool enableTrueBwpControl = false,
+                         NetDeviceContainer trueBwpUeDevices = NetDeviceContainer(),
+                         energy::DeviceEnergyModelContainer trueBwpUeEnergyModels =
+                             energy::DeviceEnergyModelContainer())
         : m_tracker(tracker),
           m_energyMetrics(energyMetrics),
           m_radioController(radioController),
@@ -433,6 +716,9 @@ public:
           m_backlogThresholdBytes(backlogThresholdBytes),
           m_timelineCsvName(timelineCsvName),
           m_warmupMs(warmupMs),
+          m_enableTrueBwpControl(enableTrueBwpControl),
+          m_trueBwpUeDevices(trueBwpUeDevices),
+          m_trueBwpUeEnergyModels(trueBwpUeEnergyModels),
           m_ipcClient(nullptr)
     {
         m_bdpThresholdBytes = static_cast<uint64_t>((totalDataRateMbps * 1e6 * linkDelaySec) / 8.0);
@@ -472,6 +758,17 @@ public:
     BwpState GetCurrentBwp() const { return m_currentBwp; }
 
 private:
+    void ApplyPhysicalBwpSwitch(BwpState oldBwp)
+    {
+        if (m_enableTrueBwpControl && m_currentBwp != oldBwp)
+        {
+            SwitchAllUesToPrimaryBwpAndEnergy(
+                m_trueBwpUeDevices,
+                m_trueBwpUeEnergyModels,
+                static_cast<uint8_t>(m_currentBwp));
+        }
+    }
+
     void AppendTimeline(uint64_t totalPending, uint64_t rlcBacklogBytes)
     {
         std::ofstream csv(m_timelineCsvName, std::ios::app);
@@ -510,6 +807,9 @@ private:
     uint64_t m_bdpThresholdBytes;
     std::string m_timelineCsvName;
     double m_warmupMs;
+    bool m_enableTrueBwpControl;
+    NetDeviceContainer m_trueBwpUeDevices;
+    energy::DeviceEnergyModelContainer m_trueBwpUeEnergyModels;
     RlIpcClient* m_ipcClient;
 };
 
@@ -989,6 +1289,7 @@ void DynamicDtxController::EvaluateAndAdjust()
         {
             m_radioController->UpdateState(m_currentActiveMs, m_currentBwp);
         }
+        ApplyPhysicalBwpSwitch(oldBwp);
 
         if (m_enableDciDynamic)
         {
@@ -1051,9 +1352,13 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
 
     if (actionIdx >= 0)
     {
+        BwpState oldBwp = m_currentBwp;
         double deltaWOptions[] = {-4.0, -2.0, 0.0, 2.0, 4.0};
         double deltaW = deltaWOptions[actionIdx % 5];
-        BwpState nextBwp = (actionIdx / 5 == 1) ? BWP_WIDE_100MHZ : BWP_NARROW_20MHZ;
+        BwpState nextBwp = m_enableBwpDynamic
+                               ? ((actionIdx / 5 == 1) ? BWP_WIDE_100MHZ
+                                                      : BWP_NARROW_20MHZ)
+                               : m_currentBwp;
 
         m_currentActiveMs = std::max(m_minActiveMs, std::min(m_maxActiveMs, m_currentActiveMs + deltaW));
         m_currentBwp = nextBwp;
@@ -1062,6 +1367,7 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
         {
             m_radioController->UpdateState(m_currentActiveMs, m_currentBwp);
         }
+        ApplyPhysicalBwpSwitch(oldBwp);
 
         if (m_enableDciDynamic)
         {
@@ -1172,6 +1478,9 @@ int main(int argc, char *argv[])
     uint64_t rngRun = 1;
     std::string csvFileName = "joint_energy_results.csv";
     std::string timelineCsvName = "active_window_timeline.csv";
+    std::string bwpHandoverTraceCsv;
+    double bwpHandoverSampleMs = 0.25;
+    std::string tbContinuityTraceCsv;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("numUes", "Number of UEs", numUes);
@@ -1195,8 +1504,8 @@ int main(int argc, char *argv[])
     cmd.AddValue("enableCdrx", "Enable UE C-DRX Energy Saving Mode", enableCdrx);
     cmd.AddValue("enableDciDynamic", "Enable 3GPP DCI-Level Dynamic Alignment", enableDciDynamic);
     cmd.AddValue("enableBwpDynamic",
-                 "Legacy name: dynamically switch the schedulable PRB profile "
-                 "(20/100 MHz-equivalent) on one physical 100 MHz BWP",
+                 "Enable policy-driven BWP selection: physical BWPs when "
+                 "enableTrueBwp=true, otherwise legacy PRB profiles",
                  enableBwpDynamic);
     cmd.AddValue("enableTrueBwp",
                  "Experimental v6: create physical 20 and 100 MHz gNB/UE BWPs",
@@ -1236,15 +1545,27 @@ int main(int argc, char *argv[])
     cmd.AddValue("rngRun", "ns-3 independent random-number generator run", rngRun);
     cmd.AddValue("csvFileName", "Output CSV file name", csvFileName);
     cmd.AddValue("timelineCsvName", "Controller timeline CSV file name", timelineCsvName);
+    cmd.AddValue("bwpHandoverTraceCsv",
+                 "Optional high-resolution scheduler backlog and BWP DL-symbol trace CSV",
+                 bwpHandoverTraceCsv);
+    cmd.AddValue("bwpHandoverSampleMs",
+                 "Sampling interval in ms for bwpHandoverTraceCsv",
+                 bwpHandoverSampleMs);
+    cmd.AddValue("tbContinuityTraceCsv",
+                 "Optional per-BWP DL TB TX/RX/HARQ continuity trace CSV",
+                 tbContinuityTraceCsv);
     cmd.Parse(argc, argv);
 
     NS_ABORT_MSG_IF(fixedBwpMHz != 20 && fixedBwpMHz != 100,
                     "fixedBwpMHz must be either 20 or 100");
     NS_ABORT_MSG_IF(enableTrueBwpSwitchScript && !enableTrueBwp,
                     "enableTrueBwpSwitchScript requires enableTrueBwp=true");
-    NS_ABORT_MSG_IF(enableTrueBwp && enableBwpDynamic,
-                    "Policy-driven true-BWP switching is not enabled yet; use "
-                    "enableTrueBwpSwitchScript for the deterministic validation sequence");
+    NS_ABORT_MSG_IF(!bwpHandoverTraceCsv.empty() && !enableTrueBwp,
+                    "bwpHandoverTraceCsv requires enableTrueBwp=true");
+    NS_ABORT_MSG_IF(!tbContinuityTraceCsv.empty() && !enableTrueBwpSwitchScript,
+                    "tbContinuityTraceCsv currently requires enableTrueBwpSwitchScript=true");
+    NS_ABORT_MSG_IF(enableTrueBwpSwitchScript && enableBwpDynamic,
+                    "Choose either scripted or policy-driven physical BWP switching");
     NS_ABORT_MSG_IF(enableTrueBwpSwitchScript &&
                         (bwpSwitchToWideSec <= 0.0 ||
                          bwpSwitchBackToNarrowSec <= bwpSwitchToWideSec ||
@@ -1355,6 +1676,7 @@ int main(int argc, char *argv[])
     BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({band});
 
     const uint8_t selectedBwpId = enableTrueBwp && !enableTrueBwpSwitchScript &&
+                                          !enableBwpDynamic &&
                                           fixedBwpMHz == 100
                                       ? BWP_WIDE_100MHZ
                                       : BWP_NARROW_20MHZ;
@@ -1402,7 +1724,39 @@ int main(int argc, char *argv[])
                                             gnbPhy,
                                             cellDtxPeriodMs,
                                             enableGating,
-                                            enableBwpDynamic);
+                                            enableBwpDynamic && !enableTrueBwp);
+    std::vector<Ptr<NrMacSchedulerNs3>> physicalSchedulers;
+    std::vector<Ptr<NrGnbPhy>> physicalPhys;
+    if (enableTrueBwp)
+    {
+        for (uint32_t bwpId = 0; bwpId < allBwps.size(); ++bwpId)
+        {
+            physicalSchedulers.push_back(DynamicCast<NrMacSchedulerNs3>(
+                NrHelper::GetScheduler(gnbNetDev.Get(0), bwpId)));
+            physicalPhys.push_back(NrHelper::GetGnbPhy(gnbNetDev.Get(0), bwpId));
+        }
+        radioController.ConfigurePhysicalBwpResources(physicalSchedulers, physicalPhys);
+    }
+
+    std::unique_ptr<BwpHandoverProbe> bwpHandoverProbe;
+    if (!bwpHandoverTraceCsv.empty())
+    {
+        bwpHandoverProbe = std::make_unique<BwpHandoverProbe>(physicalSchedulers,
+                                                              physicalPhys,
+                                                              bwpHandoverTraceCsv,
+                                                              bwpHandoverSampleMs);
+        bwpHandoverProbe->Start(selectedBwpId);
+    }
+
+    std::unique_ptr<TbContinuityProbe> tbContinuityProbe;
+    if (!tbContinuityTraceCsv.empty())
+    {
+        tbContinuityProbe = std::make_unique<TbContinuityProbe>(gnbNetDev,
+                                                                ueNetDev,
+                                                                allBwps.size(),
+                                                                tbContinuityTraceCsv);
+        tbContinuityProbe->Start(selectedBwpId);
+    }
 
     Ptr<Node> pgw = epcHelper->GetPgwNode();
     NodeContainer remoteHostContainer;
@@ -1522,9 +1876,11 @@ int main(int argc, char *argv[])
     FlowMonitorHelper flowmonHelper;
     Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
 
-    BwpState initialBwp = enableBwpDynamic || fixedBwpMHz == 20
-                              ? BWP_NARROW_20MHZ
-                              : BWP_WIDE_100MHZ;
+    BwpState initialBwp = enableTrueBwp
+                              ? static_cast<BwpState>(selectedBwpId)
+                              : (enableBwpDynamic || fixedBwpMHz == 20
+                                     ? BWP_NARROW_20MHZ
+                                     : BWP_WIDE_100MHZ);
 
     // Official 5G-LENA energy framework: PHY traces drive the TR 38.864 gNB
     // and TR 38.840 UE models at the real OFDM symbol/slot timing.  No custom
@@ -1561,7 +1917,8 @@ int main(int argc, char *argv[])
 
     energy::DeviceEnergyModelContainer gnbEnergyModels =
         nrEnergyHelper.InstallGnb(gnbNetDev, gnbEnergySources);
-    energy::DeviceEnergyModelContainer ueEnergyModels = enableTrueBwpSwitchScript
+    energy::DeviceEnergyModelContainer ueEnergyModels =
+        enableTrueBwp && (enableTrueBwpSwitchScript || enableBwpDynamic)
         ? nrEnergyHelper.InstallUeAllBwps(ueNetDev, ueEnergySources, selectedBwpId)
         : nrEnergyHelper.InstallUe(ueNetDev, ueEnergySources, selectedBwpId);
     OfficialEnergyMetrics energyMetrics(gnbEnergyModels, ueEnergyModels, ueNodes);
@@ -1586,14 +1943,18 @@ int main(int argc, char *argv[])
             NS_ABORT_MSG_IF(bwpSwitchToWideSec <= trafficStartSec,
                             "The first scripted BWP switch must occur after traffic starts");
             Simulator::Schedule(Seconds(bwpSwitchToWideSec),
-                                &SwitchAllUesToPrimaryBwpAndEnergy,
+                                &SwitchAllUesToPrimaryBwpAndEnergyWithProbe,
                                 ueNetDev,
                                 ueEnergyModels,
+                                bwpHandoverProbe.get(),
+                                tbContinuityProbe.get(),
                                 static_cast<uint8_t>(BWP_WIDE_100MHZ));
             Simulator::Schedule(Seconds(bwpSwitchBackToNarrowSec),
-                                &SwitchAllUesToPrimaryBwpAndEnergy,
+                                &SwitchAllUesToPrimaryBwpAndEnergyWithProbe,
                                 ueNetDev,
                                 ueEnergyModels,
+                                bwpHandoverProbe.get(),
+                                tbContinuityProbe.get(),
                                 static_cast<uint8_t>(BWP_NARROW_20MHZ));
         }
         Simulator::Schedule(Seconds(trafficStartSec),
@@ -1615,8 +1976,11 @@ int main(int argc, char *argv[])
                                            controllerInitialActiveMs,
                                            controllerStepUpMs, controllerStepDownMs,
                                            controllerBacklogThresholdBytes, timelineCsvName,
-                                           controllerWarmupMs);
-    bool dynamicControlEnabled = enableGating && (enableQueueAware || enableRlIpc);
+                                           controllerWarmupMs,
+                                           enableTrueBwp && enableBwpDynamic,
+                                           ueNetDev,
+                                           ueEnergyModels);
+    bool dynamicControlEnabled = enableQueueAware || enableRlIpc || enableBwpDynamic;
     radioController.Start(cellDtxActiveMs, initialBwp);
     if (dynamicControlEnabled)
     {
@@ -1635,6 +1999,7 @@ int main(int argc, char *argv[])
     }
 
     double finalActiveMs = dynamicControlEnabled ? dynamicController.GetCurrentActiveMs() : cellDtxActiveMs;
+    BwpState finalBwp = dynamicControlEnabled ? dynamicController.GetCurrentBwp() : initialBwp;
     double avgPower = energyMetrics.GetAvgGnbPowerW();
     double totalEnergy = energyMetrics.GetTotalGnbEnergyJ();
     double totalRxMbits = (totalRxBytes * 8.0) / 1e6;
@@ -1659,10 +2024,15 @@ int main(int argc, char *argv[])
               << ", FrequencyControl="
               << (enableTrueBwpSwitchScript
                       ? "scripted-physical-BWP-v6"
-                      : (enableTrueBwp ? "fixed-physical-BWP-v6-prototype"
-                                       : "PRB-profile-on-100MHz-PHY"))
+                      : (enableTrueBwp && enableBwpDynamic
+                             ? (enableRlIpc ? "ipc-physical-BWP-v6"
+                                            : "rule-physical-BWP-v6")
+                             : (enableTrueBwp ? "fixed-physical-BWP-v6-prototype"
+                                              : "PRB-profile-on-100MHz-PHY")))
               << ", ActivePhysicalBwpMHz="
-              << (enableTrueBwpSwitchScript ? 20 : (enableTrueBwp ? fixedBwpMHz : 100))
+              << (enableTrueBwp
+                      ? static_cast<uint32_t>(g_bwpResourceProfiles[finalBwp].channelBwMhz)
+                      : 100u)
               << std::endl;
 
     ExportStatsToCsv(csvFileName, Simulator::Now().GetSeconds(), enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules);

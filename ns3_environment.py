@@ -83,6 +83,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                  gnb_energy_antenna_ratio=0.4,
                  gnb_energy_power_unit_w=1.0,
                  ue_energy_power_unit_mw=1.0,
+                 enable_true_bwp=True,
                  sim_time=20.0,
                  enable_mock=False,
                  port=5555,
@@ -113,6 +114,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.gnb_energy_antenna_ratio = gnb_energy_antenna_ratio
         self.gnb_energy_power_unit_w = gnb_energy_power_unit_w
         self.ue_energy_power_unit_mw = ue_energy_power_unit_mw
+        self.enable_true_bwp = enable_true_bwp
         self.sim_time = sim_time
         self.enable_mock = enable_mock
         self.port = port
@@ -274,6 +276,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             "--enableCdrx=true",
             "--enableDciDynamic=true",
             "--enableBwpDynamic=true",
+            f"--enableTrueBwp={'true' if self.enable_true_bwp else 'false'}",
             "--enableRlIpc=true",
             f"--ipcPort={self.port}",
             f"--csvFileName={self.csv_filename}",
