@@ -390,7 +390,9 @@ public:
         return true;
     }
 
-    int StepIpc(double backlogBytes, double maxUeBacklogBytes, double offeredRateMbps,
+    int StepIpc(double backlogBytes, double maxUeBacklogBytes,
+                double totalRlcOccupancyRatio, double maxBearerOccupancyRatio,
+                double offeredRateMbps,
                 double deliveredRateMbps,
                 double delayMs,
                 double avgCqi, double p10Cqi, double minCqi, double avgMcs,
@@ -404,8 +406,9 @@ public:
 
         char sendBuffer[384];
         std::snprintf(sendBuffer, sizeof(sendBuffer),
-                      "S4,%.2f,%.2f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.4f\n",
-                      backlogBytes, maxUeBacklogBytes, offeredRateMbps, deliveredRateMbps, delayMs,
+                      "S4,%.2f,%.2f,%.6f,%.6f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.2f,%.4f\n",
+                      backlogBytes, maxUeBacklogBytes, totalRlcOccupancyRatio,
+                      maxBearerOccupancyRatio, offeredRateMbps, deliveredRateMbps, delayMs,
                       avgCqi, p10Cqi, minCqi,
                       avgMcs, wActiveMs, bwpState, gnbPowerW, uePowerMw, jainFairness);
 
@@ -432,6 +435,8 @@ public:
 
     bool StepIpcS5(double backlogBytes,
                    double maxUeBacklogBytes,
+                   double totalRlcOccupancyRatio,
+                   double maxBearerOccupancyRatio,
                    double offeredRateMbps,
                    double deliveredRateMbps,
                    double delayMs,
@@ -453,6 +458,8 @@ public:
         std::ostringstream wire;
         wire << "S5," << std::fixed << std::setprecision(2)
              << backlogBytes << "," << maxUeBacklogBytes << ","
+             << std::setprecision(6) << totalRlcOccupancyRatio << ","
+             << maxBearerOccupancyRatio << ","
              << std::setprecision(4) << offeredRateMbps << "," << deliveredRateMbps << ","
              << std::setprecision(2) << delayMs << "," << avgCqi << "," << p10Cqi << ","
              << minCqi << "," << avgMcs << "," << wActiveMs << "," << gnbPowerW << ","
@@ -1831,6 +1838,8 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
         std::vector<BwpState> nextPerUeBwp;
         if (!m_ipcClient->StepIpcS5((double)rlcBacklogBytes,
                                     (double)dlStats.maxUeBufferBytes,
+                                    queueRatios.first,
+                                    queueRatios.second,
                                     offeredRateMbps,
                                     deliveredRateMbps,
                                     p99DelayMs,
@@ -1878,6 +1887,8 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
 
     int actionIdx = m_ipcClient->StepIpc((double)rlcBacklogBytes,
                                          (double)dlStats.maxUeBufferBytes,
+                                         queueRatios.first,
+                                         queueRatios.second,
                                          offeredRateMbps,
                                          deliveredRateMbps,
                                          p99DelayMs,

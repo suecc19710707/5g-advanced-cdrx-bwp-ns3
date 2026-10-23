@@ -19,7 +19,7 @@ import socket
 import subprocess
 import numpy as np
 
-OBSERVATION_DIM = 10
+OBSERVATION_DIM = 12
 ACTION_ENCODING = "absolute-active-window-v1"
 S5_ACTION_ENCODING = "factorized-active-window-per-ue-bwp-v1"
 ACTIVE_WINDOW_ACTION_STEP_MS = 2.0
@@ -27,6 +27,8 @@ REWARD_MODE = "total-system-threshold-v1"
 OBSERVATION_FIELDS = (
     "total_backlog",
     "max_ue_backlog",
+    "total_rlc_occupancy_ratio",
+    "max_bearer_occupancy_ratio",
     "offered_rate",
     "p99_latency",
     "mean_cqi",
@@ -224,7 +226,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
 
         # S5 carries per-UE BWP state explicitly.  Do not also expose the
         # legacy scalar BWP field: for N UEs the factorized observation is
-        # 9 aggregate features + 3 features per UE.
+        # 11 aggregate features + 3 features per UE.
         self.observation_dim = (
             (OBSERVATION_DIM - 1) + 3 * self.num_ues
             if self.enable_per_ue_bwp_action
@@ -442,42 +444,59 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
 
         parts = data.decode("utf-8").strip().split(",")
         if parts[0] == "S5":
-            if len(parts) != 14 + 3 * self.num_ues:
+            base_fields = 16 + self.num_ues
+            if len(parts) < base_fields or len(parts) > base_fields + 2 * self.num_ues:
                 raise ValueError(f"invalid S5 state length: {data!r}")
-            bwp_end = 14 + self.num_ues
-            buffer_end = bwp_end + self.num_ues
+            bwp_end = base_fields
+            remaining = parts[bwp_end:]
+            buffer_end = bwp_end + min(self.num_ues, len(remaining))
+            delay_end = buffer_end + min(self.num_ues, max(0, len(remaining) - self.num_ues))
             state = {
                 "backlog_bytes": float(parts[1]), "max_ue_backlog_bytes": float(parts[2]),
-                "offered_rate_mbps": float(parts[3]), "delivered_rate_mbps": float(parts[4]),
-                "p99_latency_ms": float(parts[5]), "avg_cqi": float(parts[6]),
-                "p10_cqi": float(parts[7]), "min_cqi": float(parts[8]),
-                "avg_dl_mcs": float(parts[9]), "w_active_ms": float(parts[10]),
-                "gnb_power_w": float(parts[11]), "ue_power_mw": float(parts[12]),
-                "jain_fairness": float(parts[13]),
-                "per_ue_bwp": [int(value) for value in parts[14:bwp_end]],
-                "per_ue_backlog_bytes": [float(value) for value in parts[bwp_end:buffer_end]],
-                "per_ue_delay_ms": [float(value) for value in parts[buffer_end:]],
+                "total_rlc_occupancy_ratio": float(parts[3]),
+                "max_bearer_occupancy_ratio": float(parts[4]),
+                "offered_rate_mbps": float(parts[5]), "delivered_rate_mbps": float(parts[6]),
+                "p99_latency_ms": float(parts[7]), "avg_cqi": float(parts[8]),
+                "p10_cqi": float(parts[9]), "min_cqi": float(parts[10]),
+                "avg_dl_mcs": float(parts[11]), "w_active_ms": float(parts[12]),
+                "gnb_power_w": float(parts[13]), "ue_power_mw": float(parts[14]),
+                "jain_fairness": float(parts[15]),
+                "per_ue_bwp": [int(value) for value in parts[16:bwp_end]],
+                "per_ue_backlog_bytes": [
+                    float(value) for value in parts[bwp_end:buffer_end]
+                ],
+                "per_ue_delay_ms": [
+                    float(value) for value in parts[buffer_end:delay_end]
+                ],
             }
+            state["per_ue_backlog_bytes"] += [
+                0.0
+            ] * (self.num_ues - len(state["per_ue_backlog_bytes"]))
+            state["per_ue_delay_ms"] += [
+                0.0
+            ] * (self.num_ues - len(state["per_ue_delay_ms"]))
             state["bwp_state"] = state["per_ue_bwp"][0] if state["per_ue_bwp"] else 0
             return state
-        if len(parts) != 15 or parts[0] != "S4":
+        if len(parts) != 17 or parts[0] != "S4":
             raise ValueError(f"invalid ns-3 state message: {data!r}")
 
         return {
             "backlog_bytes": float(parts[1]),
             "max_ue_backlog_bytes": float(parts[2]),
-            "offered_rate_mbps": float(parts[3]),
-            "delivered_rate_mbps": float(parts[4]),
-            "p99_latency_ms": float(parts[5]),
-            "avg_cqi": float(parts[6]),
-            "p10_cqi": float(parts[7]),
-            "min_cqi": float(parts[8]),
-            "avg_dl_mcs": float(parts[9]),
-            "w_active_ms": float(parts[10]),
-            "bwp_state": int(parts[11]),
-            "gnb_power_w": float(parts[12]),
-            "ue_power_mw": float(parts[13]),
-            "jain_fairness": float(parts[14]),
+            "total_rlc_occupancy_ratio": float(parts[3]),
+            "max_bearer_occupancy_ratio": float(parts[4]),
+            "offered_rate_mbps": float(parts[5]),
+            "delivered_rate_mbps": float(parts[6]),
+            "p99_latency_ms": float(parts[7]),
+            "avg_cqi": float(parts[8]),
+            "p10_cqi": float(parts[9]),
+            "min_cqi": float(parts[10]),
+            "avg_dl_mcs": float(parts[11]),
+            "w_active_ms": float(parts[12]),
+            "bwp_state": int(parts[13]),
+            "gnb_power_w": float(parts[14]),
+            "ue_power_mw": float(parts[15]),
+            "jain_fairness": float(parts[16]),
             "per_ue_bwp": None,
         }
 
@@ -485,6 +504,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self,
         rlc_backlog_bytes,
         max_ue_backlog_bytes,
+        total_rlc_occupancy_ratio,
+        max_bearer_occupancy_ratio,
         offered_rate_mbps,
         max_pending_delay_ms,
         avg_cqi,
@@ -499,14 +520,16 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
     ):
         s1 = np.clip(rlc_backlog_bytes / self.B_MAX_BYTES, 0.0, 1.0)
         s2 = np.clip(max_ue_backlog_bytes / self.B_MAX_PER_UE_BYTES, 0.0, 1.0)
-        s3 = np.clip(offered_rate_mbps / self.OFFERED_RATE_MAX_MBPS, 0.0, 1.0)
-        s4 = np.clip(max_pending_delay_ms / self.D_LIMIT_MS, 0.0, 1.0)
-        s5 = np.clip(avg_cqi / self.CQI_MAX, 0.0, 1.0)
-        s6 = np.clip(p10_cqi / self.CQI_MAX, 0.0, 1.0)
-        s7 = np.clip(min_cqi / self.CQI_MAX, 0.0, 1.0)
-        s8 = np.clip(avg_dl_mcs / self.DL_MCS_MAX, 0.0, 1.0)
-        s9 = np.clip((w_active_ms - self.W_MIN_MS) / (self.W_MAX_MS - self.W_MIN_MS), 0.0, 1.0)
-        values = [s1, s2, s3, s4, s5, s6, s7, s8, s9]
+        s3 = np.clip(total_rlc_occupancy_ratio, 0.0, 1.0)
+        s4 = np.clip(max_bearer_occupancy_ratio, 0.0, 1.0)
+        s5 = np.clip(offered_rate_mbps / self.OFFERED_RATE_MAX_MBPS, 0.0, 1.0)
+        s6 = np.clip(max_pending_delay_ms / self.D_LIMIT_MS, 0.0, 1.0)
+        s7 = np.clip(avg_cqi / self.CQI_MAX, 0.0, 1.0)
+        s8 = np.clip(p10_cqi / self.CQI_MAX, 0.0, 1.0)
+        s9 = np.clip(min_cqi / self.CQI_MAX, 0.0, 1.0)
+        s10 = np.clip(avg_dl_mcs / self.DL_MCS_MAX, 0.0, 1.0)
+        s11 = np.clip((w_active_ms - self.W_MIN_MS) / (self.W_MAX_MS - self.W_MIN_MS), 0.0, 1.0)
+        values = [s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11]
         if not self.enable_per_ue_bwp_action:
             values.append(float(bwp_state))
         if self.enable_per_ue_bwp_action:
@@ -623,6 +646,12 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         if self.enable_mock:
             initial_backlog = 1500.0
             initial_max_ue_backlog = 250.0
+            initial_total_rlc_occupancy_ratio = np.clip(
+                initial_backlog / max(1.0, self.num_ues * 10.0 * 1024.0), 0.0, 1.0
+            )
+            initial_max_bearer_occupancy_ratio = np.clip(
+                initial_max_ue_backlog / (10.0 * 1024.0), 0.0, 1.0
+            )
             initial_offered_rate = self.num_ues * self.udp_rate
             initial_delay = 8.5
             initial_cqi = 12.0
@@ -638,6 +667,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
 
             initial_backlog = initial_state["backlog_bytes"]
             initial_max_ue_backlog = initial_state["max_ue_backlog_bytes"]
+            initial_total_rlc_occupancy_ratio = initial_state["total_rlc_occupancy_ratio"]
+            initial_max_bearer_occupancy_ratio = initial_state["max_bearer_occupancy_ratio"]
             initial_offered_rate = initial_state["offered_rate_mbps"]
             initial_delay = initial_state["p99_latency_ms"]
             initial_cqi = initial_state["avg_cqi"]
@@ -658,6 +689,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         obs = self._get_normalized_obs(
             rlc_backlog_bytes=initial_backlog,
             max_ue_backlog_bytes=initial_max_ue_backlog,
+            total_rlc_occupancy_ratio=initial_total_rlc_occupancy_ratio,
+            max_bearer_occupancy_ratio=initial_max_bearer_occupancy_ratio,
             offered_rate_mbps=initial_offered_rate,
             max_pending_delay_ms=initial_delay,
             avg_cqi=initial_cqi,
@@ -724,6 +757,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                 state = self._receive_ns3_state()
                 backlog_bytes = state["backlog_bytes"]
                 max_ue_backlog_bytes = state["max_ue_backlog_bytes"]
+                total_rlc_occupancy_ratio = state["total_rlc_occupancy_ratio"]
+                max_bearer_occupancy_ratio = state["max_bearer_occupancy_ratio"]
                 offered_rate_mbps = state["offered_rate_mbps"]
                 delivered_rate_mbps = state["delivered_rate_mbps"]
                 p99_latency_ms = state["p99_latency_ms"]
@@ -761,6 +796,12 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             capacity_factor = (self.current_w_active_ms / 10.0) * (1.0 + 1.5 * self.current_bwp_state)
             backlog_bytes = max(0.0, 15000.0 - capacity_factor * 3500.0 + np.random.normal(0, 500))
             max_ue_backlog_bytes = backlog_bytes / max(1.0, self.num_ues * 0.7)
+            total_rlc_occupancy_ratio = np.clip(
+                backlog_bytes / max(1.0, self.num_ues * 10.0 * 1024.0), 0.0, 1.0
+            )
+            max_bearer_occupancy_ratio = np.clip(
+                max_ue_backlog_bytes / (10.0 * 1024.0), 0.0, 1.0
+            )
             if self.enable_burst_traffic:
                 burst_fraction = np.random.beta(2.0, 3.0)
                 offered_rate_mbps += (
@@ -790,6 +831,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         obs = self._get_normalized_obs(
             rlc_backlog_bytes=backlog_bytes,
             max_ue_backlog_bytes=max_ue_backlog_bytes,
+            total_rlc_occupancy_ratio=total_rlc_occupancy_ratio,
+            max_bearer_occupancy_ratio=max_bearer_occupancy_ratio,
             offered_rate_mbps=offered_rate_mbps,
             max_pending_delay_ms=p99_latency_ms,
             avg_cqi=avg_cqi,
@@ -832,6 +875,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             "per_ue_delay_ms": list(self.current_per_ue_delay),
             "backlog_bytes": backlog_bytes,
             "max_ue_backlog_bytes": max_ue_backlog_bytes,
+            "total_rlc_occupancy_ratio": total_rlc_occupancy_ratio,
+            "max_bearer_occupancy_ratio": max_bearer_occupancy_ratio,
             "offered_rate_mbps": offered_rate_mbps,
             "delivered_rate_mbps": delivered_rate_mbps,
             "p99_latency_ms": p99_latency_ms,
