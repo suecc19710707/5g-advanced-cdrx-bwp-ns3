@@ -48,6 +48,92 @@ To run the main scenario after building:
 The exact scenario arguments and experiment matrices are kept in the relevant
 `experiment_archive/` run scripts.
 
+## Scenario parameters
+
+`joint-energy-mvp` uses ns-3 `CommandLine` parameters. Values in the source
+are defaults; a reproducible experiment should pass the important values
+explicitly. The following are the parameters used by the current rule-based
+baseline/grid experiments.
+
+| Parameter | Meaning | Current baseline value |
+|---|---|---:|
+| `numUes` | Number of UEs | `10` |
+| `udpDataRate` | Constant DL UDP rate per UE (Mbps) | `2` |
+| `simTime` | Simulation duration (s) | `5` or `10` |
+| `trafficStopSec` | Stop traffic before simulation end; `-1` disables | `-1` |
+| `cellDtxPeriodMs` | Cell-DTX cycle length | `40` ms |
+| `cellDtxActiveMs` | Initial Cell-DTX active window | `20` ms for the current baseline |
+| `cdrxOnDurationMs` | UE C-DRX on-duration | `10` ms |
+| `cdrxInactivityMs` | Common UE C-DRX inactivity timer | `10` ms |
+| `ueCdrxInactivityMs` | Comma-separated per-UE inactivity timers; overrides common value | empty |
+| `phaseOffsetMs` | Common UE/Cell C-DRX phase offset | `0` ms |
+| `ueCdrxOffsetsMs` | Comma-separated per-UE offsets; overrides common phase | empty |
+| `qosTargetDelayMs` | QoS delay target used by controller/statistics | `50` ms in the current baseline |
+| `enableGating` | Enable Cell-DTX scheduler gating | `true` |
+| `enableCdrx` | Enable UE C-DRX energy/eligibility model | `true` |
+| `enableQueueAware` | Enable closed-loop rule controller | `true` for rule baselines |
+| `controllerEvalIntervalMs` | Controller decision interval | `40` ms |
+| `controllerWarmupMs` | Delay before first controller decision | `200` ms |
+| `controllerMinActiveMs` | Lower active-window bound | `10` ms |
+| `controllerMaxActiveMs` | Upper active-window bound | `30` ms |
+| `controllerInitialActiveMs` | Rule controller initial active window | `20` ms |
+| `controllerStepUpMs` | Active-window increase per decision | `2` ms |
+| `controllerStepDownMs` | Active-window decrease per decision | `2` ms |
+| `controllerQueueWarnRatio` | Queue warning occupancy ratio | `0.50` |
+| `controllerQueueHighRatio` | Queue high occupancy ratio | `0.60` |
+| `controllerBwpDwellMs` | Minimum time between rule BWP switches | `100` ms |
+| `enableBwpDynamic` | Enable policy/rule BWP selection | `false` for 1D, `true` for 2D |
+| `enableTrueBwp` | Use physical 20/100 MHz BWPs | `false` for legacy/1D, `true` for physical 2D |
+| `fixedBwpMHz` | Fixed BWP profile when dynamic BWP is off | `20` or `100` |
+| `gnbTxPowerDbm` | gNB transmit power | `30` dBm |
+| `gnbEnergyRefConfig` | Energy reference row (`Custom` uses Set1 values) | `Custom` |
+| `gnbEnergyReferenceTxPowerDbm` | Reference power for `sp` normalization | `30` dBm |
+| `gnbEnergyAntennaRatio` | TR 38.864 antenna dynamic-power fraction `A` | `0.4` |
+| `gnbEnergyEtaMode` | PA efficiency mode | `Dual` |
+| `rngSeed` / `rngRun` | ns-3 seed and independent run | `42` / `1` |
+| `csvFileName` | Main result CSV | `joint_energy_results.csv` |
+| `timelineCsvName` | Controller timeline CSV | `active_window_timeline.csv` |
+
+Additional diagnostic options include `rlcBearerSampleMs`,
+`bwpHandoverTraceCsv`, `bwpHandoverSampleMs`, and `tbContinuityTraceCsv`.
+Traffic-burst options are `enableBurstTraffic`, `synchronizeBurstTraffic`,
+`udpBurstRate`, `burstMeanOnMs`, and `burstMeanOffMs`. The complete option list
+is also visible with:
+
+```bash
+./ns3 run "joint-energy-mvp --PrintHelp"
+```
+
+### 1D rule baseline (fixed BWP)
+
+```bash
+./ns3 run "joint-energy-mvp \
+  --numUes=10 --udpDataRate=2 --simTime=5 \
+  --enableGating=true --enableQueueAware=true --enableCdrx=true \
+  --enableBwpDynamic=false --enableTrueBwp=false --fixedBwpMHz=100 \
+  --cellDtxPeriodMs=40 --cellDtxActiveMs=20 \
+  --cdrxOnDurationMs=10 --cdrxInactivityMs=10 \
+  --qosTargetDelayMs=50 --controllerInitialActiveMs=20 \
+  --controllerStepUpMs=2 --controllerStepDownMs=2 \
+  --controllerQueueWarnRatio=0.5 --controllerQueueHighRatio=0.6 \
+  --controllerBwpDwellMs=100 --gnbTxPowerDbm=30 \
+  --gnbEnergyRefConfig=Custom --gnbEnergyReferenceTxPowerDbm=30 \
+  --gnbEnergyAntennaRatio=0.4 --rngSeed=42 --rngRun=1"
+```
+
+### 2D rule baseline (dynamic physical 20/100 MHz BWP)
+
+Use the same command, but change the BWP controls:
+
+```bash
+--enableBwpDynamic=true --enableTrueBwp=true
+```
+
+For a fixed-BWP comparison, use `--enableBwpDynamic=false` and run once with
+`--fixedBwpMHz=20` and once with `--fixedBwpMHz=100`. The current
+slot-start eligibility patch is active whenever `enableCdrx=true`; it checks
+the target slot start and leaves full-slot eligibility for a later revision.
+
 ---
 
 ## 🌟 Key Features
