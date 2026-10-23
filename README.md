@@ -142,7 +142,7 @@ constraints. The archived search script starts at most four simulations at a
 time and writes one result CSV plus one status log per candidate:
 
 ```bash
-SIM_TIME=1.6 bash experiment_archive/run_static_grid_expanded.sh \
+SIM_TIME=5 bash experiment_archive/run_static_grid_expanded.sh \
   experiment_archive/slot_start_eligibility_2026-10-23/greedy_candidates
 ```
 
@@ -150,6 +150,10 @@ This sweeps candidate BWP, Cell-DTX active window, C-DRX on-duration,
 inactivity timer, and phase offset while keeping slot-start eligibility active
 (`enableCdrx=true`). A candidate that aborts with the PHY consistency assertion
 is marked failed and must not enter the feasible set.
+
+The formal baseline and comparison runs use `SIM_TIME=5` seconds. A shorter
+`SIM_TIME=1.6` is only a fast diagnostic/smoke-search setting and must not be
+mixed with the 5-second result tables.
 
 The greedy selection criterion is:
 
