@@ -134,6 +134,69 @@ For a fixed-BWP comparison, use `--enableBwpDynamic=false` and run once with
 slot-start eligibility patch is active whenever `enableCdrx=true`; it checks
 the target slot start and leaves full-slot eligibility for a later revision.
 
+### Parallel greedy-search example (slot-start enforcement)
+
+For a quick rule-parameter search, evaluate candidate configurations in
+parallel and keep the lowest-power candidate that satisfies the QoS and loss
+constraints. The archived search script starts at most four simulations at a
+time and writes one result CSV plus one status log per candidate:
+
+```bash
+SIM_TIME=1.6 bash experiment_archive/run_static_grid_expanded.sh \
+  experiment_archive/slot_start_eligibility_2026-10-23/greedy_candidates
+```
+
+This sweeps candidate BWP, Cell-DTX active window, C-DRX on-duration,
+inactivity timer, and phase offset while keeping slot-start eligibility active
+(`enableCdrx=true`). A candidate that aborts with the PHY consistency assertion
+is marked failed and must not enter the feasible set.
+
+The greedy selection criterion is:
+
+```text
+feasible := RlcTxDropPackets == 0
+            AND FlowLostPackets == 0
+            AND QosSatisfactionRatePct >= 95%
+choose argmin(AvgPowerWatts) over feasible candidates
+```
+
+For one traffic context, the lowest-power feasible result can be selected with:
+
+```bash
+python3 - <<'PY'
+import csv, glob
+
+best = None
+for path in glob.glob("experiment_archive/slot_start_eligibility_2026-10-23/greedy_candidates/*.csv"):
+    if path.endswith(".rlc-bearer.csv"):
+        continue
+    with open(path, newline="") as f:
+        row = next(csv.DictReader(f), None)
+    if not row:
+        continue
+    if int(row["RlcTxDropPackets"]) != 0 or int(row["FlowLostPackets"]) != 0:
+        continue
+    if float(row["QosSatisfactionRatePct"]) < 95.0:
+        continue
+    candidate = (float(row["AvgPowerWatts"]), path, row)
+    if best is None or candidate[0] < best[0]:
+        best = candidate
+
+if best is None:
+    raise SystemExit("no feasible slot-start candidate")
+print(f"best_avg_power_w={best[0]:.6f}")
+print(f"csv={best[1]}")
+print(f"cell_dtx_period_ms={best[2]['CellDtxPeriodMs']}")
+print(f"cell_dtx_active_ms={best[2]['CellDtxActiveMs']}")
+PY
+```
+
+For a true greedy refinement rather than a broad sweep, first search coarse
+active windows (`10, 20, 30, 40` ms), retain the best feasible candidate, then
+search neighbouring values (for example ±2 ms) with the same seed, traffic,
+UE count, and QoS target. This keeps the comparison on one time axis and does
+not introduce the deferred full-slot guard.
+
 ---
 
 ## 🌟 Key Features
