@@ -1,0 +1,197 @@
+From 04bed11ef76c19c363ea561ffe2727d8a7133711 Mon Sep 17 00:00:00 2001
+From: suecc0707 <suecc0707@gmail.com>
+Date: Fri, 23 Oct 2026 10:37:12 +0800
+Subject: [PATCH] nr: enforce UE eligibility across DL grant spans
+
+---
+ model/nr-mac-scheduler-ns3.cc   | 25 +++++++++++++++++++++++--
+ model/nr-mac-scheduler-ns3.h    | 12 ++++++++++--
+ model/nr-mac-scheduler-ofdma.cc |  8 ++++++++
+ model/nr-mac-scheduler-tdma.cc  | 11 ++++++++++-
+ model/nr-ue-drx-model.cc        | 15 +++++++++++++++
+ model/nr-ue-drx-model.h         |  8 ++++++++
+ 6 files changed, 74 insertions(+), 5 deletions(-)
+
+diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
+index b16f0260..1b84117b 100644
+--- a/model/nr-mac-scheduler-ns3.cc
++++ b/model/nr-mac-scheduler-ns3.cc
+@@ -542,7 +542,7 @@ NrMacSchedulerNs3::IsCellDtxSlotEligible(const SfnSf& targetSlot) const
+ 
+ void
+ NrMacSchedulerNs3::SetUeDlEligibilityCallback(
+-    std::function<bool(uint16_t, Time)> callback)
++    std::function<bool(uint16_t, Time, Time)> callback)
+ {
+     m_ueDlEligibilityCallback = std::move(callback);
+ }
+@@ -557,7 +557,27 @@ NrMacSchedulerNs3::IsUeDlEligible(uint16_t rnti, const SfnSf& targetSlot) const
+     const double slotsPerSecond = 1000.0 * (1u << targetSlot.GetNumerology());
+     const Time targetTime =
+         Seconds(static_cast<double>(targetSlot.Normalize()) / slotsPerSecond);
+-    return m_ueDlEligibilityCallback(rnti, targetTime);
++    return m_ueDlEligibilityCallback(rnti, targetTime, targetTime + NanoSeconds(1));
++}
++
++bool
++NrMacSchedulerNs3::IsUeDlGrantSpanEligible(uint16_t rnti,
++                                            uint8_t symStart,
++                                            uint8_t numSym) const
++{
++    if (!m_ueDlEligibilityCallback)
++    {
++        return true;
++    }
++    NS_ABORT_MSG_IF(numSym == 0, "DL grant must contain at least one symbol");
++    const double slotsPerSecond = 1000.0 * (1u << m_currentDlSfnSf.GetNumerology());
++    const Time slotStart =
++        Seconds(static_cast<double>(m_currentDlSfnSf.Normalize()) / slotsPerSecond);
++    const Time slotPeriod = m_macSchedSapUser->GetSlotPeriod();
++    const uint32_t symbolsPerSlot = m_macSchedSapUser->GetSymbolsPerSlot();
++    const Time grantStart = slotStart + slotPeriod * symStart / symbolsPerSlot;
++    const Time grantEnd = slotStart + slotPeriod * (symStart + numSym) / symbolsPerSlot;
++    return m_ueDlEligibilityCallback(rnti, grantStart, grantEnd);
+ }
+ 
+ uint64_t
+@@ -2777,6 +2797,7 @@ NrMacSchedulerNs3::DoScheduleDl(const std::vector<DlHarqInfo>& dlHarqFeedback,
+ {
+     NS_LOG_FUNCTION(this);
+     NS_ASSERT(activeDlUe != nullptr);
++    m_currentDlSfnSf = dlSfnSf;
+ 
+     uint8_t dataSymPerSlot = m_macSchedSapUser->GetSymbolsPerSlot() - m_dlCtrlSymbols;
+ 
+diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
+index 71de30c6..3c54d87c 100644
+--- a/model/nr-mac-scheduler-ns3.h
++++ b/model/nr-mac-scheduler-ns3.h
+@@ -612,7 +612,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+      *
+      * @param callback Function returning true when the UE may receive DL data
+      */
+-    void SetUeDlEligibilityCallback(std::function<bool(uint16_t, Time)> callback);
++    void SetUeDlEligibilityCallback(std::function<bool(uint16_t, Time, Time)> callback);
+ 
+     /**
+      * @brief Check whether a UE may receive downlink scheduling in a target slot.
+@@ -622,6 +622,13 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+      */
+     bool IsUeDlEligible(uint16_t rnti, const SfnSf& targetSlot) const;
+ 
++    /**
++     * @brief Check UE eligibility across the exact DL grant symbol span.
++     */
++    bool IsUeDlGrantSpanEligible(uint16_t rnti,
++                                 uint8_t symStart,
++                                 uint8_t numSym) const;
++
+     /**
+      * @brief Return the aggregate downlink RLC buffer across all UEs.
+      * @return queued downlink bytes reported to the scheduler
+@@ -1120,7 +1127,8 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+     Time m_cellDtxPeriod{Seconds(0)};      //!< Period of the Cell-DTX cycle
+     Time m_cellDtxActiveWindow{Seconds(0)}; //!< Transmittable interval in each cycle
+     Time m_cellDtxStartOffset{Seconds(0)}; //!< Start of the first Cell-DTX cycle
+-    std::function<bool(uint16_t, Time)> m_ueDlEligibilityCallback; //!< Per-UE C-DRX gate
++    std::function<bool(uint16_t, Time, Time)> m_ueDlEligibilityCallback; //!< Per-UE C-DRX gate
++    SfnSf m_currentDlSfnSf{0, 0, 0, 0}; //!< Slot currently being materialized into DL DCIs
+     uint8_t m_maxHarqReTx{3};    //!< Maximum number of HARQ retransmissions per TB
+ 
+     uint8_t m_rachUlGrantMcs{0}; //!< The MCS that will be used for UL RACH grant
+diff --git a/model/nr-mac-scheduler-ofdma.cc b/model/nr-mac-scheduler-ofdma.cc
+index df9c1094..d0c6be18 100644
+--- a/model/nr-mac-scheduler-ofdma.cc
++++ b/model/nr-mac-scheduler-ofdma.cc
+@@ -777,6 +777,14 @@ NrMacSchedulerOfdma::CreateDlDci(NrMacSchedulerNs3::PointInFTPlane* spoint,
+         return nullptr;
+     }
+ 
++    if (!IsUeDlGrantSpanEligible(ueInfo->m_rnti, spoint->m_sym, maxSym))
++    {
++        NS_LOG_DEBUG("Deferring DL grant for UE " << ueInfo->m_rnti
++                                                    << " because its grant span crosses C-DRX");
++        ueInfo->m_dlTbSize = 0;
++        return nullptr;
++    }
++
+     const auto rbgBitmask = CreateRbgBitmaskFromAllocatedRbgs(ueInfo->m_dlRBG);
+     std::ostringstream oss;
+     for (const auto& x : rbgBitmask)
+diff --git a/model/nr-mac-scheduler-tdma.cc b/model/nr-mac-scheduler-tdma.cc
+index cbe7c74f..39f443a7 100644
+--- a/model/nr-mac-scheduler-tdma.cc
++++ b/model/nr-mac-scheduler-tdma.cc
+@@ -448,6 +448,15 @@ NrMacSchedulerTdma::CreateDlDci(PointInFTPlane* spoint,
+ 
+     auto numSym = static_cast<uint8_t>(ueInfo->m_dlRBG.size() / numOfAssignableRbgs);
+ 
++    numSym = std::max(numSym, static_cast<uint8_t>(1));
++    if (!IsUeDlGrantSpanEligible(ueInfo->m_rnti, spoint->m_sym, numSym))
++    {
++        NS_LOG_DEBUG("Deferring DL grant for UE " << ueInfo->m_rnti
++                                                    << " because its grant span crosses C-DRX");
++        ueInfo->m_dlTbSize = 0;
++        return nullptr;
++    }
++
+     auto dci = CreateDci(spoint,
+                          ueInfo,
+                          tbs,
+@@ -455,7 +464,7 @@ NrMacSchedulerTdma::CreateDlDci(PointInFTPlane* spoint,
+                          ueInfo->GetDlMcs(),
+                          ueInfo->m_dlRank,
+                          ueInfo->m_dlPrecMats,
+-                         std::max(numSym, static_cast<uint8_t>(1)));
++                         numSym);
+ 
+     // The starting point must advance.
+     spoint->m_rbg = 0;
+diff --git a/model/nr-ue-drx-model.cc b/model/nr-ue-drx-model.cc
+index 3ef73e7d..338016b6 100644
+--- a/model/nr-ue-drx-model.cc
++++ b/model/nr-ue-drx-model.cc
+@@ -196,6 +196,21 @@ NrUeDrxModel::IsActiveAt(Time time) const
+     return inOnDuration || inInactivity;
+ }
+ 
++bool
++NrUeDrxModel::IsActiveFor(Time start, Time end) const
++{
++    if (end <= start)
++    {
++        return false;
++    }
++
++    // Grants are shorter than a DRX cycle. Checking both interval edges is
++    // sufficient to reject an interval crossing an on-duration or inactivity
++    // expiry boundary, while preserving the half-open [start,end) semantics.
++    const Time lastSymbol = end - NanoSeconds(1);
++    return IsActiveAt(start) && IsActiveAt(lastSymbol);
++}
++
+ void
+ NrUeDrxModel::StartCycle()
+ {
+diff --git a/model/nr-ue-drx-model.h b/model/nr-ue-drx-model.h
+index 18e12ce7..0e0f3fbd 100644
+--- a/model/nr-ue-drx-model.h
++++ b/model/nr-ue-drx-model.h
+@@ -107,6 +107,14 @@ class NrUeDrxModel : public Object
+      */
+     bool IsActiveAt(Time time) const;
+ 
++    /**
++     * @brief Check whether the complete half-open interval is Active Time.
++     * @param start Absolute interval start
++     * @param end Absolute exclusive interval end
++     * @return true when the UE remains active throughout the interval
++     */
++    bool IsActiveFor(Time start, Time end) const;
++
+     /**
+      * @brief Frequency range selector (TR 38.840 Section 8.2), used to pick the
+      * FR-appropriate onDuration for a named reference configuration.
+-- 
+2.43.0
+

@@ -2,7 +2,7 @@
 
 This repository contains an advanced **5G-Advanced discrete-event network simulation framework** built on top of **ns-3 (5G-LENA `nr` module)**. It implements a **Joint Time-Frequency 2D Alignment Architecture**, coordinating Base Station **Cell-DTX**, User Equipment **C-DRX**, and DCI-based **Dynamic Bandwidth Part (BWP) Switching (20 MHz ↔ 100 MHz)**.
 
-> The reproducible setup below is the current slot-start eligibility
+> The reproducible setup below is the current grant-span eligibility
 > environment. The older result tables and the historical 9-experiment
 > commands further down are retained for reference.
 
@@ -22,11 +22,12 @@ cd contrib/nr
 git checkout 9b830f9adfc28bb559f4eaa5fc22fd4518e1cdfa
 cd ../..
 
-# Reconstruct the energy/BWP history, then apply slot-start eligibility.
+# Reconstruct the energy/BWP history, then apply grant-span eligibility.
 cd contrib/nr
 git am ../../experiment_archive/official_energy_v5_2026-10-19/000*.patch
 git am ../../experiment_archive/true_bwp_dci_v6_2026-10-19/000*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0001-*.patch
+git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0002-*.patch
 cd ../..
 
 # Configure and build ns-3 (CMake-based ns-3.48 environment).
@@ -34,9 +35,10 @@ cd ../..
 ./ns3 build
 ```
 
-The final patch implements **slot-start** Cell-DTX and per-UE C-DRX
-eligibility. It deliberately does not implement the deferred full-slot or
-two-slot guard. The scenario must install the callback described in
+The final patches implement **grant-span-aware** Cell-DTX and per-UE C-DRX
+eligibility. The scheduler checks the actual DCI symbol interval before
+assigning RLC bytes; it deliberately does not implement a fixed two-slot guard.
+The scenario must install the callback described in
 `experiment_archive/slot_start_eligibility_2026-10-23/README.md`.
 
 To run the main scenario after building:
@@ -130,11 +132,11 @@ Use the same command, but change the BWP controls:
 ```
 
 For a fixed-BWP comparison, use `--enableBwpDynamic=false` and run once with
-`--fixedBwpMHz=20` and once with `--fixedBwpMHz=100`. The current
-slot-start eligibility patch is active whenever `enableCdrx=true`; it checks
-the target slot start and leaves full-slot eligibility for a later revision.
+`--fixedBwpMHz=20` and once with `--fixedBwpMHz=100`. The current grant-span
+eligibility patches are active whenever `enableCdrx=true`; they check the
+actual DL DCI interval and do not add a fixed full-slot/two-slot guard.
 
-### Parallel greedy-search example (slot-start enforcement)
+### Parallel greedy-search example (grant-span enforcement)
 
 For a quick rule-parameter search, evaluate candidate configurations in
 parallel and keep the lowest-power candidate that satisfies the QoS and loss
@@ -147,7 +149,7 @@ SIM_TIME=5 bash experiment_archive/run_static_grid_expanded.sh \
 ```
 
 This sweeps candidate BWP, Cell-DTX active window, C-DRX on-duration,
-inactivity timer, and phase offset while keeping slot-start eligibility active
+inactivity timer, and phase offset while keeping grant-span eligibility active
 (`enableCdrx=true`). A candidate that aborts with the PHY consistency assertion
 is marked failed and must not enter the feasible set.
 
@@ -199,7 +201,7 @@ For a true greedy refinement rather than a broad sweep, first search coarse
 active windows (`10, 20, 30, 40` ms), retain the best feasible candidate, then
 search neighbouring values (for example ±2 ms) with the same seed, traffic,
 UE count, and QoS target. This keeps the comparison on one time axis and does
-not introduce the deferred full-slot guard.
+not introduce a fixed full-slot guard.
 
 ---
 
