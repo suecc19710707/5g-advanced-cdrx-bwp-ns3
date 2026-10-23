@@ -28,6 +28,7 @@ git am ../../experiment_archive/official_energy_v5_2026-10-19/000*.patch
 git am ../../experiment_archive/true_bwp_dci_v6_2026-10-19/000*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0001-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0002-*.patch
+git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0004-*.patch
 cd ../..
 git apply experiment_archive/slot_start_eligibility_2026-10-23/0003-*.patch
 
@@ -38,7 +39,9 @@ git apply experiment_archive/slot_start_eligibility_2026-10-23/0003-*.patch
 
 The final patches implement **grant-span-aware** Cell-DTX and per-UE C-DRX
 eligibility. The scheduler checks the actual DCI symbol interval before
-assigning RLC bytes; it deliberately does not implement a fixed two-slot guard.
+assigning RLC bytes, clips a partially overlapping grant when possible, and
+defers only when the clipped TB is below the minimum size. It deliberately
+does not implement a fixed two-slot guard.
 Patch `0003` installs the matching scenario-side callback wiring.
 
 To run the main scenario after building:

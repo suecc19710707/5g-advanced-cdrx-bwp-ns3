@@ -9,6 +9,10 @@ they intentionally do **not** implement a fixed full-slot or two-slot guard.
 The existing PHY listener remains as a consistency assertion for a TB that
 still arrives outside UE Active Time.
 
+`0004` adds prefix clipping: when only part of a grant fits before the DRX
+boundary, the DCI and TB size are reduced to the largest eligible symbol span.
+If the clipped TB is below the minimum legal size, the grant is deferred.
+
 ## Apply
 
 From the ns-3 repository root:
@@ -17,6 +21,7 @@ From the ns-3 repository root:
 cd contrib/nr
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0001-nr-slot-start-eligibility.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0002-nr-grant-span-eligibility.patch
+git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0004-nr-grant-clipping-minimum-tb.patch
 cd ../..
 git apply experiment_archive/slot_start_eligibility_2026-10-23/0003-joint-energy-scenario-grant-span.patch
 ```

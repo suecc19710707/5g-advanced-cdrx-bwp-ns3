@@ -1,0 +1,163 @@
+From 6454bbef3c10ddaa6d1127c285663d186c4fb44e Mon Sep 17 00:00:00 2001
+From: suecc0707 <suecc0707@gmail.com>
+Date: Fri, 23 Oct 2026 10:45:00 +0800
+Subject: [PATCH] nr: clip DL grants at C-DRX boundary
+
+---
+ model/nr-mac-scheduler-ns3.cc   | 19 +++++++++++++++++++
+ model/nr-mac-scheduler-ns3.h    |  9 +++++++++
+ model/nr-mac-scheduler-ofdma.cc | 21 ++++++++++++++++++---
+ model/nr-mac-scheduler-tdma.cc  | 30 +++++++++++++++++++++---------
+ 4 files changed, 67 insertions(+), 12 deletions(-)
+
+diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
+index 1b84117b..3658ede2 100644
+--- a/model/nr-mac-scheduler-ns3.cc
++++ b/model/nr-mac-scheduler-ns3.cc
+@@ -580,6 +580,25 @@ NrMacSchedulerNs3::IsUeDlGrantSpanEligible(uint16_t rnti,
+     return m_ueDlEligibilityCallback(rnti, grantStart, grantEnd);
+ }
+ 
++uint8_t
++NrMacSchedulerNs3::GetUeDlGrantSpanSymbols(uint16_t rnti,
++                                           uint8_t symStart,
++                                           uint8_t maxSym) const
++{
++    if (!m_ueDlEligibilityCallback)
++    {
++        return maxSym;
++    }
++    for (uint8_t numSym = maxSym; numSym > 0; --numSym)
++    {
++        if (IsUeDlGrantSpanEligible(rnti, symStart, numSym))
++        {
++            return numSym;
++        }
++    }
++    return 0;
++}
++
+ uint64_t
+ NrMacSchedulerNs3::GetTotalDlBufferBytes() const
+ {
+diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
+index 3c54d87c..db23fce0 100644
+--- a/model/nr-mac-scheduler-ns3.h
++++ b/model/nr-mac-scheduler-ns3.h
+@@ -629,6 +629,15 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+                                  uint8_t symStart,
+                                  uint8_t numSym) const;
+ 
++    /**
++     * @brief Return the largest prefix of a DL grant that remains eligible.
++     * @return Number of symbols allowed, or zero if the first symbol is not
++     *         eligible.
++     */
++    uint8_t GetUeDlGrantSpanSymbols(uint16_t rnti,
++                                    uint8_t symStart,
++                                    uint8_t maxSym) const;
++
+     /**
+      * @brief Return the aggregate downlink RLC buffer across all UEs.
+      * @return queued downlink bytes reported to the scheduler
+diff --git a/model/nr-mac-scheduler-ofdma.cc b/model/nr-mac-scheduler-ofdma.cc
+index d0c6be18..0dc534a2 100644
+--- a/model/nr-mac-scheduler-ofdma.cc
++++ b/model/nr-mac-scheduler-ofdma.cc
+@@ -777,15 +777,30 @@ NrMacSchedulerOfdma::CreateDlDci(NrMacSchedulerNs3::PointInFTPlane* spoint,
+         return nullptr;
+     }
+ 
+-    if (!IsUeDlGrantSpanEligible(ueInfo->m_rnti, spoint->m_sym, maxSym))
++    const auto effectiveNumSym = GetUeDlGrantSpanSymbols(ueInfo->m_rnti, spoint->m_sym, maxSym);
++    if (effectiveNumSym == 0)
+     {
+         NS_LOG_DEBUG("Deferring DL grant for UE " << ueInfo->m_rnti
+-                                                    << " because its grant span crosses C-DRX");
++                                                    << " because its first symbol is outside C-DRX");
+         ueInfo->m_dlTbSize = 0;
+         return nullptr;
+     }
+ 
+     const auto rbgBitmask = CreateRbgBitmaskFromAllocatedRbgs(ueInfo->m_dlRBG);
++    const uint32_t effectiveRbgCount =
++        static_cast<uint32_t>(std::count(rbgBitmask.begin(), rbgBitmask.end(), true)) *
++        effectiveNumSym;
++    tbs = m_dlAmc->CalculateTbSize(dlMcs,
++                                   ueInfo->m_dlRank,
++                                   effectiveRbgCount * GetNumRbPerRbg());
++    if (tbs < 10)
++    {
++        NS_LOG_DEBUG("Deferring clipped DL grant for UE " << ueInfo->m_rnti
++                                                           << " because TB size is " << tbs);
++        ueInfo->m_dlTbSize = 0;
++        return nullptr;
++    }
++
+     std::ostringstream oss;
+     for (const auto& x : rbgBitmask)
+     {
+@@ -799,7 +814,7 @@ NrMacSchedulerOfdma::CreateDlDci(NrMacSchedulerNs3::PointInFTPlane* spoint,
+         std::make_shared<DciInfoElementTdma>(ueInfo->m_rnti,
+                                              DciInfoElementTdma::DL,
+                                              spoint->m_sym,
+-                                             maxSym,
++                                             effectiveNumSym,
+                                              dlMcs,
+                                              ueInfo->m_dlRank,
+                                              ueInfo->m_dlPrecMats,
+diff --git a/model/nr-mac-scheduler-tdma.cc b/model/nr-mac-scheduler-tdma.cc
+index 39f443a7..eacadcc1 100644
+--- a/model/nr-mac-scheduler-tdma.cc
++++ b/model/nr-mac-scheduler-tdma.cc
+@@ -427,12 +427,12 @@ NrMacSchedulerTdma::CreateDlDci(PointInFTPlane* spoint,
+                                 [[maybe_unused]] uint32_t maxSym) const
+ {
+     NS_LOG_FUNCTION(this);
+-    uint32_t tbs = m_dlAmc->CalculateTbSize(ueInfo->GetDlMcs(),
+-                                            ueInfo->m_dlRank,
+-                                            ueInfo->m_dlRBG.size() * GetNumRbPerRbg());
++    uint32_t initialTbs = m_dlAmc->CalculateTbSize(ueInfo->GetDlMcs(),
++                                                   ueInfo->m_dlRank,
++                                                   ueInfo->m_dlRBG.size() * GetNumRbPerRbg());
+     // If is less than 10 (3 mac header, 2 rlc header, 5 data), then we can't
+     // transmit any new data, so don't create dci.
+-    if (tbs < 10)
++    if (initialTbs < 10)
+     {
+         NS_LOG_DEBUG("While creating DL DCI for UE " << ueInfo->m_rnti << " assigned "
+                                                      << ueInfo->m_dlRBG.size()
+@@ -446,13 +446,25 @@ NrMacSchedulerTdma::CreateDlDci(PointInFTPlane* spoint,
+     int zeroes = std::count(notchedRBGsMask.begin(), notchedRBGsMask.end(), 0);
+     uint32_t numOfAssignableRbgs = GetBandwidthInRbg() - zeroes;
+ 
+-    auto numSym = static_cast<uint8_t>(ueInfo->m_dlRBG.size() / numOfAssignableRbgs);
+-
+-    numSym = std::max(numSym, static_cast<uint8_t>(1));
+-    if (!IsUeDlGrantSpanEligible(ueInfo->m_rnti, spoint->m_sym, numSym))
++    auto requestedNumSym = static_cast<uint8_t>(ueInfo->m_dlRBG.size() / numOfAssignableRbgs);
++    requestedNumSym = std::max(requestedNumSym, static_cast<uint8_t>(1));
++    const auto numSym = GetUeDlGrantSpanSymbols(ueInfo->m_rnti, spoint->m_sym, requestedNumSym);
++    if (numSym == 0)
+     {
+         NS_LOG_DEBUG("Deferring DL grant for UE " << ueInfo->m_rnti
+-                                                    << " because its grant span crosses C-DRX");
++                                                    << " because its first symbol is outside C-DRX");
++        ueInfo->m_dlTbSize = 0;
++        return nullptr;
++    }
++
++    const uint32_t effectiveRbgCount = static_cast<uint32_t>(numOfAssignableRbgs) * numSym;
++    const uint32_t tbs = m_dlAmc->CalculateTbSize(ueInfo->GetDlMcs(),
++                                                   ueInfo->m_dlRank,
++                                                   effectiveRbgCount * GetNumRbPerRbg());
++    if (tbs < 10)
++    {
++        NS_LOG_DEBUG("Deferring clipped DL grant for UE " << ueInfo->m_rnti
++                                                           << " because TB size is " << tbs);
+         ueInfo->m_dlTbSize = 0;
+         return nullptr;
+     }
+-- 
+2.43.0
+
