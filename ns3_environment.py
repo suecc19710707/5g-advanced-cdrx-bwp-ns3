@@ -21,6 +21,7 @@ import numpy as np
 
 OBSERVATION_DIM = 10
 ACTION_ENCODING = "absolute-active-window-v1"
+S5_ACTION_ENCODING = "factorized-active-window-per-ue-bwp-v1"
 ACTIVE_WINDOW_ACTION_STEP_MS = 2.0
 REWARD_MODE = "total-system-threshold-v1"
 OBSERVATION_FIELDS = (
@@ -52,13 +53,16 @@ except ImportError:
         class Discrete(MockSpace):
             def __init__(self, n): self.n = n
             def sample(self): return int(np.random.randint(0, self.n))
+        class MultiDiscrete(MockSpace):
+            def __init__(self, nvec): self.nvec = np.asarray(nvec, dtype=np.int64)
+            def sample(self): return np.array([np.random.randint(n) for n in self.nvec], dtype=np.int64)
         class Box(MockSpace):
             def __init__(self, low, high, shape, dtype=np.float32):
                 self.low = np.array(low, dtype=dtype)
                 self.high = np.array(high, dtype=dtype)
                 self.shape = shape; self.dtype = dtype
             def sample(self): return np.random.uniform(self.low, self.high, size=self.shape).astype(self.dtype)
-        class SpacesModule: Discrete = Discrete; Box = Box
+        class SpacesModule: Discrete = Discrete; MultiDiscrete = MultiDiscrete; Box = Box
         spaces = SpacesModule()
         class GymEnvBase:
             def __init__(self): pass
@@ -82,7 +86,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                  burst_mean_off_ms=120.0,
                  gnb_tx_power_dbm=30.0,
                  gnb_energy_bs_category="BsCat1",
-                 gnb_energy_ref_config="Set1",
+                 gnb_energy_ref_config="Custom",
+                 gnb_energy_reference_tx_power_dbm=30.0,
                  gnb_energy_eta_mode="Dual",
                  gnb_energy_antenna_ratio=0.4,
                  gnb_energy_power_unit_w=1.0,
@@ -96,6 +101,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                  controller_warmup_ms=200.0,
                  controller_max_active_ms=30.0,
                  controller_initial_active_ms=30.0,
+                 enable_dci_dynamic=False,
                  rng_seed=42,
                  weight_gnb_power=0.15,
                  weight_ue_power=0.15,
@@ -103,7 +109,9 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                  weight_latency=0.45,
                  weight_backlog=0.25,
                  reward_mode=REWARD_MODE,
-                 backlog_safe_bytes=50000.0):
+                 backlog_safe_bytes=50000.0,
+                 bwp_switch_penalty=0.0,
+                 enable_per_ue_bwp_action=False):
         super(Ns3MultiUserEnv, self).__init__()
 
         self.ns3_path = ns3_path
@@ -117,17 +125,22 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.gnb_tx_power_dbm = gnb_tx_power_dbm
         self.gnb_energy_bs_category = gnb_energy_bs_category
         self.gnb_energy_ref_config = gnb_energy_ref_config
+        self.gnb_energy_reference_tx_power_dbm = float(
+            gnb_energy_reference_tx_power_dbm
+        )
         self.gnb_energy_eta_mode = gnb_energy_eta_mode
         self.gnb_energy_antenna_ratio = gnb_energy_antenna_ratio
         self.gnb_energy_power_unit_w = gnb_energy_power_unit_w
         self.ue_energy_power_unit_mw = ue_energy_power_unit_mw
         self.enable_true_bwp = enable_true_bwp
+        self.enable_per_ue_bwp_action = bool(enable_per_ue_bwp_action)
         self.sim_time = sim_time
         self.enable_mock = enable_mock
         self.port = port
         self.csv_filename = csv_filename
         self.controller_warmup_ms = controller_warmup_ms
         self.controller_initial_active_ms = controller_initial_active_ms
+        self.enable_dci_dynamic = bool(enable_dci_dynamic)
         self.rng_seed = rng_seed
         self.episode_index = 0
 
@@ -148,8 +161,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.W_MIN_MS = 10.0
         self.W_MAX_MS = controller_max_active_ms
         official_gnb_power_sets = {
-            "BsCat1": {"Set1": (55.0, 280.0), "Set2": (50.0, 200.0), "Set3": (38.0, 152.0)},
-            "BsCat2": {"Set1": (5.5, 32.0), "Set2": (5.0, 26.0), "Set3": (3.0, 17.6)},
+            "BsCat1": {"Custom": (55.0, 280.0), "Set1": (55.0, 280.0), "Set2": (50.0, 200.0), "Set3": (38.0, 152.0)},
+            "BsCat2": {"Custom": (5.5, 32.0), "Set1": (5.5, 32.0), "Set2": (5.0, 26.0), "Set3": (3.0, 17.6)},
         }
         try:
             p3_relative, p4_relative = official_gnb_power_sets[
@@ -176,6 +189,9 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.W_BACKLOG = weight_backlog
         self.REWARD_MODE = reward_mode
         self.BACKLOG_SAFE_BYTES = float(backlog_safe_bytes)
+        self.BWP_SWITCH_PENALTY = float(bwp_switch_penalty)
+        if self.BWP_SWITCH_PENALTY < 0.0:
+            raise ValueError("bwp_switch_penalty cannot be negative")
         if self.REWARD_MODE not in {
             "legacy-separated-v1",
             "total-system-threshold-v1",
@@ -197,19 +213,35 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             self.W_MIN_MS + index * ACTIVE_WINDOW_ACTION_STEP_MS
             for index in range(int(round(action_span)) + 1)
         )
-        self.action_space = spaces.Discrete(
-            len(self.ACTIVE_WINDOW_OPTIONS) * len(self.BWP_OPTIONS)
-        )
+        if self.enable_per_ue_bwp_action:
+            self.action_space = spaces.MultiDiscrete(
+                [len(self.ACTIVE_WINDOW_OPTIONS)] + [len(self.BWP_OPTIONS)] * self.num_ues
+            )
+        else:
+            self.action_space = spaces.Discrete(
+                len(self.ACTIVE_WINDOW_OPTIONS) * len(self.BWP_OPTIONS)
+            )
 
+        # S5 carries per-UE BWP state explicitly.  Do not also expose the
+        # legacy scalar BWP field: for N UEs the factorized observation is
+        # 9 aggregate features + 3 features per UE.
+        self.observation_dim = (
+            (OBSERVATION_DIM - 1) + 3 * self.num_ues
+            if self.enable_per_ue_bwp_action
+            else OBSERVATION_DIM
+        )
         self.observation_space = spaces.Box(
-            low=np.zeros(OBSERVATION_DIM, dtype=np.float32),
-            high=np.ones(OBSERVATION_DIM, dtype=np.float32),
-            shape=(OBSERVATION_DIM,),
+            low=np.zeros(self.observation_dim, dtype=np.float32),
+            high=np.ones(self.observation_dim, dtype=np.float32),
+            shape=(self.observation_dim,),
             dtype=np.float32
         )
 
         self.current_w_active_ms = self.controller_initial_active_ms
         self.current_bwp_state = 0
+        self.current_per_ue_bwp = [0] * self.num_ues
+        self.current_per_ue_backlog = [0.0] * self.num_ues
+        self.current_per_ue_delay = [0.0] * self.num_ues
         self.step_count = 0
         self.max_steps = 50
 
@@ -307,6 +339,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             f"--gnbTxPowerDbm={self.gnb_tx_power_dbm}",
             f"--gnbEnergyBsCategory={self.gnb_energy_bs_category}",
             f"--gnbEnergyRefConfig={self.gnb_energy_ref_config}",
+            f"--gnbEnergyReferenceTxPowerDbm={self.gnb_energy_reference_tx_power_dbm}",
             f"--gnbEnergyEtaMode={self.gnb_energy_eta_mode}",
             f"--gnbEnergyAntennaRatio={self.gnb_energy_antenna_ratio}",
             f"--gnbEnergyPowerUnitW={self.gnb_energy_power_unit_w}",
@@ -314,9 +347,11 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             "--enableGating=true",
             "--enableQueueAware=false",
             "--enableCdrx=true",
-            "--enableDciDynamic=true",
-            "--enableBwpDynamic=true",
+            f"--enableDciDynamic={'true' if self.enable_dci_dynamic else 'false'}",
+            f"--enableBwpDynamic={'false' if self.enable_per_ue_bwp_action else 'true'}",
             f"--enableTrueBwp={'true' if self.enable_true_bwp else 'false'}",
+            f"--enablePerUeBwpAction={'true' if self.enable_per_ue_bwp_action else 'false'}",
+            "--fixedBwpMHz=20" if self.enable_per_ue_bwp_action else "--fixedBwpMHz=100",
             "--enableRlIpc=true",
             f"--ipcPort={self.port}",
             f"--csvFileName={self.csv_filename}",
@@ -356,6 +391,17 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             raise
 
     def _action_to_config(self, action_idx):
+        if self.enable_per_ue_bwp_action:
+            action = np.asarray(action_idx, dtype=np.int64).reshape(-1)
+            expected = 1 + self.num_ues
+            if action.size != expected:
+                raise ValueError(f"expected {expected} factorized action values, got {action_idx}")
+            if action[0] < 0 or action[0] >= len(self.ACTIVE_WINDOW_OPTIONS):
+                raise ValueError(f"active action outside [0, {len(self.ACTIVE_WINDOW_OPTIONS)})")
+            bwp = action[1:]
+            if np.any((bwp < 0) | (bwp >= len(self.BWP_OPTIONS))):
+                raise ValueError("per-UE BWP action must contain only 0 or 1")
+            return self.ACTIVE_WINDOW_OPTIONS[int(action[0])], bwp.astype(int).tolist()
         action_idx = int(action_idx)
         if not 0 <= action_idx < self.action_space.n:
             raise ValueError(
@@ -395,6 +441,25 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             raise ConnectionError("ns-3 closed the IPC connection")
 
         parts = data.decode("utf-8").strip().split(",")
+        if parts[0] == "S5":
+            if len(parts) != 14 + 3 * self.num_ues:
+                raise ValueError(f"invalid S5 state length: {data!r}")
+            bwp_end = 14 + self.num_ues
+            buffer_end = bwp_end + self.num_ues
+            state = {
+                "backlog_bytes": float(parts[1]), "max_ue_backlog_bytes": float(parts[2]),
+                "offered_rate_mbps": float(parts[3]), "delivered_rate_mbps": float(parts[4]),
+                "p99_latency_ms": float(parts[5]), "avg_cqi": float(parts[6]),
+                "p10_cqi": float(parts[7]), "min_cqi": float(parts[8]),
+                "avg_dl_mcs": float(parts[9]), "w_active_ms": float(parts[10]),
+                "gnb_power_w": float(parts[11]), "ue_power_mw": float(parts[12]),
+                "jain_fairness": float(parts[13]),
+                "per_ue_bwp": [int(value) for value in parts[14:bwp_end]],
+                "per_ue_backlog_bytes": [float(value) for value in parts[bwp_end:buffer_end]],
+                "per_ue_delay_ms": [float(value) for value in parts[buffer_end:]],
+            }
+            state["bwp_state"] = state["per_ue_bwp"][0] if state["per_ue_bwp"] else 0
+            return state
         if len(parts) != 15 or parts[0] != "S4":
             raise ValueError(f"invalid ns-3 state message: {data!r}")
 
@@ -413,6 +478,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             "gnb_power_w": float(parts[12]),
             "ue_power_mw": float(parts[13]),
             "jain_fairness": float(parts[14]),
+            "per_ue_bwp": None,
         }
 
     def _get_normalized_obs(
@@ -427,6 +493,9 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         avg_dl_mcs,
         w_active_ms,
         bwp_state,
+        per_ue_bwp=None,
+        per_ue_backlog=None,
+        per_ue_delay=None,
     ):
         s1 = np.clip(rlc_backlog_bytes / self.B_MAX_BYTES, 0.0, 1.0)
         s2 = np.clip(max_ue_backlog_bytes / self.B_MAX_PER_UE_BYTES, 0.0, 1.0)
@@ -437,10 +506,23 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         s7 = np.clip(min_cqi / self.CQI_MAX, 0.0, 1.0)
         s8 = np.clip(avg_dl_mcs / self.DL_MCS_MAX, 0.0, 1.0)
         s9 = np.clip((w_active_ms - self.W_MIN_MS) / (self.W_MAX_MS - self.W_MIN_MS), 0.0, 1.0)
-        s10 = float(bwp_state)
-        return np.array([s1, s2, s3, s4, s5, s6, s7, s8, s9, s10], dtype=np.float32)
+        values = [s1, s2, s3, s4, s5, s6, s7, s8, s9]
+        if not self.enable_per_ue_bwp_action:
+            values.append(float(bwp_state))
+        if self.enable_per_ue_bwp_action:
+            values.extend(float(value) for value in (per_ue_bwp or self.current_per_ue_bwp))
+            values.extend(
+                float(np.clip(value / self.B_MAX_PER_UE_BYTES, 0.0, 1.0))
+                for value in (per_ue_backlog or self.current_per_ue_backlog)
+            )
+            values.extend(
+                float(np.clip(value / self.D_LIMIT_MS, 0.0, 1.0))
+                for value in (per_ue_delay or self.current_per_ue_delay)
+            )
+        return np.array(values, dtype=np.float32)
 
-    def _compute_reward(self, gnb_power_watts, ue_avg_power_mw, p99_latency_ms, backlog_bytes):
+    def _compute_reward(self, gnb_power_watts, ue_avg_power_mw, p99_latency_ms,
+                        backlog_bytes, bwp_switch_count=0):
         p_gnb_norm = np.clip(gnb_power_watts / self.P_GNB_MAX_W, 0.0, 1.0)
         p_ue_norm = np.clip(ue_avg_power_mw / self.P_UE_MAX_MW, 0.0, 1.0)
         total_ue_power_watts = self.num_ues * ue_avg_power_mw / 1000.0
@@ -489,11 +571,13 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             backlog_penalty_norm = backlog_excess_norm
         reward_latency = -self.W_LATENCY * penalty_p99
         reward_backlog = -self.W_BACKLOG * backlog_penalty_norm
+        reward_bwp_switch = -self.BWP_SWITCH_PENALTY * float(bwp_switch_count)
         reward = (
             reward_gnb_power
             + reward_ue_power
             + reward_latency
             + reward_backlog
+            + reward_bwp_switch
         )
 
         return float(reward), {
@@ -502,6 +586,8 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             "reward_system_power": float(reward_system_power),
             "reward_latency": float(reward_latency),
             "reward_backlog": float(reward_backlog),
+            "reward_bwp_switch": float(reward_bwp_switch),
+            "bwp_switch_count": int(bwp_switch_count),
             "p_gnb_norm": float(p_gnb_norm),
             "p_ue_norm": float(p_ue_norm),
             "p_system_norm": float(p_system_norm),
@@ -560,6 +646,14 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             initial_avg_mcs = initial_state["avg_dl_mcs"]
             self.current_w_active_ms = initial_state["w_active_ms"]
             self.current_bwp_state = initial_state["bwp_state"]
+            if initial_state.get("per_ue_bwp") is not None:
+                self.current_per_ue_bwp = initial_state["per_ue_bwp"]
+                self.current_per_ue_backlog = initial_state.get(
+                    "per_ue_backlog_bytes", self.current_per_ue_backlog
+                )
+                self.current_per_ue_delay = initial_state.get(
+                    "per_ue_delay_ms", self.current_per_ue_delay
+                )
 
         obs = self._get_normalized_obs(
             rlc_backlog_bytes=initial_backlog,
@@ -571,12 +665,18 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             min_cqi=initial_min_cqi,
             avg_dl_mcs=initial_avg_mcs,
             w_active_ms=self.current_w_active_ms,
-            bwp_state=self.current_bwp_state
+            bwp_state=self.current_bwp_state,
+            per_ue_bwp=self.current_per_ue_bwp,
+            per_ue_backlog=self.current_per_ue_backlog,
+            per_ue_delay=self.current_per_ue_delay,
         )
 
         info = {
             "w_active_ms": self.current_w_active_ms,
             "bwp_state": self.current_bwp_state,
+            "per_ue_bwp": list(self.current_per_ue_bwp),
+            "per_ue_backlog_bytes": list(self.current_per_ue_backlog),
+            "per_ue_delay_ms": list(self.current_per_ue_delay),
             "udp_rate_mbps_per_ue": self.udp_rate,
             "offered_rate_max_mbps": self.OFFERED_RATE_MAX_MBPS,
             "backend": "mock" if self.enable_mock else "ns3-ipc",
@@ -590,6 +690,13 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.step_count += 1
         target_w_active_ms, bwp_next = self._action_to_config(action)
         requested_delta_w = target_w_active_ms - self.current_w_active_ms
+        previous_bwp = list(self.current_per_ue_bwp)
+        if self.enable_per_ue_bwp_action:
+            bwp_switch_count = sum(
+                int(old != new) for old, new in zip(previous_bwp, bwp_next)
+            )
+        else:
+            bwp_switch_count = int(self.current_bwp_state != bwp_next)
 
         backlog_bytes = 2500.0
         max_ue_backlog_bytes = 400.0
@@ -606,7 +713,12 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
 
         if not self.enable_mock:
             try:
-                self.client_stream.write(f"{action}\n".encode("utf-8"))
+                if self.enable_per_ue_bwp_action:
+                    action_values = np.asarray(action, dtype=np.int64).reshape(-1)
+                    wire_action = ",".join(str(int(value)) for value in action_values)
+                else:
+                    wire_action = str(int(action))
+                self.client_stream.write(f"{wire_action}\n".encode("utf-8"))
                 self.client_stream.flush()
 
                 state = self._receive_ns3_state()
@@ -621,6 +733,14 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                 avg_dl_mcs = state["avg_dl_mcs"]
                 self.current_w_active_ms = state["w_active_ms"]
                 self.current_bwp_state = state["bwp_state"]
+                if state.get("per_ue_bwp") is not None:
+                    self.current_per_ue_bwp = state["per_ue_bwp"]
+                    self.current_per_ue_backlog = state.get(
+                        "per_ue_backlog_bytes", self.current_per_ue_backlog
+                    )
+                    self.current_per_ue_delay = state.get(
+                        "per_ue_delay_ms", self.current_per_ue_delay
+                    )
                 gnb_power_w = state["gnb_power_w"]
                 ue_power_mw = state["ue_power_mw"]
                 jain_fairness = state["jain_fairness"]
@@ -632,7 +752,11 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
 
         if self.enable_mock:
             self.current_w_active_ms = float(target_w_active_ms)
-            self.current_bwp_state = int(bwp_next)
+            if self.enable_per_ue_bwp_action:
+                self.current_per_ue_bwp = list(bwp_next)
+                self.current_bwp_state = int(self.current_per_ue_bwp[0])
+            else:
+                self.current_bwp_state = int(bwp_next)
 
             capacity_factor = (self.current_w_active_ms / 10.0) * (1.0 + 1.5 * self.current_bwp_state)
             backlog_bytes = max(0.0, 15000.0 - capacity_factor * 3500.0 + np.random.normal(0, 500))
@@ -673,7 +797,10 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             min_cqi=min_cqi,
             avg_dl_mcs=avg_dl_mcs,
             w_active_ms=self.current_w_active_ms,
-            bwp_state=self.current_bwp_state
+            bwp_state=self.current_bwp_state,
+            per_ue_bwp=self.current_per_ue_bwp,
+            per_ue_backlog=self.current_per_ue_backlog,
+            per_ue_delay=self.current_per_ue_delay,
         )
 
         reward, reward_breakdown = self._compute_reward(
@@ -681,6 +808,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             ue_avg_power_mw=ue_power_mw,
             p99_latency_ms=p99_latency_ms,
             backlog_bytes=backlog_bytes,
+            bwp_switch_count=bwp_switch_count,
         )
 
         terminated = False
@@ -689,12 +817,19 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         info = {
             "step": self.step_count,
             "action_idx": action,
-            "action_encoding": ACTION_ENCODING,
+            "action_encoding": (
+                S5_ACTION_ENCODING if self.enable_per_ue_bwp_action else ACTION_ENCODING
+            ),
             "target_w_active_ms": target_w_active_ms,
-            "action_bwp_state": int(bwp_next),
+            "action_bwp_state": (
+                list(bwp_next) if self.enable_per_ue_bwp_action else int(bwp_next)
+            ),
             "delta_w_ms": requested_delta_w,
             "w_active_ms": self.current_w_active_ms,
             "bwp_state": self.current_bwp_state,
+            "per_ue_bwp": list(self.current_per_ue_bwp),
+            "per_ue_backlog_bytes": list(self.current_per_ue_backlog),
+            "per_ue_delay_ms": list(self.current_per_ue_delay),
             "backlog_bytes": backlog_bytes,
             "max_ue_backlog_bytes": max_ue_backlog_bytes,
             "offered_rate_mbps": offered_rate_mbps,
