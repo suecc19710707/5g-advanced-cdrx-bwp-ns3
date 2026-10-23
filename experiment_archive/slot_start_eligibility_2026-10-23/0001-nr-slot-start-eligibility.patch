@@ -1,0 +1,537 @@
+From 83d8db63b5b8e27f23a6237a9b2a083138cbd23f Mon Sep 17 00:00:00 2001
+From: suecc0707 <suecc0707@gmail.com>
+Date: Fri, 23 Oct 2026 09:58:52 +0800
+Subject: [PATCH] nr: enforce slot-start Cell-DTX and UE C-DRX eligibility
+
+---
+ model/nr-mac-scheduler-ns3.cc      | 158 ++++++++++++++++++++++++++++-
+ model/nr-mac-scheduler-ns3.h       |  67 ++++++++++++
+ model/nr-ue-drx-model.cc           |  53 ++++++++++
+ model/nr-ue-drx-model.h            |  40 ++++++--
+ model/nr-ue-phy-energy-listener.cc |  11 +-
+ 5 files changed, 320 insertions(+), 9 deletions(-)
+
+diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
+index 05e2a49e..b16f0260 100644
+--- a/model/nr-mac-scheduler-ns3.cc
++++ b/model/nr-mac-scheduler-ns3.cc
+@@ -30,6 +30,7 @@
+ #include <numeric>
+ #include <ranges>
+ #include <unordered_set>
++#include <utility>
+ 
+ namespace ns3
+ {
+@@ -501,6 +502,64 @@ NrMacSchedulerNs3::IsDlDataSchedulingEnabled() const
+     return m_dlDataSchedulingEnabled;
+ }
+ 
++void
++NrMacSchedulerNs3::ConfigureCellDtx(Time period, Time activeWindow, Time startOffset)
++{
++    NS_ABORT_MSG_IF(period <= Seconds(0), "Cell-DTX period must be positive");
++    NS_ABORT_MSG_IF(activeWindow < Seconds(0) || activeWindow > period,
++                    "Cell-DTX active window must be inside [0, period]");
++    m_cellDtxPeriod = period;
++    m_cellDtxActiveWindow = activeWindow;
++    m_cellDtxStartOffset = startOffset;
++    m_cellDtxEnabled = activeWindow < period;
++}
++
++void
++NrMacSchedulerNs3::DisableCellDtx()
++{
++    m_cellDtxEnabled = false;
++}
++
++bool
++NrMacSchedulerNs3::IsCellDtxSlotEligible(const SfnSf& targetSlot) const
++{
++    if (!m_cellDtxEnabled)
++    {
++        return true;
++    }
++
++    const int64_t periodNs = m_cellDtxPeriod.GetNanoSeconds();
++    const double slotsPerSecond = 1000.0 * (1u << targetSlot.GetNumerology());
++    const int64_t targetNs =
++        Seconds(static_cast<double>(targetSlot.Normalize()) / slotsPerSecond).GetNanoSeconds();
++    int64_t phaseNs = (targetNs - m_cellDtxStartOffset.GetNanoSeconds()) % periodNs;
++    if (phaseNs < 0)
++    {
++        phaseNs += periodNs;
++    }
++    return phaseNs < m_cellDtxActiveWindow.GetNanoSeconds();
++}
++
++void
++NrMacSchedulerNs3::SetUeDlEligibilityCallback(
++    std::function<bool(uint16_t, Time)> callback)
++{
++    m_ueDlEligibilityCallback = std::move(callback);
++}
++
++bool
++NrMacSchedulerNs3::IsUeDlEligible(uint16_t rnti, const SfnSf& targetSlot) const
++{
++    if (!m_ueDlEligibilityCallback)
++    {
++        return true;
++    }
++    const double slotsPerSecond = 1000.0 * (1u << targetSlot.GetNumerology());
++    const Time targetTime =
++        Seconds(static_cast<double>(targetSlot.Normalize()) / slotsPerSecond);
++    return m_ueDlEligibilityCallback(rnti, targetTime);
++}
++
+ uint64_t
+ NrMacSchedulerNs3::GetTotalDlBufferBytes() const
+ {
+@@ -512,6 +571,50 @@ NrMacSchedulerNs3::GetTotalDlBufferBytes() const
+     return totalBytes;
+ }
+ 
++std::vector<NrMacSchedulerNs3::DlBearerBufferStats>
++NrMacSchedulerNs3::GetDlBearerBufferStats() const
++{
++    std::vector<DlBearerBufferStats> result;
++    for (const auto& [rnti, ue] : m_ueMap)
++    {
++        const auto& dlLcg = NrMacSchedulerUeInfo::GetDlLCG(ue);
++        for (const auto& [lcgId, lcg] : dlLcg)
++        {
++            (void)lcgId;
++            for (uint8_t lcid : lcg->GetLCId())
++            {
++                if (lcg->GetTotalSizeOfLC(lcid) == 0)
++                {
++                    continue;
++                }
++                const auto& lc = lcg->GetLC(lcid);
++                result.push_back({rnti,
++                                  lcid,
++                                  lc->m_rlcTransmissionQueueSize,
++                                  lc->m_rlcRetransmissionQueueSize,
++                                  lc->m_rlcStatusPduSize});
++            }
++        }
++    }
++    return result;
++}
++
++uint32_t
++NrMacSchedulerNs3::GetDlBearerCount() const
++{
++    uint32_t count = 0;
++    for (const auto& [rnti, ue] : m_ueMap)
++    {
++        const auto& dlLcg = NrMacSchedulerUeInfo::GetDlLCG(ue);
++        for (const auto& [lcgId, lcg] : dlLcg)
++        {
++            (void)lcgId;
++            count += static_cast<uint32_t>(lcg->GetLCId().size());
++        }
++    }
++    return count;
++}
++
+ NrMacSchedulerNs3::DlObservationStats
+ NrMacSchedulerNs3::GetDlObservationStats() const
+ {
+@@ -2026,6 +2129,21 @@ NrMacSchedulerNs3::ScheduleDl(const NrMacSchedSapProvider::SchedDlTriggerReqPara
+     NrMacSchedSapUser::SchedConfigIndParameters dlSlot(params.m_snfSf);
+     dlSlot.m_slotAllocInfo.m_sfnSf = params.m_snfSf;
+     dlSlot.m_slotAllocInfo.m_type = SlotAllocInfo::DL;
++
++    if (!IsCellDtxSlotEligible(params.m_snfSf))
++    {
++        auto pendingUl = m_ulAllocationMap.find(params.m_snfSf.GetEncoding());
++        NS_ABORT_MSG_IF(pendingUl != m_ulAllocationMap.end() &&
++                            (pendingUl->second.m_totUlSym != 0 ||
++                             !pendingUl->second.m_ulAllocations.empty()),
++                        "A pre-scheduled UL allocation overlaps a Cell-DTX sleep slot");
++        if (pendingUl != m_ulAllocationMap.end())
++        {
++            m_ulAllocationMap.erase(pendingUl);
++        }
++        return;
++    }
++
+     auto ulAllocationIt =
+         m_ulAllocationMap.find(params.m_snfSf.GetEncoding()); // UL allocations for this slot
+     if (ulAllocationIt == m_ulAllocationMap.end())
+@@ -2062,16 +2180,47 @@ NrMacSchedulerNs3::ScheduleDl(const NrMacSchedSapProvider::SchedDlTriggerReqPara
+     }
+ 
+     // compute active ue in the current subframe, group them by BeamId
++    std::vector<DlHarqInfo> eligibleDlHarqFeedback;
++    eligibleDlHarqFeedback.reserve(dlHarqFeedback.size());
++    for (const auto& feedback : dlHarqFeedback)
++    {
++        if (IsUeDlEligible(feedback.m_rnti, params.m_snfSf))
++        {
++            eligibleDlHarqFeedback.push_back(feedback);
++        }
++        else
++        {
++            // Preserve a NACK until the UE's next DRX Active Time instead of
++            // retransmitting to a sleeping UE or discarding the HARQ process.
++            m_dlHarqToRetransmit.push_back(feedback);
++        }
++    }
++
+     ActiveHarqMap activeDlHarq;
+-    ComputeActiveHarq(&activeDlHarq, dlHarqFeedback);
++    ComputeActiveHarq(&activeDlHarq, eligibleDlHarqFeedback);
+ 
+     ActiveUeMap activeDlUe;
+     ComputeActiveUe(&activeDlUe,
+                     &NrMacSchedulerUeInfo::GetDlLCG,
+                     &NrMacSchedulerUeInfo::GetDlHarqVector,
+                     "DL");
++    for (auto beamIt = activeDlUe.begin(); beamIt != activeDlUe.end();)
++    {
++        auto& ues = beamIt->second;
++        std::erase_if(ues, [&](const auto& entry) {
++            return !IsUeDlEligible(entry.first->m_rnti, params.m_snfSf);
++        });
++        if (ues.empty())
++        {
++            beamIt = activeDlUe.erase(beamIt);
++        }
++        else
++        {
++            ++beamIt;
++        }
++    }
+ 
+-    DoScheduleDl(dlHarqFeedback,
++    DoScheduleDl(eligibleDlHarqFeedback,
+                  activeDlHarq,
+                  &activeDlUe,
+                  params.m_snfSf,
+@@ -2163,6 +2312,11 @@ NrMacSchedulerNs3::ScheduleUl(const NrMacSchedSapProvider::SchedUlTriggerReqPara
+     ulSlot.m_slotAllocInfo.m_sfnSf = params.m_snfSf;
+     ulSlot.m_slotAllocInfo.m_type = SlotAllocInfo::UL;
+ 
++    if (!IsCellDtxSlotEligible(params.m_snfSf))
++    {
++        return;
++    }
++
+     // add slot for UL control, at last symbol, for slot type F and UL.
+     AppendCtrlSym(static_cast<uint8_t>(m_macSchedSapUser->GetSymbolsPerSlot() - 1),
+                   m_ulCtrlSymbols,
+diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
+index 253f05bd..71de30c6 100644
+--- a/model/nr-mac-scheduler-ns3.h
++++ b/model/nr-mac-scheduler-ns3.h
+@@ -14,6 +14,7 @@
+ #include "nr-phy-mac-common.h"
+ 
+ #include "ns3/nr-export.h"
++#include "ns3/nstime.h"
+ #include "ns3/traced-callback.h"
+ 
+ #include <functional>
+@@ -577,12 +578,73 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+      */
+     bool IsDlDataSchedulingEnabled() const;
+ 
++    /**
++     * @brief Configure a periodic Cell-DTX scheduling window.
++     *
++     * The eligibility decision is evaluated against the target slot carried by
++     * the scheduler request, not against Simulator::Now(). This accounts for the
++     * L1/L2 and UL scheduling look-ahead and prevents allocations prepared in
++     * advance from leaking into the sleep interval.
++     *
++     * @param period Cell-DTX cycle period
++     * @param activeWindow Transmittable interval at the start of every cycle
++     * @param startOffset Start of the first cycle relative to simulation time zero
++     */
++    void ConfigureCellDtx(Time period, Time activeWindow, Time startOffset = Seconds(0));
++
++    /**
++     * @brief Disable the periodic Cell-DTX scheduling restriction.
++     */
++    void DisableCellDtx();
++
++    /**
++     * @brief Check whether a target slot is inside the Cell-DTX active window.
++     * @param targetSlot Slot for which an allocation is being prepared
++     * @return true when data and control allocations are permitted
++     */
++    bool IsCellDtxSlotEligible(const SfnSf& targetSlot) const;
++
++    /**
++     * @brief Install the per-UE C-DRX downlink Active Time query.
++     *
++     * The callback receives an RNTI and the absolute start time of the target
++     * slot. An unset callback leaves the scheduler behavior unchanged.
++     *
++     * @param callback Function returning true when the UE may receive DL data
++     */
++    void SetUeDlEligibilityCallback(std::function<bool(uint16_t, Time)> callback);
++
++    /**
++     * @brief Check whether a UE may receive downlink scheduling in a target slot.
++     * @param rnti UE radio network temporary identifier
++     * @param targetSlot Slot for which scheduling is being prepared
++     * @return true when the UE is in DRX Active Time or no callback is installed
++     */
++    bool IsUeDlEligible(uint16_t rnti, const SfnSf& targetSlot) const;
++
+     /**
+      * @brief Return the aggregate downlink RLC buffer across all UEs.
+      * @return queued downlink bytes reported to the scheduler
+      */
+     uint64_t GetTotalDlBufferBytes() const;
+ 
++    struct DlBearerBufferStats
++    {
++        uint16_t rnti{0};
++        uint8_t lcid{0};
++        uint32_t txQueueBytes{0};
++        uint32_t retxQueueBytes{0};
++        uint32_t statusPduBytes{0};
++    };
++
++    std::vector<DlBearerBufferStats> GetDlBearerBufferStats() const;
++
++    /**
++     * @brief Return the number of configured downlink logical channels.
++     * @note This includes bearers whose current reported buffer is zero.
++     */
++    uint32_t GetDlBearerCount() const;
++
+     /**
+      * @brief Fixed-size aggregate statistics for an external controller.
+      *
+@@ -1054,6 +1116,11 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+     Time m_cqiTimersThreshold;   //!< The time while a CQI is valid
+     bool m_enableHarqReTx{true}; //!< Whether HARQ retransmissions are enabled
+     bool m_dlDataSchedulingEnabled{true}; //!< Whether new DL data can be scheduled
++    bool m_cellDtxEnabled{false};          //!< Whether target-slot Cell-DTX gating is active
++    Time m_cellDtxPeriod{Seconds(0)};      //!< Period of the Cell-DTX cycle
++    Time m_cellDtxActiveWindow{Seconds(0)}; //!< Transmittable interval in each cycle
++    Time m_cellDtxStartOffset{Seconds(0)}; //!< Start of the first Cell-DTX cycle
++    std::function<bool(uint16_t, Time)> m_ueDlEligibilityCallback; //!< Per-UE C-DRX gate
+     uint8_t m_maxHarqReTx{3};    //!< Maximum number of HARQ retransmissions per TB
+ 
+     uint8_t m_rachUlGrantMcs{0}; //!< The MCS that will be used for UL RACH grant
+diff --git a/model/nr-ue-drx-model.cc b/model/nr-ue-drx-model.cc
+index a5611535..3ef73e7d 100644
+--- a/model/nr-ue-drx-model.cc
++++ b/model/nr-ue-drx-model.cc
+@@ -60,6 +60,11 @@ NrUeDrxModel::GetTypeId()
+                           TimeValue(MilliSeconds(10)),
+                           MakeTimeAccessor(&NrUeDrxModel::m_inactivityTimer),
+                           MakeTimeChecker())
++            .AddAttribute("StartOffset",
++                          "Offset of the first onDuration relative to DRX installation.",
++                          TimeValue(Seconds(0)),
++                          MakeTimeAccessor(&NrUeDrxModel::m_startOffset),
++                          MakeTimeChecker())
+             .AddAttribute("DeepSleepThreshold",
+                           "Gap to next onDuration at/above which deep sleep is used "
+                           "(TR 38.840 Table 19 deep-sleep total transition time = 20 ms).",
+@@ -101,9 +106,13 @@ NrUeDrxModel::NrUeDrxModel()
+       m_longCycle(MilliSeconds(160)),
+       m_onDuration(MilliSeconds(8)),
+       m_inactivityTimer(MilliSeconds(10)),
++      m_startOffset(Seconds(0)),
+       m_deepSleepThreshold(MilliSeconds(20)),
+       m_lightSleepThreshold(MilliSeconds(6)),
+       m_nextCycleTime(Seconds(0)),
++      m_startTime(Seconds(0)),
++      m_inactivityEndTime(Seconds(0)),
++      m_started(false),
+       m_inactivityRunning(false),
+       m_onDurationRunning(false)
+ {
+@@ -141,10 +150,52 @@ void
+ NrUeDrxModel::Start(Time startAt)
+ {
+     NS_LOG_FUNCTION(this << startAt);
++    NS_ABORT_MSG_IF(startAt < Simulator::Now(), "DRX start time cannot be in the past");
+     ApplyReferenceConfig();
++    NS_ABORT_MSG_IF(m_startOffset >= m_longCycle,
++                    "DRX StartOffset must be smaller than LongCycle");
++    m_startTime = startAt;
++    m_started = true;
++    m_nextCycleTime = startAt;
++    if (startAt > Simulator::Now())
++    {
++        GoToSleep();
++    }
+     m_cycleEvent = Simulator::Schedule(startAt - Simulator::Now(), &NrUeDrxModel::StartCycle, this);
+ }
+ 
++Time
++NrUeDrxModel::GetStartOffset() const
++{
++    return m_startOffset;
++}
++
++Time
++NrUeDrxModel::GetInactivityTimer() const
++{
++    return m_inactivityTimer;
++}
++
++bool
++NrUeDrxModel::IsActiveAt(Time time) const
++{
++    if (!m_started || time < m_startTime)
++    {
++        return false;
++    }
++
++    const int64_t cycleNs = m_longCycle.GetNanoSeconds();
++    NS_ABORT_MSG_IF(cycleNs <= 0, "DRX long cycle must be positive");
++    int64_t phaseNs = (time - m_startTime).GetNanoSeconds() % cycleNs;
++    if (phaseNs < 0)
++    {
++        phaseNs += cycleNs;
++    }
++    const bool inOnDuration = phaseNs < m_onDuration.GetNanoSeconds();
++    const bool inInactivity = m_inactivityRunning && time < m_inactivityEndTime;
++    return inOnDuration || inInactivity;
++}
++
+ void
+ NrUeDrxModel::StartCycle()
+ {
+@@ -185,6 +236,7 @@ NrUeDrxModel::NotifyDataActivity()
+     NS_LOG_FUNCTION(this);
+     // (Re)start the inactivity timer; this keeps the UE awake past onDuration.
+     m_inactivityRunning = true;
++    m_inactivityEndTime = Simulator::Now() + m_inactivityTimer;
+     m_inactivityEvent.Cancel();
+     m_inactivityEvent =
+         Simulator::Schedule(m_inactivityTimer, &NrUeDrxModel::InactivityExpired, this);
+@@ -195,6 +247,7 @@ NrUeDrxModel::InactivityExpired()
+ {
+     NS_LOG_FUNCTION(this);
+     m_inactivityRunning = false;
++    m_inactivityEndTime = Seconds(0);
+     if (!m_onDurationRunning)
+     {
+         GoToSleep();
+diff --git a/model/nr-ue-drx-model.h b/model/nr-ue-drx-model.h
+index 4e1bd69e..18e12ce7 100644
+--- a/model/nr-ue-drx-model.h
++++ b/model/nr-ue-drx-model.h
+@@ -26,12 +26,12 @@ class NrUeEnergyModel;
+  * @ingroup nr
+  * @brief Connected-mode DRX power model that drives the UE energy state machine.
+  *
+- * 5G-LENA has no MAC C-DRX engine, so for TR 38.840 power-saving evaluation
+- * this class runs the DRX timers (onDuration, inactivity, long cycle) on the
+- * ns-3 scheduler and toggles the attached NrUeEnergyModel between active
+- * monitoring (PDCCH-only) and sleep (light / deep) accordingly. It is a power
+- * model for energy evaluation, not a protocol-accurate MAC DRX: it does not
+- * gate the scheduler, it only decides the UE power state over time.
++ * 5G-LENA has no native MAC C-DRX engine, so for TR 38.840 power-saving
++ * evaluation this class owns the DRX timers (onDuration, inactivity, long
++ * cycle) and exposes their shared Active Time. The scenario can query that
++ * timeline from the gNB scheduler while this class drives the attached
++ * NrUeEnergyModel between active monitoring and sleep. It remains a system-
++ * level abstraction rather than a protocol-accurate RRC/DCI implementation.
+  *
+  * Behaviour (TS 38.321 semantics):
+  *   - Each long cycle the onDuration starts: UE wakes to PDCCH-only monitoring.
+@@ -75,6 +75,18 @@ class NrUeDrxModel : public Object
+      */
+     void Start(Time startAt);
+ 
++    /**
++     * @brief Get the configured offset of the first DRX cycle.
++     * @return Offset relative to the time at which the model is installed.
++     */
++    Time GetStartOffset() const;
++
++    /**
++     * @brief Get the configured DRX inactivity timer.
++     * @return Time for which data activity extends DRX Active Time.
++     */
++    Time GetInactivityTimer() const;
++
+     /**
+      * @brief Notify the model that data was sent/received for this UE.
+      *
+@@ -83,6 +95,18 @@ class NrUeDrxModel : public Object
+      */
+     void NotifyDataActivity();
+ 
++    /**
++     * @brief Check whether the UE is in DRX Active Time at an absolute time.
++     *
++     * Active Time is true while the periodic onDuration or the inactivity
++     * timer is running. This query is shared by the scheduler, PHY listener,
++     * and energy state machine so they use one DRX timeline.
++     *
++     * @param time Absolute simulation time to check
++     * @return true when the UE must monitor PDCCH and may receive DL scheduling
++     */
++    bool IsActiveAt(Time time) const;
++
+     /**
+      * @brief Frequency range selector (TR 38.840 Section 8.2), used to pick the
+      * FR-appropriate onDuration for a named reference configuration.
+@@ -147,10 +171,14 @@ class NrUeDrxModel : public Object
+     Time m_longCycle;           //!< DRX long cycle period
+     Time m_onDuration;          //!< onDuration window length
+     Time m_inactivityTimer;     //!< drx-InactivityTimer length
++    Time m_startOffset;         //!< Offset of the first onDuration from installation
+     Time m_deepSleepThreshold;  //!< Gap >= this -> deep sleep (TR 38.840 Table 19: 20 ms)
+     Time m_lightSleepThreshold; //!< Gap >= this -> light sleep, else micro sleep
+ 
+     Time m_nextCycleTime;     //!< Absolute time of the next onDuration start
++    Time m_startTime;         //!< Absolute start of the first DRX cycle
++    Time m_inactivityEndTime; //!< Absolute expiry of the inactivity timer
++    bool m_started;           //!< True after Start() configured the timeline
+     bool m_inactivityRunning; //!< True while the inactivity timer is armed
+     bool m_onDurationRunning; //!< True while the onDuration window is open
+ 
+diff --git a/model/nr-ue-phy-energy-listener.cc b/model/nr-ue-phy-energy-listener.cc
+index ead62389..83090000 100644
+--- a/model/nr-ue-phy-energy-listener.cc
++++ b/model/nr-ue-phy-energy-listener.cc
+@@ -159,6 +159,8 @@ NrUePhyEnergyListener::DlTbReceivedFromPhy(Ptr<NrUePhy> phy,
+     {
+         return;
+     }
++    NS_ABORT_MSG_IF(m_drx && !m_drx->IsActiveAt(Simulator::Now()),
++                    "Downlink TB reached a UE outside its C-DRX Active Time");
+     if (m_model->GetCurrentState() == NR_UE_DEEP_SLEEP)
+     {
+         m_model->TriggerSetupTransition();
+@@ -207,6 +209,10 @@ NrUePhyEnergyListener::UlTbSentFromPhy(Ptr<NrUePhy> phy,
+     {
+         return;
+     }
++    if (m_model->GetCurrentState() == NR_UE_DEEP_SLEEP)
++    {
++        m_model->TriggerSetupTransition();
++    }
+     RefreshBwpScaling(phy);
+     if (phy)
+     {
+@@ -235,7 +241,10 @@ NrUePhyEnergyListener::ReturnToMonitoring()
+     {
+         return;
+     }
+-    m_model->ChangeState(NR_UE_PDCCH_ONLY);
++    if (!m_drx || m_drx->IsActiveAt(Simulator::Now()))
++    {
++        m_model->ChangeState(NR_UE_PDCCH_ONLY);
++    }
+ }
+ 
+ } // namespace ns3
+-- 
+2.43.0
+
