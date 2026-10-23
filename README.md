@@ -2,6 +2,52 @@
 
 This repository contains an advanced **5G-Advanced discrete-event network simulation framework** built on top of **ns-3 (5G-LENA `nr` module)**. It implements a **Joint Time-Frequency 2D Alignment Architecture**, coordinating Base Station **Cell-DTX**, User Equipment **C-DRX**, and DCI-based **Dynamic Bandwidth Part (BWP) Switching (20 MHz ↔ 100 MHz)**.
 
+> The reproducible setup below is the current slot-start eligibility
+> environment. The older result tables and the historical 9-experiment
+> commands further down are retained for reference.
+
+## Rebuild the current environment from GitHub
+
+The outer repository intentionally does not vendor `contrib/nr`; that module
+is a separate Git repository. From a clean machine:
+
+```bash
+git clone --branch true-bwp-dci-v6 \
+  https://github.com/suecc0707/5g-advanced-cdrx-bwp-ns3.git ns-3-dev
+cd ns-3-dev
+
+# Fetch the ns-3 NR module used by this experiment.
+git clone https://gitlab.com/cttc-lena/nr.git contrib/nr
+cd contrib/nr
+git checkout 9b830f9adfc28bb559f4eaa5fc22fd4518e1cdfa
+cd ../..
+
+# Reconstruct the energy/BWP history, then apply slot-start eligibility.
+cd contrib/nr
+git am ../../experiment_archive/official_energy_v5_2026-10-19/000*.patch
+git am ../../experiment_archive/true_bwp_dci_v6_2026-10-19/000*.patch
+git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0001-*.patch
+cd ../..
+
+# Configure and build ns-3 (CMake-based ns-3.48 environment).
+./ns3 configure --enable-examples --enable-tests
+./ns3 build
+```
+
+The final patch implements **slot-start** Cell-DTX and per-UE C-DRX
+eligibility. It deliberately does not implement the deferred full-slot or
+two-slot guard. The scenario must install the callback described in
+`experiment_archive/slot_start_eligibility_2026-10-23/README.md`.
+
+To run the main scenario after building:
+
+```bash
+./ns3 run joint-energy-mvp
+```
+
+The exact scenario arguments and experiment matrices are kept in the relevant
+`experiment_archive/` run scripts.
+
 ---
 
 ## 🌟 Key Features
