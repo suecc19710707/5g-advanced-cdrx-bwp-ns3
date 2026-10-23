@@ -11,6 +11,44 @@ This repository contains an advanced **5G-Advanced discrete-event network simula
 The outer repository intentionally does not vendor `contrib/nr`; that module
 is a separate Git repository. From a clean machine:
 
+### System prerequisites (Ubuntu/Debian)
+
+The repository contains the ns-3 source tree and research scenario, but the
+compiler/toolchain and system libraries must already be installed. This is the
+one-time setup; it is **not** a second installation of ns-3 or 5G-LENA.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake ninja-build ccache git pkg-config \
+  python3 python3-pip python3-venv \
+  libc6-dev sqlite3 libsqlite3-dev libeigen3-dev
+```
+
+The C++ toolchain, CMake/Ninja, and Git are required for every run. SQLite and
+Eigen3 enable the NR module features used by the 5G-LENA build. Python is only
+needed for the batch-search, plotting, and analysis scripts; the C++ scenario
+itself does not require a Python virtual environment.
+
+For the optional analysis scripts, install the common Python packages in a
+virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install numpy pandas matplotlib
+```
+
+Verify the basic tools before cloning the NR module:
+
+```bash
+git --version
+cmake --version
+python3 --version
+g++ --version
+```
+
 ```bash
 git clone --branch true-bwp-dci-v6 \
   https://github.com/suecc0707/5g-advanced-cdrx-bwp-ns3.git ns-3-dev
