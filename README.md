@@ -29,6 +29,7 @@ git am ../../experiment_archive/true_bwp_dci_v6_2026-10-19/000*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0001-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0002-*.patch
 cd ../..
+git apply experiment_archive/slot_start_eligibility_2026-10-23/0003-*.patch
 
 # Configure and build ns-3 (CMake-based ns-3.48 environment).
 ./ns3 configure --enable-examples --enable-tests
@@ -38,8 +39,7 @@ cd ../..
 The final patches implement **grant-span-aware** Cell-DTX and per-UE C-DRX
 eligibility. The scheduler checks the actual DCI symbol interval before
 assigning RLC bytes; it deliberately does not implement a fixed two-slot guard.
-The scenario must install the callback described in
-`experiment_archive/slot_start_eligibility_2026-10-23/README.md`.
+Patch `0003` installs the matching scenario-side callback wiring.
 
 To run the main scenario after building:
 
