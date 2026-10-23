@@ -13,14 +13,16 @@ import pandas as pd
 import torch
 
 from train_drl_agent import PPOAgent
-from ns3_environment import OBSERVATION_DIM, Ns3MultiUserEnv
+from ns3_environment import ACTION_ENCODING, OBSERVATION_DIM, Ns3MultiUserEnv
 
 def evaluate_deterministic_policy(
     model_path="ppo_5g_joint2d_model.pt",
     ns3_path="./ns3",
     num_seeds=10,
+    seeds=None,
     num_ues=10,
     udp_rate=2.0,
+    offered_rate_max_mbps=None,
     enable_burst_traffic=False,
     synchronize_burst_traffic=False,
     udp_burst_rate=3.0,
@@ -33,6 +35,7 @@ def evaluate_deterministic_policy(
     gnb_energy_antenna_ratio=0.4,
     gnb_energy_power_unit_w=1.0,
     ue_energy_power_unit_mw=1.0,
+    enable_true_bwp=True,
     steps_per_ep=250,
     qos_target_ms=30.0,
     warmup_ms=200.0,
@@ -41,6 +44,7 @@ def evaluate_deterministic_policy(
     enable_mock=False,
     csv_out="deterministic_evaluation_results.csv",
     ns3_csv_out="multi_user_rl_step.csv",
+    step_csv_out=None,
 ):
     print("=" * 110)
     print("🎯 開始執行 5G-Advanced Joint 2D DRL 模型固定策略 (Deterministic Evaluation) 跨種子評估...")
@@ -62,6 +66,7 @@ def evaluate_deterministic_policy(
         ns3_path=ns3_path,
         num_ues=num_ues,
         udp_rate=udp_rate,
+        offered_rate_max_mbps=offered_rate_max_mbps,
         enable_burst_traffic=enable_burst_traffic,
         synchronize_burst_traffic=synchronize_burst_traffic,
         udp_burst_rate=udp_burst_rate,
@@ -74,6 +79,7 @@ def evaluate_deterministic_policy(
         gnb_energy_antenna_ratio=gnb_energy_antenna_ratio,
         gnb_energy_power_unit_w=gnb_energy_power_unit_w,
         ue_energy_power_unit_mw=ue_energy_power_unit_mw,
+        enable_true_bwp=enable_true_bwp,
         sim_time=episode_sim_time,
         enable_mock=enable_mock,
         csv_filename=ns3_csv_out,
@@ -84,19 +90,39 @@ def evaluate_deterministic_policy(
     )
     env.max_steps = steps_per_ep
 
-    agent = PPOAgent(state_dim=OBSERVATION_DIM, action_dim=10, hidden_dim=64)
+    agent = PPOAgent(
+        state_dim=OBSERVATION_DIM,
+        action_dim=env.action_space.n,
+        hidden_dim=64,
+    )
     
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"model weights not found: {model_path}")
     try:
-        agent.policy.load_state_dict(torch.load(model_path, map_location=agent.device))
+        loaded_model = torch.load(model_path, map_location=agent.device)
+        checkpoint_episode = None
+        if (
+            isinstance(loaded_model, dict)
+            and "policy_state_dict" in loaded_model
+        ):
+            checkpoint_episode = loaded_model.get("episode")
+            loaded_model = loaded_model["policy_state_dict"]
+        agent.policy.load_state_dict(loaded_model)
     except RuntimeError as exc:
         raise RuntimeError(
             f"model {model_path!r} is incompatible with the current "
-            f"{OBSERVATION_DIM}D observation space; retrain the policy"
+            f"{OBSERVATION_DIM}D observation/{env.action_space.n}-action "
+            f"{ACTION_ENCODING} space; retrain the policy"
         ) from exc
     agent.policy.eval()
     print(f"✅ 成功載入模型權重: {model_path}")
+    if checkpoint_episode is not None:
+        print(f"📍 Checkpoint episode: {checkpoint_episode}")
+    print(f"🎛️ Action: {ACTION_ENCODING} ({env.action_space.n} actions)")
+    print(
+        f"👁️ Offered-load observation normalization: "
+        f"0–{env.OFFERED_RATE_MAX_MBPS:g} Mbps total"
+    )
     print(
         f"🎯 SLA={qos_target_ms:.1f}ms | Active Window=10–{max_active_ms:.0f}ms "
         f"(initial {initial_active_ms:.0f}ms) | "
@@ -104,7 +130,8 @@ def evaluate_deterministic_policy(
     )
 
     eval_results = []
-    seeds = [101 + i for i in range(num_seeds)]
+    step_records = []
+    seeds = list(seeds) if seeds is not None else [101 + i for i in range(num_seeds)]
     load_threshold_mbps = num_ues * (udp_rate + 0.5 * udp_burst_rate)
 
     print(f"{'Seed':<6} | {'Episode Reward':<16} | {'Avg P99 Latency (ms)':<22} | {'Avg gNB Power (W)':<18} | {'Avg UE Power (mW)':<18} | {'SLA Violation Rate':<20}")
@@ -114,7 +141,7 @@ def evaluate_deterministic_policy(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        obs, _ = env.reset(seed=seed)
+        obs, reset_info = env.reset(seed=seed)
         
         ep_reward = 0.0
         p99_latencies = []
@@ -131,6 +158,8 @@ def evaluate_deterministic_policy(
         active_windows = []
         bwp_states = []
         wide_bwp_steps = 0
+        bwp_switch_count = 0
+        previous_bwp_state = int(reset_info.get("bwp_state", 0))
         sla_violations = 0
 
         for step in range(steps_per_ep):
@@ -140,6 +169,29 @@ def evaluate_deterministic_policy(
                 action = torch.argmax(logits, dim=-1).item()
 
             next_obs, reward, terminated, truncated, info = env.step(action)
+
+            step_records.append({
+                "Controller": "ppo",
+                "ControllerLabel": "PPO (deterministic)",
+                "Seed": seed,
+                "Step": step + 1,
+                "SimTimeSec": warmup_ms / 1000.0 + (step + 1) * 0.040,
+                "ControlElapsedSec": (step + 1) * 0.040,
+                "UdpRateMbpsPerUe": udp_rate,
+                "NominalOfferedRateMbps": num_ues * udp_rate,
+                "OfferedRateMbps": info.get("offered_rate_mbps", 0.0),
+                "DeliveredRateMbps": info.get("delivered_rate_mbps", 0.0),
+                "RlcBacklogBytes": info.get("backlog_bytes", 0.0),
+                "MaxUeBacklogBytes": info.get("max_ue_backlog_bytes", 0.0),
+                "P99LatencyMs": info.get("p99_latency_ms", 0.0),
+                "ActiveWindowMs": info.get("w_active_ms", 0.0),
+                "CurrentBwpMHz": (
+                    100 if int(info.get("bwp_state", 0)) == 1 else 20
+                ),
+                "GnbPowerW": info.get("gnb_power_w", 0.0),
+                "UePowerMw": info.get("ue_power_mw", 0.0),
+                "Action": action,
+            })
 
             ep_reward += reward
             p99_latencies.append(info.get("p99_latency_ms", 0.0))
@@ -156,6 +208,9 @@ def evaluate_deterministic_policy(
             active_windows.append(info.get("w_active_ms", 0.0))
             bwp_states.append(int(info.get("bwp_state", 0)))
             wide_bwp_steps += int(info.get("bwp_state", 0) == 1)
+            if int(info.get("bwp_state", 0)) != previous_bwp_state:
+                bwp_switch_count += 1
+            previous_bwp_state = int(info.get("bwp_state", 0))
 
             if info.get("p99_latency_ms", 0.0) > qos_target_ms:
                 sla_violations += 1
@@ -186,6 +241,13 @@ def evaluate_deterministic_policy(
         ue_control_energy_j_all_ues = float(
             np.sum(ue_powers) / 1000.0 * control_interval_sec * num_ues
         )
+        total_network_energy_j = (
+            gnb_control_energy_j + ue_control_energy_j_all_ues
+        )
+        network_energy_efficiency = (
+            total_delivered_mbits / total_network_energy_j
+            if total_network_energy_j > 0.0 else np.nan
+        )
         offered_array = np.asarray(offered_rates)
         active_array = np.asarray(active_windows)
         bwp_array = np.asarray(bwp_states)
@@ -210,6 +272,8 @@ def evaluate_deterministic_policy(
             "GnbEnergyEfficiencyMbitPerJ": gnb_energy_efficiency,
             "GnbEnergyKwhPerTb": gnb_energy_kwh_per_tb,
             "UeControlEnergyJAllUes": ue_control_energy_j_all_ues,
+            "TotalNetworkEnergyJ": total_network_energy_j,
+            "NetworkEnergyEfficiencyMbitPerJ": network_energy_efficiency,
             "MinOfferedRateMbps": np.min(offered_array),
             "MaxOfferedRateMbps": np.max(offered_array),
             "StdOfferedRateMbps": np.std(offered_array),
@@ -220,6 +284,7 @@ def evaluate_deterministic_policy(
             "FinalBacklogBytes": final_backlog,
             "AvgActiveWindowMs": avg_active_window,
             "WideBwpRatePct": wide_bwp_rate,
+            "BwpSwitchCount": bwp_switch_count,
             "LowLoadThresholdMbps": load_threshold_mbps,
             "LowLoadWideBwpRatePct": 100.0 * conditional_mean(bwp_array, low_load),
             "HighLoadWideBwpRatePct": 100.0 * conditional_mean(bwp_array, high_load),
@@ -229,7 +294,10 @@ def evaluate_deterministic_policy(
             "SLA_Violation_Rate_Pct": sla_viol_rate,
             "SLA_Compliance_Rate_Pct": 100.0 - sla_viol_rate,
             "EnergyModel": "5G-LENA-TR38.864-TR38.840",
-            "FrequencyControlMode": "PRB-profile-on-single-physical-BWP",
+            "FrequencyControlMode": (
+                "physical-20-100-MHz-BWP"
+                if enable_true_bwp else "legacy-PRB-profile"
+            ),
             "PhysicalBandwidthMHz": 100,
             "GnbEnergyBsCategory": gnb_energy_bs_category,
             "GnbEnergyRefConfig": gnb_energy_ref_config,
@@ -243,6 +311,10 @@ def evaluate_deterministic_policy(
 
     df_eval = pd.DataFrame(eval_results)
     df_eval.to_csv(csv_out, index=False)
+    if step_csv_out is not None:
+        step_csv_out = os.path.abspath(step_csv_out)
+        os.makedirs(os.path.dirname(step_csv_out), exist_ok=True)
+        pd.DataFrame(step_records).to_csv(step_csv_out, index=False)
 
     print("-" * 110)
     print("\n📊 固定策略評估統計總結 (Deterministic Evaluation Summary):")
@@ -255,8 +327,12 @@ def evaluate_deterministic_policy(
     print(f"  • 平均 RLC backlog (bytes)   : {df_eval['AvgBacklogBytes'].mean():.1f}")
     print(f"  • 平均 Active Window (ms)    : {df_eval['AvgActiveWindowMs'].mean():.2f}")
     print(f"  • 平均 Wide-BWP 使用率 (%)   : {df_eval['WideBwpRatePct'].mean():.1f}%")
+    print(f"  • 平均 BWP 切換次數          : {df_eval['BwpSwitchCount'].mean():.1f}")
+    print(f"  • 整體網路能源效率 (Mbit/J) : {df_eval['NetworkEnergyEfficiencyMbitPerJ'].mean():.4f}")
     print(f"  • 平均 {qos_target_ms:g}ms SLA 違規率 (%) : {df_eval['SLA_Violation_Rate_Pct'].mean():.1f}%")
     print(f"\n💾 評估結果數據已匯出至: {csv_out}\n")
+    if step_csv_out is not None:
+        print(f"🔬 每 40ms 評估時序已匯出至: {step_csv_out}\n")
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -265,8 +341,21 @@ def parse_args():
     parser.add_argument("--model-path", default="ppo_5g_joint2d_model.pt")
     parser.add_argument("--ns3-path", default="./ns3")
     parser.add_argument("--num-seeds", type=int, default=10)
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="explicit evaluation seeds; overrides --num-seeds",
+    )
     parser.add_argument("--num-ues", type=int, default=10)
     parser.add_argument("--udp-rate", type=float, default=2.0)
+    parser.add_argument(
+        "--offered-rate-max-mbps",
+        type=float,
+        default=None,
+        help="fixed total-Mbps normalization used by the trained policy",
+    )
     parser.add_argument("--enable-burst-traffic", action="store_true")
     parser.add_argument("--synchronize-burst-traffic", action="store_true")
     parser.add_argument("--udp-burst-rate", type=float, default=3.0)
@@ -279,6 +368,12 @@ def parse_args():
     parser.add_argument("--gnb-energy-antenna-ratio", type=float, default=0.4)
     parser.add_argument("--gnb-energy-power-unit-w", type=float, default=1.0)
     parser.add_argument("--ue-energy-power-unit-mw", type=float, default=1.0)
+    parser.add_argument(
+        "--true-bwp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use physical 20/100 MHz BWPs (default)",
+    )
     parser.add_argument("--steps-per-ep", type=int, default=250)
     parser.add_argument("--qos-target-ms", type=float, default=30.0)
     parser.add_argument("--warmup-ms", type=float, default=200.0)
@@ -286,15 +381,27 @@ def parse_args():
     parser.add_argument("--initial-active-ms", type=float, default=30.0)
     parser.add_argument("--csv-out", default="deterministic_evaluation_results.csv")
     parser.add_argument("--ns3-csv-out", default="multi_user_rl_step.csv")
+    parser.add_argument(
+        "--step-csv-out",
+        default=None,
+        help="optional per-40ms deterministic evaluation timeline CSV",
+    )
     parser.add_argument("--enable-mock", action="store_true")
     args = parser.parse_args()
 
     if args.num_seeds <= 0:
         parser.error("--num-seeds must be greater than zero")
+    if args.seeds is not None and len(set(args.seeds)) != len(args.seeds):
+        parser.error("--seeds must not contain duplicates")
     if args.num_ues <= 0:
         parser.error("--num-ues must be greater than zero")
     if args.udp_rate <= 0:
         parser.error("--udp-rate must be greater than zero")
+    if (
+        args.offered_rate_max_mbps is not None
+        and args.offered_rate_max_mbps <= 0.0
+    ):
+        parser.error("--offered-rate-max-mbps must be greater than zero")
     if args.enable_burst_traffic and args.udp_burst_rate <= 0:
         parser.error("--udp-burst-rate must be greater than zero")
     if args.enable_burst_traffic and (
@@ -325,8 +432,10 @@ if __name__ == "__main__":
         model_path=cli_args.model_path,
         ns3_path=cli_args.ns3_path,
         num_seeds=cli_args.num_seeds,
+        seeds=cli_args.seeds,
         num_ues=cli_args.num_ues,
         udp_rate=cli_args.udp_rate,
+        offered_rate_max_mbps=cli_args.offered_rate_max_mbps,
         enable_burst_traffic=cli_args.enable_burst_traffic,
         synchronize_burst_traffic=cli_args.synchronize_burst_traffic,
         udp_burst_rate=cli_args.udp_burst_rate,
@@ -339,6 +448,7 @@ if __name__ == "__main__":
         gnb_energy_antenna_ratio=cli_args.gnb_energy_antenna_ratio,
         gnb_energy_power_unit_w=cli_args.gnb_energy_power_unit_w,
         ue_energy_power_unit_mw=cli_args.ue_energy_power_unit_mw,
+        enable_true_bwp=cli_args.true_bwp,
         steps_per_ep=cli_args.steps_per_ep,
         qos_target_ms=cli_args.qos_target_ms,
         warmup_ms=cli_args.warmup_ms,
@@ -347,4 +457,5 @@ if __name__ == "__main__":
         enable_mock=cli_args.enable_mock,
         csv_out=cli_args.csv_out,
         ns3_csv_out=cli_args.ns3_csv_out,
+        step_csv_out=cli_args.step_csv_out,
     )

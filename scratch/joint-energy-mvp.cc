@@ -18,6 +18,7 @@
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
+#include <map>
 #include <cmath>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -25,6 +26,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <sstream>
 
 using namespace ns3;
 
@@ -395,8 +397,9 @@ private:
 class PacketDelayTracker
 {
 public:
-    PacketDelayTracker()
-        : m_totalTxBytes(0),
+    explicit PacketDelayTracker(uint32_t numUes)
+        : m_delaysMsPerUe(numUes),
+          m_totalTxBytes(0),
           m_totalRxBytes(0),
           m_totalDropBytes(0)
     {}
@@ -410,8 +413,12 @@ public:
         m_windowTxBytes += payloadBytes;
     }
 
-    void RecordRx(Ptr<const Packet> packet, const Address& from, const Address& to)
+    void RecordRxForUe(uint32_t ueId,
+                       Ptr<const Packet> packet,
+                       const Address& from,
+                       const Address& to)
     {
+        NS_ABORT_MSG_IF(ueId >= m_delaysMsPerUe.size(), "RX trace has an invalid UE index");
         uint64_t uid = packet->GetUid();
         auto it = m_txInfo.find(uid);
         if (it != m_txInfo.end())
@@ -420,6 +427,7 @@ public:
             Time delay = Simulator::Now() - sendTime;
             double rawDelayMs = delay.GetSeconds() * 1000.0;
             m_delaysMs.push_back(rawDelayMs);
+            m_delaysMsPerUe[ueId].push_back(rawDelayMs);
             m_windowDelaysMs.push_back(rawDelayMs);
             m_pendingBytes = m_pendingBytes >= it->second.second
                                  ? m_pendingBytes - it->second.second
@@ -443,6 +451,38 @@ public:
         }
     }
 
+    void RecordDropWithContext(std::string context, Ptr<const Packet> packet)
+    {
+        RecordDrop(packet);
+        const std::string ueMarker = "/UeMap/";
+        const std::string bearerMarker = "/DataRadioBearerMap/";
+        const size_t uePos = context.find(ueMarker);
+        const size_t bearerPos = context.find(bearerMarker);
+        if (uePos == std::string::npos || bearerPos == std::string::npos)
+        {
+            return;
+        }
+        const size_t ueBegin = uePos + ueMarker.size();
+        const size_t ueEnd = context.find('/', ueBegin);
+        const size_t lcidBegin = bearerPos + bearerMarker.size();
+        const size_t lcidEnd = context.find('/', lcidBegin);
+        if (ueEnd == std::string::npos || lcidEnd == std::string::npos)
+        {
+            return;
+        }
+        const uint16_t rnti = static_cast<uint16_t>(std::stoul(context.substr(ueBegin, ueEnd - ueBegin)));
+        const uint8_t lcid = static_cast<uint8_t>(std::stoul(context.substr(lcidBegin, lcidEnd - lcidBegin)));
+        auto& counters = m_dropByBearer[{rnti, lcid}];
+        counters.first++;
+        counters.second += packet->GetSize();
+    }
+
+    const std::map<std::pair<uint16_t, uint8_t>, std::pair<uint64_t, uint64_t>>&
+    GetDropByBearer() const
+    {
+        return m_dropByBearer;
+    }
+
     uint64_t GetPendingBytes() const
     {
         return m_pendingBytes;
@@ -458,14 +498,24 @@ public:
         return m_totalRxBytes;
     }
 
+    uint64_t GetTotalDropBytes() const
+    {
+        return m_totalDropBytes;
+    }
+
     double GetP99Latency() const
     {
-        return CalculateP99(m_delaysMs);
+        return CalculatePercentile(m_delaysMs, 0.99);
+    }
+
+    double GetLatencyPercentile(double percentile) const
+    {
+        return CalculatePercentile(m_delaysMs, percentile);
     }
 
     double GetWindowP99Latency() const
     {
-        return CalculateP99(m_windowDelaysMs);
+        return CalculatePercentile(m_windowDelaysMs, 0.99);
     }
 
     void ResetWindowStats()
@@ -493,28 +543,67 @@ public:
 
     double GetQosSatisfactionRate(double targetDelayMs = 20.0) const
     {
-        if (m_delaysMs.empty()) return 0.0;
-        uint64_t count = 0;
-        for (double d : m_delaysMs)
+        return CalculateQosSatisfactionRate(m_delaysMs, targetDelayMs);
+    }
+
+    std::string GetPerUeLatencyPercentile(double percentile) const
+    {
+        std::ostringstream values;
+        values << std::fixed << std::setprecision(4);
+        for (uint32_t ueId = 0; ueId < m_delaysMsPerUe.size(); ++ueId)
         {
-            if (d <= targetDelayMs) count++;
+            if (ueId > 0)
+            {
+                values << ";";
+            }
+            values << CalculatePercentile(m_delaysMsPerUe[ueId], percentile);
         }
-        return (static_cast<double>(count) / m_delaysMs.size()) * 100.0;
+        return values.str();
+    }
+
+    std::string GetPerUeQosSatisfactionRate(double targetDelayMs) const
+    {
+        std::ostringstream values;
+        values << std::fixed << std::setprecision(4);
+        for (uint32_t ueId = 0; ueId < m_delaysMsPerUe.size(); ++ueId)
+        {
+            if (ueId > 0)
+            {
+                values << ";";
+            }
+            values << CalculateQosSatisfactionRate(m_delaysMsPerUe[ueId], targetDelayMs);
+        }
+        return values.str();
     }
 
 private:
-    static double CalculateP99(const std::vector<double>& delaysMs)
+    static double CalculateQosSatisfactionRate(const std::vector<double>& delaysMs,
+                                               double targetDelayMs)
     {
         if (delaysMs.empty()) return 0.0;
+        uint64_t count = 0;
+        for (double d : delaysMs)
+        {
+            if (d <= targetDelayMs) count++;
+        }
+        return (static_cast<double>(count) / delaysMs.size()) * 100.0;
+    }
+
+    static double CalculatePercentile(const std::vector<double>& delaysMs, double percentile)
+    {
+        if (delaysMs.empty()) return 0.0;
+        NS_ABORT_MSG_IF(percentile < 0.0 || percentile > 1.0,
+                        "Delay percentile must be inside [0, 1]");
         std::vector<double> sortedDelays = delaysMs;
         std::sort(sortedDelays.begin(), sortedDelays.end());
-        size_t idxP99 = static_cast<size_t>(0.99 * sortedDelays.size());
-        if (idxP99 >= sortedDelays.size()) idxP99 = sortedDelays.size() - 1;
-        return sortedDelays[idxP99];
+        size_t index = static_cast<size_t>(percentile * sortedDelays.size());
+        if (index >= sortedDelays.size()) index = sortedDelays.size() - 1;
+        return sortedDelays[index];
     }
 
     std::unordered_map<uint64_t, std::pair<Time, uint32_t>> m_txInfo;
     std::vector<double> m_delaysMs;
+    std::vector<std::vector<double>> m_delaysMsPerUe;
     std::vector<double> m_windowDelaysMs;
     uint64_t m_pendingBytes{0};
     uint64_t m_windowTxBytes{0};
@@ -522,7 +611,18 @@ private:
     uint64_t m_totalTxBytes;
     uint64_t m_totalRxBytes;
     uint64_t m_totalDropBytes;
+    std::map<std::pair<uint16_t, uint8_t>, std::pair<uint64_t, uint64_t>> m_dropByBearer;
 };
+
+void
+RecordRxForUeTrace(PacketDelayTracker* tracker,
+                   uint32_t ueId,
+                   Ptr<const Packet> packet,
+                   const Address& from,
+                   const Address& to)
+{
+    tracker->RecordRxForUe(ueId, packet, from, to);
+}
 
 class RadioResourceController
 {
@@ -550,10 +650,17 @@ public:
         Simulator::ScheduleNow(&RadioResourceController::BeginCycle, this);
     }
 
+    void SetGnbEnergyModel(Ptr<NrGnbEnergyModel> energyModel)
+    {
+        NS_ABORT_MSG_IF(!energyModel, "Cell-DTX requires an NrGnbEnergyModel");
+        m_gnbEnergyModel = energyModel;
+    }
+
     void UpdateState(double activeWindowMs, BwpState bwp)
     {
         m_activeWindowMs = std::max(0.0, std::min(m_periodMs, activeWindowMs));
         m_bwp = bwp;
+        ConfigureSchedulerEligibility();
     }
 
     void ConfigurePhysicalBwpResources(
@@ -569,6 +676,7 @@ public:
         }
         m_physicalBwpSchedulers = schedulers;
         m_physicalBwpPhys = phys;
+        ConfigureSchedulerEligibility();
     }
 
     uint64_t GetDlRlcBacklogBytes() const
@@ -579,6 +687,43 @@ public:
     NrMacSchedulerNs3::DlObservationStats GetDlObservationStats() const
     {
         return GetActiveScheduler()->GetDlObservationStats();
+    }
+
+    std::pair<double, double> GetDlQueueOccupancyRatios() const
+    {
+        constexpr double kRlcBearerCapacityBytes = 10.0 * 1024.0;
+        double totalUsedBytes = 0.0;
+        double maxBearerRatio = 0.0;
+        for (const auto& stats : GetActiveScheduler()->GetDlBearerBufferStats())
+        {
+            const double usedBytes = static_cast<double>(stats.txQueueBytes) +
+                                     static_cast<double>(stats.retxQueueBytes) +
+                                     static_cast<double>(stats.statusPduBytes);
+            totalUsedBytes += usedBytes;
+            maxBearerRatio = std::max(maxBearerRatio, usedBytes / kRlcBearerCapacityBytes);
+        }
+        const double totalCapacityBytes =
+            static_cast<double>(GetActiveScheduler()->GetDlBearerCount()) *
+            kRlcBearerCapacityBytes;
+        const double totalRatio = totalCapacityBytes > 0.0
+                                      ? totalUsedBytes / totalCapacityBytes
+                                      : 0.0;
+        return {totalRatio, maxBearerRatio};
+    }
+
+    bool IsCellActiveAt(Time time) const
+    {
+        if (!m_enableGating || m_activeWindowMs >= m_periodMs)
+        {
+            return true;
+        }
+        const int64_t periodNs = MilliSeconds(m_periodMs).GetNanoSeconds();
+        int64_t phaseNs = time.GetNanoSeconds() % periodNs;
+        if (phaseNs < 0)
+        {
+            phaseNs += periodNs;
+        }
+        return phaseNs < MilliSeconds(m_activeWindowMs).GetNanoSeconds();
     }
 
 private:
@@ -597,16 +742,10 @@ private:
     void BeginCycle()
     {
         ApplyBwpMask();
-        if (m_physicalBwpSchedulers.empty())
+        ConfigureSchedulerEligibility();
+        if (m_gnbEnergyModel)
         {
-            m_scheduler->SetDlDataSchedulingEnabled(true);
-        }
-        else
-        {
-            for (const auto& scheduler : m_physicalBwpSchedulers)
-            {
-                scheduler->SetDlDataSchedulingEnabled(true);
-            }
+            m_gnbEnergyModel->ChangeState(static_cast<int>(NrGnbPowerState::MicroSleep));
         }
         if (m_enableGating && m_activeWindowMs < m_periodMs)
         {
@@ -621,16 +760,51 @@ private:
 
     void EndActiveWindow()
     {
+        if (!m_gnbEnergyModel)
+        {
+            return;
+        }
+        const Time idleDuration = MilliSeconds(m_periodMs - m_activeWindowMs);
+        const NrGnbPowerState sleepState = m_gnbEnergyModel->SelectSleepState(idleDuration);
+        m_gnbEnergyModel->ChangeState(static_cast<int>(sleepState));
+    }
+
+    void ConfigureSchedulerEligibility()
+    {
+        const Time period = MilliSeconds(m_periodMs);
+        const Time activeWindow = MilliSeconds(m_activeWindowMs);
+        auto configure = [&](const Ptr<NrMacSchedulerNs3>& scheduler) {
+            scheduler->SetDlDataSchedulingEnabled(true);
+            if (m_enableGating)
+            {
+                scheduler->ConfigureCellDtx(period, activeWindow);
+            }
+            else
+            {
+                scheduler->DisableCellDtx();
+            }
+        };
+        auto configurePhy = [&](const Ptr<NrGnbPhy>& phy) {
+            if (m_enableGating)
+            {
+                phy->ConfigureCellDtx(period, activeWindow);
+            }
+            else
+            {
+                phy->DisableCellDtx();
+            }
+        };
+
         if (m_physicalBwpSchedulers.empty())
         {
-            m_scheduler->SetDlDataSchedulingEnabled(false);
+            configure(m_scheduler);
+            configurePhy(m_gnbPhy);
+            return;
         }
-        else
+        for (uint32_t i = 0; i < m_physicalBwpSchedulers.size(); ++i)
         {
-            for (const auto& scheduler : m_physicalBwpSchedulers)
-            {
-                scheduler->SetDlDataSchedulingEnabled(false);
-            }
+            configure(m_physicalBwpSchedulers[i]);
+            configurePhy(m_physicalBwpPhys[i]);
         }
     }
 
@@ -665,6 +839,7 @@ private:
 
     Ptr<NrMacSchedulerNs3> m_scheduler;
     Ptr<NrGnbPhy> m_gnbPhy;
+    Ptr<NrGnbEnergyModel> m_gnbEnergyModel;
     std::vector<Ptr<NrMacSchedulerNs3>> m_physicalBwpSchedulers;
     std::vector<Ptr<NrGnbPhy>> m_physicalBwpPhys;
     double m_periodMs;
@@ -672,6 +847,138 @@ private:
     bool m_enableBwpDynamic;
     double m_activeWindowMs;
     BwpState m_bwp;
+};
+
+class EligibilityOverlapTracker
+{
+public:
+    EligibilityOverlapTracker(const std::vector<Ptr<NrUeDrxModel>>& drxModels,
+                              const RadioResourceController* radioController,
+                              Time sampleInterval,
+                              Time stopTime)
+        : m_drxModels(drxModels),
+          m_radioController(radioController),
+          m_sampleInterval(sampleInterval),
+          m_stopTime(stopTime),
+          m_awakeTimeS(drxModels.size(), 0.0),
+          m_awakeCellInactiveTimeS(drxModels.size(), 0.0)
+    {
+        NS_ABORT_MSG_IF(!m_radioController, "Eligibility tracker needs a radio controller");
+        NS_ABORT_MSG_IF(m_sampleInterval <= Seconds(0),
+                        "Eligibility tracker sample interval must be positive");
+    }
+
+    void Start(Time startTime)
+    {
+        NS_ABORT_MSG_IF(startTime >= m_stopTime,
+                        "Eligibility tracker start must precede its stop time");
+        Simulator::Schedule(startTime - Simulator::Now(),
+                            &EligibilityOverlapTracker::Sample,
+                            this);
+    }
+
+    double GetAwakePct() const
+    {
+        return GetAggregatePct(m_awakeTimeS, m_totalTimeS * m_drxModels.size());
+    }
+
+    double GetAwakeCellInactivePct() const
+    {
+        return GetAggregatePct(m_awakeCellInactiveTimeS,
+                               m_totalTimeS * m_drxModels.size());
+    }
+
+    double GetWasteWithinAwakePct() const
+    {
+        double awakeTimeS = 0.0;
+        double wasteTimeS = 0.0;
+        for (uint32_t ueId = 0; ueId < m_drxModels.size(); ++ueId)
+        {
+            awakeTimeS += m_awakeTimeS[ueId];
+            wasteTimeS += m_awakeCellInactiveTimeS[ueId];
+        }
+        return GetAggregatePct(wasteTimeS, awakeTimeS);
+    }
+
+    std::string GetAwakeCellInactivePctPerUe() const
+    {
+        std::ostringstream values;
+        values << std::fixed << std::setprecision(3);
+        for (uint32_t ueId = 0; ueId < m_drxModels.size(); ++ueId)
+        {
+            if (ueId > 0)
+            {
+                values << ";";
+            }
+            values << GetAggregatePct(m_awakeCellInactiveTimeS[ueId], m_totalTimeS);
+        }
+        return values.str();
+    }
+
+    std::string GetWasteWithinAwakePctPerUe() const
+    {
+        std::ostringstream values;
+        values << std::fixed << std::setprecision(3);
+        for (uint32_t ueId = 0; ueId < m_drxModels.size(); ++ueId)
+        {
+            if (ueId > 0)
+            {
+                values << ";";
+            }
+            values << GetAggregatePct(m_awakeCellInactiveTimeS[ueId], m_awakeTimeS[ueId]);
+        }
+        return values.str();
+    }
+
+private:
+    static double GetAggregatePct(double numerator, double denominator)
+    {
+        return denominator > 0.0 ? 100.0 * numerator / denominator : 0.0;
+    }
+
+    static double GetAggregatePct(const std::vector<double>& values, double denominator)
+    {
+        double numerator = 0.0;
+        for (double value : values)
+        {
+            numerator += value;
+        }
+        return GetAggregatePct(numerator, denominator);
+    }
+
+    void Sample()
+    {
+        const Time now = Simulator::Now();
+        if (now >= m_stopTime)
+        {
+            return;
+        }
+        const Time interval = std::min(m_sampleInterval, m_stopTime - now);
+        const double intervalS = interval.GetSeconds();
+        const bool cellActive = m_radioController->IsCellActiveAt(now);
+        for (uint32_t ueId = 0; ueId < m_drxModels.size(); ++ueId)
+        {
+            const bool ueAwake = !m_drxModels[ueId] || m_drxModels[ueId]->IsActiveAt(now);
+            if (ueAwake)
+            {
+                m_awakeTimeS[ueId] += intervalS;
+                if (!cellActive)
+                {
+                    m_awakeCellInactiveTimeS[ueId] += intervalS;
+                }
+            }
+        }
+        m_totalTimeS += intervalS;
+        Simulator::Schedule(interval, &EligibilityOverlapTracker::Sample, this);
+    }
+
+    std::vector<Ptr<NrUeDrxModel>> m_drxModels;
+    const RadioResourceController* m_radioController;
+    Time m_sampleInterval;
+    Time m_stopTime;
+    std::vector<double> m_awakeTimeS;
+    std::vector<double> m_awakeCellInactiveTimeS;
+    double m_totalTimeS{0.0};
 };
 
 class OfficialEnergyMetrics;
@@ -686,9 +993,11 @@ public:
                          double linkDelaySec = 0.010, double evalIntervalMs = 40.0, double minActiveMs = 10.0,
                          double maxActiveMs = 30.0, double initialActiveMs = 30.0,
                          double stepUpMs = 4.0, double stepDownMs = 2.0,
-                         uint64_t backlogThresholdBytes = 2000,
+                         double queueWarnRatio = 0.50, double queueHighRatio = 0.80,
+                         double bwpDwellMs = 100.0,
                          std::string timelineCsvName = "active_window_timeline.csv",
                          double warmupMs = 200.0,
+                         BwpState initialBwp = BWP_NARROW_20MHZ,
                          bool enableTrueBwpControl = false,
                          NetDeviceContainer trueBwpUeDevices = NetDeviceContainer(),
                          energy::DeviceEnergyModelContainer trueBwpUeEnergyModels =
@@ -707,13 +1016,16 @@ public:
           m_stepUpMs(stepUpMs),
           m_stepDownMs(stepDownMs),
           m_currentActiveMs(std::max(minActiveMs, std::min(maxActiveMs, initialActiveMs))),
-          m_currentBwp(BWP_NARROW_20MHZ),
+          m_currentBwp(initialBwp),
           m_bwpInactivityTimerMs(0.0),
           m_bwpInactivityTimeoutMs(10.0),
           m_cellDtxPeriodMs(40.0),
           m_avgTbsPerSlot(3000),
           m_slotDurationMs(0.5),
-          m_backlogThresholdBytes(backlogThresholdBytes),
+          m_queueWarnRatio(queueWarnRatio),
+          m_queueHighRatio(queueHighRatio),
+          m_bwpDwellMs(std::max(0.0, bwpDwellMs)),
+          m_bwpDwellRemainingMs(0.0),
           m_timelineCsvName(timelineCsvName),
           m_warmupMs(warmupMs),
           m_enableTrueBwpControl(enableTrueBwpControl),
@@ -721,7 +1033,6 @@ public:
           m_trueBwpUeEnergyModels(trueBwpUeEnergyModels),
           m_ipcClient(nullptr)
     {
-        m_bdpThresholdBytes = static_cast<uint64_t>((totalDataRateMbps * 1e6 * linkDelaySec) / 8.0);
         if (m_enableRlIpc)
         {
             m_ipcClient = new RlIpcClient("127.0.0.1", ipcPort);
@@ -743,7 +1054,7 @@ public:
         std::ofstream csv(m_timelineCsvName, std::ios::app);
         if (csv.is_open() && !exists)
         {
-            csv << "SimTimeSec,ActiveWindowMs,CurrentBwp,TotalPendingBytes,RlcBacklogBytes,DataRateMbps\n";
+            csv << "SimTimeSec,ActiveWindowMs,CurrentBwp,TotalPendingBytes,RlcBacklogBytes,RlcTotalOccupancyPct,RlcMaxBearerOccupancyPct,DataRateMbps\n";
         }
         csv.close();
 
@@ -769,7 +1080,8 @@ private:
         }
     }
 
-    void AppendTimeline(uint64_t totalPending, uint64_t rlcBacklogBytes)
+    void AppendTimeline(uint64_t totalPending, uint64_t rlcBacklogBytes,
+                        double totalQueueRatio, double maxBearerRatio)
     {
         std::ofstream csv(m_timelineCsvName, std::ios::app);
         if (csv.is_open())
@@ -779,6 +1091,8 @@ private:
                 << (m_currentBwp == BWP_WIDE_100MHZ ? 100 : 20) << ","
                 << totalPending << ","
                 << rlcBacklogBytes << ","
+                << (100.0 * totalQueueRatio) << ","
+                << (100.0 * maxBearerRatio) << ","
                 << m_totalDataRateMbps << "\n";
         }
     }
@@ -803,8 +1117,10 @@ private:
     double m_cellDtxPeriodMs;
     uint32_t m_avgTbsPerSlot;
     double m_slotDurationMs;
-    uint64_t m_backlogThresholdBytes;
-    uint64_t m_bdpThresholdBytes;
+    double m_queueWarnRatio;
+    double m_queueHighRatio;
+    double m_bwpDwellMs;
+    double m_bwpDwellRemainingMs;
     std::string m_timelineCsvName;
     double m_warmupMs;
     bool m_enableTrueBwpControl;
@@ -1239,42 +1555,44 @@ void DynamicDtxController::EvaluateAndAdjust()
     uint64_t rlcBacklogBytes = m_radioController
                                    ? m_radioController->GetDlRlcBacklogBytes()
                                    : 0;
+    const auto queueRatios = m_radioController
+                                 ? m_radioController->GetDlQueueOccupancyRatios()
+                                 : std::pair<double, double>{0.0, 0.0};
+    const double totalQueueRatio = queueRatios.first;
+    const double maxBearerRatio = queueRatios.second;
+    m_bwpDwellRemainingMs = std::max(0.0, m_bwpDwellRemainingMs - m_evalIntervalSec * 1000.0);
+    const bool bwpSwitchAllowed = m_bwpDwellRemainingMs <= 1e-9;
 
     double oldActiveMs = m_currentActiveMs;
     BwpState oldBwp = m_currentBwp;
 
-    if (rlcBacklogBytes > m_backlogThresholdBytes)
+    if (maxBearerRatio >= m_queueHighRatio || totalQueueRatio >= m_queueHighRatio)
     {
-        uint64_t excessBacklog = rlcBacklogBytes - m_backlogThresholdBytes;
-        uint32_t neededSlots = static_cast<uint32_t>(std::ceil((double)excessBacklog / m_avgTbsPerSlot));
-        double targetActiveMs = neededSlots * m_slotDurationMs + m_minActiveMs;
-        
-        targetActiveMs = std::max(m_minActiveMs, std::min(m_maxActiveMs, targetActiveMs));
+        m_currentActiveMs = std::min(m_maxActiveMs, m_currentActiveMs + m_stepUpMs);
 
-        if (targetActiveMs > m_currentActiveMs)
+        if (m_enableBwpDynamic && bwpSwitchAllowed)
         {
-            m_currentActiveMs = std::min(m_maxActiveMs, m_currentActiveMs + m_stepUpMs);
-        }
-        else if (targetActiveMs < m_currentActiveMs)
-        {
-            m_currentActiveMs = std::max(m_minActiveMs, m_currentActiveMs - m_stepDownMs);
-        }
-
-        if (m_enableBwpDynamic)
-        {
-            m_currentBwp = BWP_WIDE_100MHZ;
+            if (m_currentBwp != BWP_WIDE_100MHZ)
+            {
+                m_currentBwp = BWP_WIDE_100MHZ;
+                m_bwpDwellRemainingMs = m_bwpDwellMs;
+            }
             m_bwpInactivityTimerMs = m_bwpInactivityTimeoutMs;
         }
     }
-    else
+    else if (maxBearerRatio < m_queueWarnRatio && totalQueueRatio < m_queueWarnRatio)
     {
         m_currentActiveMs = std::max(m_minActiveMs, m_currentActiveMs - m_stepDownMs);
 
         if (m_enableBwpDynamic)
         {
-            if (m_bwpInactivityTimerMs <= 0.0)
+            if (m_bwpInactivityTimerMs <= 0.0 && bwpSwitchAllowed)
             {
-                m_currentBwp = BWP_NARROW_20MHZ;
+                if (m_currentBwp != BWP_NARROW_20MHZ)
+                {
+                    m_currentBwp = BWP_NARROW_20MHZ;
+                    m_bwpDwellRemainingMs = m_bwpDwellMs;
+                }
             }
             else
             {
@@ -1297,7 +1615,7 @@ void DynamicDtxController::EvaluateAndAdjust()
         }
     }
 
-    AppendTimeline(totalPending, rlcBacklogBytes);
+    AppendTimeline(totalPending, rlcBacklogBytes, totalQueueRatio, maxBearerRatio);
     if (m_tracker) m_tracker->ResetWindowStats();
     if (m_energyMetrics) m_energyMetrics->ResetWindowStats();
 
@@ -1315,6 +1633,9 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
         dlStats = m_radioController->GetDlObservationStats();
     }
     uint64_t rlcBacklogBytes = dlStats.totalBufferBytes;
+    const auto queueRatios = m_radioController
+                                 ? m_radioController->GetDlQueueOccupancyRatios()
+                                 : std::pair<double, double>{0.0, 0.0};
     double offeredRateMbps = m_tracker
                                  ? m_tracker->GetWindowOfferedRateMbps(m_evalIntervalSec)
                                  : 0.0;
@@ -1344,7 +1665,13 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
                                          uePowerMw,
                                          jainFairness);
 
-    if (actionIdx < 0 || actionIdx >= 10)
+    constexpr double absoluteActionStepMs = 2.0;
+    const int activeActionCount =
+        static_cast<int>(std::llround((m_maxActiveMs - m_minActiveMs) /
+                                      absoluteActionStepMs)) +
+        1;
+    const int actionCount = activeActionCount * 2;
+    if (actionIdx < 0 || actionIdx >= actionCount)
     {
         Simulator::Stop();
         return;
@@ -1353,14 +1680,16 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
     if (actionIdx >= 0)
     {
         BwpState oldBwp = m_currentBwp;
-        double deltaWOptions[] = {-4.0, -2.0, 0.0, 2.0, 4.0};
-        double deltaW = deltaWOptions[actionIdx % 5];
+        const int activeActionIndex = actionIdx / 2;
+        const double targetActiveMs =
+            m_minActiveMs + activeActionIndex * absoluteActionStepMs;
         BwpState nextBwp = m_enableBwpDynamic
-                               ? ((actionIdx / 5 == 1) ? BWP_WIDE_100MHZ
-                                                      : BWP_NARROW_20MHZ)
+                               ? ((actionIdx % 2 == 1) ? BWP_WIDE_100MHZ
+                                                     : BWP_NARROW_20MHZ)
                                : m_currentBwp;
 
-        m_currentActiveMs = std::max(m_minActiveMs, std::min(m_maxActiveMs, m_currentActiveMs + deltaW));
+        m_currentActiveMs = std::max(
+            m_minActiveMs, std::min(m_maxActiveMs, targetActiveMs));
         m_currentBwp = nextBwp;
 
         if (m_radioController)
@@ -1375,18 +1704,39 @@ void DynamicDtxController::EvaluateAndAdjustRlIpc()
         }
     }
 
-    AppendTimeline(totalPending, rlcBacklogBytes);
+    AppendTimeline(totalPending, rlcBacklogBytes, queueRatios.first, queueRatios.second);
 
     Simulator::Schedule(Seconds(m_evalIntervalSec), &DynamicDtxController::EvaluateAndAdjustRlIpc, this);
 }
 
-void ExportStatsToCsv(const std::string &filename, double simTime, bool enableGating, bool enableQueueAware,
+void ExportStatsToCsv(const std::string &filename, double simTime, uint32_t numUes,
+                       bool enableGating, bool enableQueueAware,
                        double cellDtxPeriodMs, double cellDtxActiveMs, double udpDataRate,
-                       uint64_t totalRxBytes, double avgPowerWatts, double totalEnergyJoules,
+                       uint64_t totalRxBytes, uint64_t trackerDropBytes, uint64_t pendingBytes,
+                       uint64_t pendingAtTrafficStop,
+                       uint64_t rlcTxDropPackets, uint64_t rlcTxDropBytes,
+                       uint64_t harqNackEvents, uint32_t harqMaxRetx,
+                       uint64_t unattributedFlowLostPackets,
+                       uint64_t flowTxPackets, uint64_t flowRxPackets, uint64_t flowLostPackets,
+                       uint64_t flowTxBytes, uint64_t flowRxBytes,
+                       double avgPowerWatts, double totalEnergyJoules,
                        double energyEfficiency, double p99LatencyMs, double qosSatisfactionRate,
                        bool enableCdrx = false, bool enableDciDynamic = false, bool enableBwpDynamic = false,
-                       double phaseOffsetMs = 0.0, double ueAvgPowerMw = 0.0, double ueTotalEnergyJoules = 0.0,
-                       double ueBatteryMah = 0.0, double ue3EnergyJoules = 0.0)
+                       double phaseOffsetMs = 0.0, const std::string& ueCdrxOffsetsMs = "",
+                       uint32_t cdrxInactivityMs = 0,
+                       const std::string& ueCdrxInactivityMs = "",
+                       double ueAvgPowerMw = 0.0, double ueTotalEnergyJoules = 0.0,
+                       double ueBatteryMah = 0.0, double ue3EnergyJoules = 0.0,
+                       double p50LatencyMs = 0.0, double p95LatencyMs = 0.0,
+                       double qos20Pct = 0.0, double qos30Pct = 0.0, double qos50Pct = 0.0,
+                       double ueAwakePct = 0.0, double ueAwakeCellInactivePct = 0.0,
+                       double wasteWithinUeAwakePct = 0.0,
+                       const std::string& ueAwakeCellInactivePctPerUe = "",
+                       const std::string& wasteWithinUeAwakePctPerUe = "",
+                       const std::string& perUeP99LatencyMs = "",
+                       const std::string& perUeQos20Pct = "",
+                       const std::string& perUeQos30Pct = "",
+                       const std::string& perUeQos50Pct = "")
 {
     bool fileExists = false;
     {
@@ -1399,22 +1749,40 @@ void ExportStatsToCsv(const std::string &filename, double simTime, bool enableGa
 
     if (!fileExists)
     {
-        csvFile << "SimTime,EnableGating,EnableQueueAware,EnableCdrx,EnableDciDynamic,EnableBwpDynamic,PhaseOffsetMs,CellDtxPeriodMs,CellDtxActiveMs,UdpDataRateMbps,TotalRxBytes,TotalRxMbits,AvgPowerWatts,TotalEnergyJoules,EnergyEfficiency_MbitsPerJoule,P99LatencyMs,QosSatisfactionRatePct,UeAvgPowerMw,UeTotalEnergyJoules,UeBatteryMah,Ue3EnergyJoules\n";
+        csvFile << "SimTime,NumUes,EnableGating,EnableQueueAware,EnableCdrx,EnableDciDynamic,EnableBwpDynamic,PhaseOffsetMs,UeCdrxOffsetsMs,CdrxInactivityMs,UeCdrxInactivityMs,CellDtxPeriodMs,CellDtxActiveMs,UdpDataRateMbps,TotalOfferedRateMbps,TotalRxBytes,TrackerDropBytes,PendingBytes,PendingBytesAtTrafficStop,RlcTxDropPackets,RlcTxDropBytes,HarqNackEvents,HarqMaxRetx,UnattributedFlowLostPackets,FlowTxPackets,FlowRxPackets,FlowLostPackets,FlowTxBytes,FlowRxBytes,TotalRxMbits,AvgPowerWatts,TotalEnergyJoules,EnergyEfficiency_MbitsPerJoule,P99LatencyMs,QosSatisfactionRatePct,UeAvgPowerMw,UeTotalEnergyJoules,UeBatteryMah,Ue3EnergyJoules,P50LatencyMs,P95LatencyMs,Qos20Pct,Qos30Pct,Qos50Pct,UeAwakePct,UeAwakeCellInactivePct,WasteWithinUeAwakePct,UeAwakeCellInactivePctPerUe,WasteWithinUeAwakePctPerUe,PerUeP99LatencyMs,PerUeQos20Pct,PerUeQos30Pct,PerUeQos50Pct\n";
     }
 
     double totalRxMbits = (totalRxBytes * 8.0) / 1e6;
 
     csvFile << simTime << ","
+            << numUes << ","
             << (enableGating ? 1 : 0) << ","
             << (enableQueueAware ? 1 : 0) << ","
             << (enableCdrx ? 1 : 0) << ","
             << (enableDciDynamic ? 1 : 0) << ","
             << (enableBwpDynamic ? 1 : 0) << ","
             << phaseOffsetMs << ","
+            << "\"" << ueCdrxOffsetsMs << "\"" << ","
+            << cdrxInactivityMs << ","
+            << "\"" << ueCdrxInactivityMs << "\"" << ","
             << cellDtxPeriodMs << ","
             << cellDtxActiveMs << ","
             << udpDataRate << ","
+            << numUes * udpDataRate << ","
             << totalRxBytes << ","
+            << trackerDropBytes << ","
+            << pendingBytes << ","
+            << pendingAtTrafficStop << ","
+            << rlcTxDropPackets << ","
+            << rlcTxDropBytes << ","
+            << harqNackEvents << ","
+            << harqMaxRetx << ","
+            << unattributedFlowLostPackets << ","
+            << flowTxPackets << ","
+            << flowRxPackets << ","
+            << flowLostPackets << ","
+            << flowTxBytes << ","
+            << flowRxBytes << ","
             << totalRxMbits << ","
             << avgPowerWatts << ","
             << totalEnergyJoules << ","
@@ -1424,16 +1792,193 @@ void ExportStatsToCsv(const std::string &filename, double simTime, bool enableGa
             << ueAvgPowerMw << ","
             << ueTotalEnergyJoules << ","
             << ueBatteryMah << ","
-            << ue3EnergyJoules << "\n";
+            << ue3EnergyJoules << ","
+            << p50LatencyMs << ","
+            << p95LatencyMs << ","
+            << qos20Pct << ","
+            << qos30Pct << ","
+            << qos50Pct << ","
+            << ueAwakePct << ","
+            << ueAwakeCellInactivePct << ","
+            << wasteWithinUeAwakePct << ","
+            << "\"" << ueAwakeCellInactivePctPerUe << "\"" << ","
+            << "\"" << wasteWithinUeAwakePctPerUe << "\"" << ","
+            << "\"" << perUeP99LatencyMs << "\"" << ","
+            << "\"" << perUeQos20Pct << "\"" << ","
+            << "\"" << perUeQos30Pct << "\"" << ","
+            << "\"" << perUeQos50Pct << "\"" << "\n";
 
     csvFile.close();
 }
+
+void
+PrintDlBearerBufferStats(const Ptr<NrMacSchedulerNs3>& scheduler, const char* phase)
+{
+    constexpr uint32_t kRlcUmCapacityBytes = 10 * 1024;
+    for (const auto& stats : scheduler->GetDlBearerBufferStats())
+    {
+        const uint32_t usedBytes = stats.txQueueBytes + stats.retxQueueBytes + stats.statusPduBytes;
+        const uint32_t remainingBytes = usedBytes < kRlcUmCapacityBytes
+                                             ? kRlcUmCapacityBytes - usedBytes
+                                             : 0;
+        std::cout << "RlcBearerBuffer phase=" << phase
+                  << ",Rnti=" << stats.rnti
+                  << ",Lcid=" << static_cast<uint32_t>(stats.lcid)
+                  << ",TxBytes=" << stats.txQueueBytes
+                  << ",RetxBytes=" << stats.retxQueueBytes
+                  << ",StatusBytes=" << stats.statusPduBytes
+                  << ",UsedBytes=" << usedBytes
+                  << ",CapacityBytes=" << kRlcUmCapacityBytes
+                  << ",RemainingBytes=" << remainingBytes << std::endl;
+    }
+}
+
+class RlcBearerTelemetryProbe
+{
+  public:
+    RlcBearerTelemetryProbe(Ptr<NrMacSchedulerNs3> scheduler,
+                            std::string filename,
+                            double sampleIntervalMs,
+                            double stopTimeSec)
+        : m_scheduler(std::move(scheduler)),
+          m_filename(std::move(filename)),
+          m_interval(Seconds(sampleIntervalMs / 1000.0)),
+          m_stopTime(Seconds(stopTimeSec))
+    {
+        NS_ABORT_MSG_IF(!m_scheduler, "RLC bearer telemetry requires a scheduler");
+        NS_ABORT_MSG_IF(sampleIntervalMs <= 0.0,
+                        "RLC bearer telemetry sample interval must be positive");
+    }
+
+    void Start()
+    {
+        m_csv.open(m_filename, std::ios::trunc);
+        NS_ABORT_MSG_IF(!m_csv.is_open(),
+                        "Unable to open RLC bearer telemetry " << m_filename);
+        m_csv << "SimTimeSec,Rnti,Lcid,TxBytes,RetxBytes,StatusBytes,UsedBytes,"
+                 "CapacityBytes,RemainingBytes,PeakUsedBytes\n";
+        Simulator::ScheduleNow(&RlcBearerTelemetryProbe::Sample, this);
+    }
+
+    void PrintPeaks() const
+    {
+        for (const auto& [key, peak] : m_peakUsedBytes)
+        {
+            std::cout << "RlcBearerPeak,Rnti=" << key.first
+                      << ",Lcid=" << static_cast<uint32_t>(key.second)
+                      << ",PeakUsedBytes=" << peak
+                      << ",CapacityBytes=" << kCapacityBytes
+                      << ",PeakRemainingBytes=" << (peak < kCapacityBytes
+                                                             ? kCapacityBytes - peak
+                                                             : 0)
+                      << std::endl;
+        }
+    }
+
+  private:
+    static constexpr uint32_t kCapacityBytes = 10 * 1024;
+
+    void Sample()
+    {
+        for (const auto& stats : m_scheduler->GetDlBearerBufferStats())
+        {
+            const uint32_t usedBytes = stats.txQueueBytes + stats.retxQueueBytes +
+                                       stats.statusPduBytes;
+            auto& peak = m_peakUsedBytes[{stats.rnti, stats.lcid}];
+            peak = std::max(peak, usedBytes);
+            const uint32_t remainingBytes = usedBytes < kCapacityBytes
+                                                 ? kCapacityBytes - usedBytes
+                                                 : 0;
+            m_csv << std::fixed << std::setprecision(6) << Simulator::Now().GetSeconds() << ","
+                  << stats.rnti << "," << static_cast<uint32_t>(stats.lcid) << ","
+                  << stats.txQueueBytes << "," << stats.retxQueueBytes << ","
+                  << stats.statusPduBytes << "," << usedBytes << "," << kCapacityBytes << ","
+                  << remainingBytes << "," << peak << "\n";
+        }
+        if (Simulator::Now() + m_interval < m_stopTime)
+        {
+            Simulator::Schedule(m_interval, &RlcBearerTelemetryProbe::Sample, this);
+        }
+    }
+
+    Ptr<NrMacSchedulerNs3> m_scheduler;
+    std::string m_filename;
+    Time m_interval;
+    Time m_stopTime;
+    std::ofstream m_csv;
+    std::map<std::pair<uint16_t, uint8_t>, uint32_t> m_peakUsedBytes;
+};
+
+class HarqDiagnostics
+{
+  public:
+    void OnDlHarqFeedback(const DlHarqInfo& info)
+    {
+        auto& counters = m_byRnti[info.m_rnti];
+        if (info.m_harqStatus == DlHarqInfo::ACK)
+        {
+            counters.acks++;
+        }
+        else
+        {
+            counters.nacks++;
+        }
+        counters.maxRetx = std::max<uint32_t>(counters.maxRetx, info.m_numRetx);
+    }
+
+    void Print() const
+    {
+        uint64_t totalAcks = 0;
+        uint64_t totalNacks = 0;
+        for (const auto& [rnti, counters] : m_byRnti)
+        {
+            totalAcks += counters.acks;
+            totalNacks += counters.nacks;
+            std::cout << "HarqDl,Rnti=" << rnti << ",Acks=" << counters.acks
+                      << ",Nacks=" << counters.nacks
+                      << ",MaxRetx=" << counters.maxRetx << std::endl;
+        }
+        std::cout << "HarqDlTotal,Acks=" << totalAcks << ",Nacks=" << totalNacks
+                  << std::endl;
+    }
+
+    uint64_t GetTotalNacks() const
+    {
+        uint64_t total = 0;
+        for (const auto& [rnti, counters] : m_byRnti)
+        {
+            total += counters.nacks;
+        }
+        return total;
+    }
+
+    uint32_t GetMaxRetx() const
+    {
+        uint32_t maximum = 0;
+        for (const auto& [rnti, counters] : m_byRnti)
+        {
+            maximum = std::max(maximum, counters.maxRetx);
+        }
+        return maximum;
+    }
+
+  private:
+    struct Counters
+    {
+        uint64_t acks{0};
+        uint64_t nacks{0};
+        uint32_t maxRetx{0};
+    };
+    std::map<uint16_t, Counters> m_byRnti;
+};
 
 int main(int argc, char *argv[])
 {
     uint32_t numUes = 10;
     uint32_t numerology = 1;
     double simTime = 10.0;
+    double trafficStopSec = -1.0;
+    double rlcBearerSampleMs = 1.0;
     double udpPacketRateMbps = 2.0;
     bool enableBurstTraffic = false;
     bool synchronizeBurstTraffic = false;
@@ -1442,7 +1987,8 @@ int main(int argc, char *argv[])
     double burstMeanOffMs = 120.0;
     double gnbTxPowerDbm = 30.0;
     std::string gnbEnergyBsCategory = "BsCat1";
-    std::string gnbEnergyRefConfig = "Set1";
+    std::string gnbEnergyRefConfig = "Custom";
+    double gnbEnergyReferenceTxPowerDbm = 30.0;
     std::string gnbEnergyEtaMode = "Dual";
     double gnbEnergyAntennaRatio = 0.4;
     double gnbEnergyPowerUnitW = 1.0;
@@ -1461,6 +2007,8 @@ int main(int argc, char *argv[])
     bool enableRlIpc = false;
     int ipcPort = 5555;
     double phaseOffsetMs = 0.0;
+    std::string ueCdrxOffsetsMs;
+    std::string ueCdrxInactivityMs;
     uint32_t cdrxOnDurationMs = 10;
     uint32_t cdrxInactivityMs = 10;
     double cellDtxPeriodMs = 40.0;
@@ -1474,6 +2022,9 @@ int main(int argc, char *argv[])
     double controllerStepUpMs = 4.0;
     double controllerStepDownMs = 2.0;
     uint64_t controllerBacklogThresholdBytes = 2000;
+    double controllerQueueWarnRatio = 0.50;
+    double controllerQueueHighRatio = 0.80;
+    double controllerBwpDwellMs = 100.0;
     uint32_t rngSeed = 42;
     uint64_t rngRun = 1;
     std::string csvFileName = "joint_energy_results.csv";
@@ -1486,6 +2037,12 @@ int main(int argc, char *argv[])
     cmd.AddValue("numUes", "Number of UEs", numUes);
     cmd.AddValue("numerology", "NR numerology (1 gives 30 kHz SCS)", numerology);
     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
+    cmd.AddValue("trafficStopSec",
+                 "Optional absolute time to stop UDP clients before simulation end",
+                 trafficStopSec);
+    cmd.AddValue("rlcBearerSampleMs",
+                 "Per-bearer RLC scheduler telemetry sampling interval in milliseconds",
+                 rlcBearerSampleMs);
     cmd.AddValue("udpDataRate", "Constant/base UDP downlink rate in Mbps per UE", udpPacketRateMbps);
     cmd.AddValue("enableBurstTraffic", "Add an independent On/Off burst source for every UE", enableBurstTraffic);
     cmd.AddValue("synchronizeBurstTraffic", "Use a shared deterministic On/Off burst regime across UEs", synchronizeBurstTraffic);
@@ -1494,7 +2051,12 @@ int main(int argc, char *argv[])
     cmd.AddValue("burstMeanOffMs", "Mean burst Off duration in ms", burstMeanOffMs);
     cmd.AddValue("gnbTxPowerDbm", "gNB downlink transmission power in dBm", gnbTxPowerDbm);
     cmd.AddValue("gnbEnergyBsCategory", "TR 38.864 BS category (BsCat1 or BsCat2)", gnbEnergyBsCategory);
-    cmd.AddValue("gnbEnergyRefConfig", "TR 38.864 reference set (Set1 for this 100 MHz mu=1 scenario)", gnbEnergyRefConfig);
+    cmd.AddValue("gnbEnergyRefConfig",
+                 "TR 38.864 reference set (Custom uses the Set1 power row)",
+                 gnbEnergyRefConfig);
+    cmd.AddValue("gnbEnergyReferenceTxPowerDbm",
+                 "Reference Tx power used to normalize sp when the energy reference set is Custom",
+                 gnbEnergyReferenceTxPowerDbm);
     cmd.AddValue("gnbEnergyEtaMode", "TR 38.864 PA efficiency mode (Single or Dual)", gnbEnergyEtaMode);
     cmd.AddValue("gnbEnergyAntennaRatio", "TR 38.864 antenna dynamic-power fraction A", gnbEnergyAntennaRatio);
     cmd.AddValue("gnbEnergyPowerUnitW", "Absolute watts per TR 38.864 relative power unit", gnbEnergyPowerUnitW);
@@ -1528,8 +2090,14 @@ int main(int argc, char *argv[])
     cmd.AddValue("enableRlIpc", "Enable Socket IPC for Reinforcement Learning Co-Simulation", enableRlIpc);
     cmd.AddValue("ipcPort", "Socket IPC Server Port", ipcPort);
     cmd.AddValue("phaseOffsetMs", "Phase Offset between gNB and UE C-DRX in ms", phaseOffsetMs);
+    cmd.AddValue("ueCdrxOffsetsMs",
+                 "Comma-separated per-UE C-DRX offsets in ms; overrides phaseOffsetMs",
+                 ueCdrxOffsetsMs);
     cmd.AddValue("cdrxOnDurationMs", "C-DRX OnDuration Timer in ms", cdrxOnDurationMs);
     cmd.AddValue("cdrxInactivityMs", "C-DRX Inactivity Timer in ms", cdrxInactivityMs);
+    cmd.AddValue("ueCdrxInactivityMs",
+                 "Comma-separated per-UE inactivity timers in ms; overrides cdrxInactivityMs",
+                 ueCdrxInactivityMs);
     cmd.AddValue("cellDtxPeriodMs", "Cell-DTX Period in ms", cellDtxPeriodMs);
     cmd.AddValue("cellDtxActiveMs", "Cell-DTX Active Duration in ms", cellDtxActiveMs);
     cmd.AddValue("qosTargetDelayMs", "QoS Target Delay Bound in ms", qosTargetDelayMs);
@@ -1540,7 +2108,10 @@ int main(int argc, char *argv[])
     cmd.AddValue("controllerInitialActiveMs", "Controller active window at episode start in ms", controllerInitialActiveMs);
     cmd.AddValue("controllerStepUpMs", "Rule-Based active-window increase per decision in ms", controllerStepUpMs);
     cmd.AddValue("controllerStepDownMs", "Rule-Based active-window decrease per decision in ms", controllerStepDownMs);
-    cmd.AddValue("controllerBacklogThresholdBytes", "Rule-Based RLC backlog threshold in bytes", controllerBacklogThresholdBytes);
+    cmd.AddValue("controllerBacklogThresholdBytes", "Legacy fixed-byte rule threshold (accepted for compatibility; ignored)", controllerBacklogThresholdBytes);
+    cmd.AddValue("controllerQueueWarnRatio", "Capacity-based rule warning occupancy ratio", controllerQueueWarnRatio);
+    cmd.AddValue("controllerQueueHighRatio", "Capacity-based rule high occupancy ratio", controllerQueueHighRatio);
+    cmd.AddValue("controllerBwpDwellMs", "Minimum time between rule-based BWP switches", controllerBwpDwellMs);
     cmd.AddValue("rngSeed", "ns-3 random-number generator seed", rngSeed);
     cmd.AddValue("rngRun", "ns-3 independent random-number generator run", rngRun);
     cmd.AddValue("csvFileName", "Output CSV file name", csvFileName);
@@ -1572,6 +2143,10 @@ int main(int argc, char *argv[])
                          bwpSwitchBackToNarrowSec >= simTime),
                     "Scripted BWP times must satisfy 0 < wide < narrow < simTime");
     NS_ABORT_MSG_IF(udpPacketRateMbps <= 0.0, "udpDataRate must be greater than zero");
+    NS_ABORT_MSG_IF(trafficStopSec > 0.0 &&
+                        (trafficStopSec <= std::max(0.02, controllerWarmupMs / 1000.0) ||
+                         trafficStopSec >= simTime),
+                    "trafficStopSec must be after traffic start and before simTime");
     NS_ABORT_MSG_IF(enableBurstTraffic && udpBurstRateMbps <= 0.0,
                     "udpBurstRate must be greater than zero when burst traffic is enabled");
     NS_ABORT_MSG_IF(enableBurstTraffic &&
@@ -1584,8 +2159,54 @@ int main(int argc, char *argv[])
                     "Official Energy model PowerUnit values must be greater than zero");
     NS_ABORT_MSG_IF(gnbEnergyAntennaRatio < 0.0 || gnbEnergyAntennaRatio > 1.0,
                     "gnbEnergyAntennaRatio must be inside [0, 1]");
-    NS_ABORT_MSG_IF(enableCdrx && phaseOffsetMs != 0.0,
-                    "NrEnergyHelper v5 does not expose a DRX start phase offset; use phaseOffsetMs=0");
+    NS_ABORT_MSG_IF(phaseOffsetMs < 0.0 || phaseOffsetMs >= cellDtxPeriodMs,
+                    "phaseOffsetMs must satisfy 0 <= offset < C-DRX long cycle");
+
+    std::vector<Time> ueCdrxStartOffsets;
+    if (!ueCdrxOffsetsMs.empty())
+    {
+        NS_ABORT_MSG_IF(ueCdrxOffsetsMs.front() == ',' || ueCdrxOffsetsMs.back() == ',',
+                        "ueCdrxOffsetsMs must not start or end with a comma");
+        std::stringstream offsetList(ueCdrxOffsetsMs);
+        std::string token;
+        while (std::getline(offsetList, token, ','))
+        {
+            std::stringstream valueStream(token);
+            double offsetMs;
+            std::string extra;
+            NS_ABORT_MSG_IF(!(valueStream >> offsetMs) || (valueStream >> extra),
+                            "Invalid value in ueCdrxOffsetsMs: " << token);
+            NS_ABORT_MSG_IF(offsetMs < 0.0 || offsetMs >= cellDtxPeriodMs,
+                            "Every UE C-DRX offset must satisfy 0 <= offset < cycle");
+            ueCdrxStartOffsets.push_back(MilliSeconds(offsetMs));
+        }
+        NS_ABORT_MSG_IF(ueCdrxStartOffsets.size() != numUes,
+                        "ueCdrxOffsetsMs must contain exactly one value per UE");
+        NS_ABORT_MSG_IF(!enableCdrx, "ueCdrxOffsetsMs requires enableCdrx=true");
+    }
+    std::vector<Time> ueCdrxInactivityTimers;
+    if (!ueCdrxInactivityMs.empty())
+    {
+        NS_ABORT_MSG_IF(ueCdrxInactivityMs.front() == ',' ||
+                            ueCdrxInactivityMs.back() == ',',
+                        "ueCdrxInactivityMs must not start or end with a comma");
+        std::stringstream timerList(ueCdrxInactivityMs);
+        std::string token;
+        while (std::getline(timerList, token, ','))
+        {
+            std::stringstream valueStream(token);
+            double timerMs;
+            std::string extra;
+            NS_ABORT_MSG_IF(!(valueStream >> timerMs) || (valueStream >> extra),
+                            "Invalid value in ueCdrxInactivityMs: " << token);
+            NS_ABORT_MSG_IF(timerMs < 0.0,
+                            "Every UE C-DRX inactivity timer must be non-negative");
+            ueCdrxInactivityTimers.push_back(MilliSeconds(timerMs));
+        }
+        NS_ABORT_MSG_IF(ueCdrxInactivityTimers.size() != numUes,
+                        "ueCdrxInactivityMs must contain exactly one value per UE");
+        NS_ABORT_MSG_IF(!enableCdrx, "ueCdrxInactivityMs requires enableCdrx=true");
+    }
 
     RngSeedManager::SetSeed(rngSeed);
     RngSeedManager::SetRun(rngRun);
@@ -1689,6 +2310,20 @@ int main(int argc, char *argv[])
     }
 
     NetDeviceContainer gnbNetDev = nrHelper->InstallGnbDevice(gnbNodes, allBwps);
+    HarqDiagnostics harqDiagnostics;
+    bool harqTraceConnected = true;
+    for (uint32_t bwpId = 0; bwpId < allBwps.size(); ++bwpId)
+    {
+        Ptr<NrGnbMac> gnbMac = NrHelper::GetGnbMac(gnbNetDev.Get(0), bwpId);
+        harqTraceConnected =
+            gnbMac &&
+            gnbMac->TraceConnectWithoutContext(
+                "DlHarqFeedback",
+                MakeCallback(&HarqDiagnostics::OnDlHarqFeedback, &harqDiagnostics)) &&
+            harqTraceConnected;
+    }
+    std::cout << "DlHarqFeedbackTraceConnected=" << (harqTraceConnected ? 1 : 0)
+              << std::endl;
     NetDeviceContainer ueNetDev = nrHelper->InstallUeDevice(ueNodes, allBwps);
 
     if (enableTrueBwp)
@@ -1773,17 +2408,13 @@ int main(int argc, char *argv[])
     p2ph.SetChannelAttribute("Delay", TimeValue(Seconds(0.010)));
     NetDeviceContainer internetDevices = p2ph.Install(pgw, remoteHost);
 
-    PacketDelayTracker delayTracker;
+    PacketDelayTracker delayTracker(numUes);
+    uint64_t pendingAtTrafficStop = 0;
     Ptr<Ipv4L3Protocol> remoteHostIpv4 = remoteHost->GetObject<Ipv4L3Protocol>();
     if (remoteHostIpv4)
     {
         remoteHostIpv4->TraceConnectWithoutContext("Tx", MakeCallback(&PacketDelayTracker::RecordTx, &delayTracker));
     }
-
-    Config::ConnectWithoutContextFailSafe(
-        "/NodeList/*/DeviceList/*/$ns3::NrGnbNetDevice/LteRlc/TxDrop",
-        MakeCallback(&PacketDelayTracker::RecordDrop, &delayTracker)
-    );
 
     Ipv4AddressHelper ipv4h;
     ipv4h.SetBase("1.0.0.0", "255.0.0.0");
@@ -1817,7 +2448,9 @@ int main(int argc, char *argv[])
         Ptr<UdpServer> udpServer = DynamicCast<UdpServer>(sApps.Get(0));
         if (udpServer)
         {
-            udpServer->TraceConnectWithoutContext("RxWithAddresses", MakeCallback(&PacketDelayTracker::RecordRx, &delayTracker));
+            udpServer->TraceConnectWithoutContext(
+                "RxWithAddresses",
+                MakeBoundCallback(&RecordRxForUeTrace, &delayTracker, i));
         }
 
         const InetSocketAddress destination(ueIpIface.GetAddress(i), port + i);
@@ -1871,7 +2504,36 @@ int main(int argc, char *argv[])
     // Warm the channel and attachment state without creating packets that the
     // controller could not influence. Traffic and control begin together.
     const double trafficStartSec = std::max(0.02, controllerWarmupMs / 1000.0);
+    std::unique_ptr<RlcBearerTelemetryProbe> rlcBearerProbe;
+    if (!csvFileName.empty())
+    {
+        rlcBearerProbe = std::make_unique<RlcBearerTelemetryProbe>(
+            scheduler, csvFileName + ".rlc-bearer.csv", rlcBearerSampleMs, simTime);
+        rlcBearerProbe->Start();
+    }
+    Simulator::Schedule(Seconds(std::max(0.001, trafficStartSec - 0.001)),
+                        [&delayTracker]() {
+                            bool connected = Config::ConnectFailSafe(
+                                "/NodeList/*/DeviceList/*/NrGnbRrc/UeMap/*/DataRadioBearerMap/*/NrRlc/TxDrop",
+                                MakeCallback(&PacketDelayTracker::RecordDropWithContext, &delayTracker));
+                            std::cout << "RlcTxDropTraceConnected=" << (connected ? 1 : 0)
+                                      << std::endl;
+                        });
+    if (trafficStopSec > 0.0)
+    {
+        Simulator::Schedule(Seconds(trafficStopSec), [&scheduler]() {
+            PrintDlBearerBufferStats(scheduler, "traffic-stop");
+        });
+    }
     clientApps.Start(Seconds(trafficStartSec));
+    if (trafficStopSec > 0.0)
+    {
+        clientApps.Stop(Seconds(trafficStopSec));
+        Simulator::Schedule(Seconds(trafficStopSec), [&delayTracker, &pendingAtTrafficStop]() {
+            pendingAtTrafficStop = delayTracker.GetPendingBytes();
+            std::cout << "PendingBytesAtTrafficStop=" << pendingAtTrafficStop << std::endl;
+        });
+    }
 
     FlowMonitorHelper flowmonHelper;
     Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
@@ -1893,6 +2555,8 @@ int main(int argc, char *argv[])
     NrEnergyHelper nrEnergyHelper;
     nrEnergyHelper.SetGnbEnergyModelAttribute("BsCategory", StringValue(gnbEnergyBsCategory));
     nrEnergyHelper.SetGnbEnergyModelAttribute("RefConfigSet", StringValue(gnbEnergyRefConfig));
+    nrEnergyHelper.SetGnbEnergyModelAttribute("ReferenceTxPowerDbm",
+                                               DoubleValue(gnbEnergyReferenceTxPowerDbm));
     nrEnergyHelper.SetGnbEnergyModelAttribute("EtaMode", StringValue(gnbEnergyEtaMode));
     nrEnergyHelper.SetGnbEnergyModelAttribute("AntennaRatio_A",
                                                DoubleValue(gnbEnergyAntennaRatio));
@@ -1914,6 +2578,9 @@ int main(int argc, char *argv[])
     nrEnergyHelper.SetDrxModelAttribute("OnDuration", TimeValue(MilliSeconds(cdrxOnDurationMs)));
     nrEnergyHelper.SetDrxModelAttribute("InactivityTimer",
                                         TimeValue(MilliSeconds(cdrxInactivityMs)));
+    nrEnergyHelper.SetDrxModelAttribute("StartOffset", TimeValue(MilliSeconds(phaseOffsetMs)));
+    nrEnergyHelper.SetDrxStartOffsets(ueCdrxStartOffsets);
+    nrEnergyHelper.SetDrxInactivityTimers(ueCdrxInactivityTimers);
 
     energy::DeviceEnergyModelContainer gnbEnergyModels =
         nrEnergyHelper.InstallGnb(gnbNetDev, gnbEnergySources);
@@ -1921,7 +2588,82 @@ int main(int argc, char *argv[])
         enableTrueBwp && (enableTrueBwpSwitchScript || enableBwpDynamic)
         ? nrEnergyHelper.InstallUeAllBwps(ueNetDev, ueEnergySources, selectedBwpId)
         : nrEnergyHelper.InstallUe(ueNetDev, ueEnergySources, selectedBwpId);
+    if (!ueCdrxStartOffsets.empty())
+    {
+        for (uint32_t ueId = 0; ueId < ueNetDev.GetN(); ++ueId)
+        {
+            Ptr<NrUeDrxModel> drx = ueNetDev.Get(ueId)->GetNode()->GetObject<NrUeDrxModel>();
+            NS_ABORT_MSG_IF(!drx || drx->GetStartOffset() != ueCdrxStartOffsets[ueId],
+                            "Per-UE C-DRX offset was not installed on UE " << ueId);
+            std::cout << "UeCdrxOffsetMs[" << ueId
+                      << "]=" << drx->GetStartOffset().GetMilliSeconds() << std::endl;
+        }
+    }
+    if (!ueCdrxInactivityTimers.empty())
+    {
+        for (uint32_t ueId = 0; ueId < ueNetDev.GetN(); ++ueId)
+        {
+            Ptr<NrUeDrxModel> drx =
+                ueNetDev.Get(ueId)->GetNode()->GetObject<NrUeDrxModel>();
+            NS_ABORT_MSG_IF(!drx ||
+                                drx->GetInactivityTimer() != ueCdrxInactivityTimers[ueId],
+                            "Per-UE C-DRX inactivity timer was not installed on UE " << ueId);
+            std::cout << "UeCdrxInactivityMs[" << ueId
+                      << "]=" << drx->GetInactivityTimer().GetMilliSeconds() << std::endl;
+        }
+    }
+    if (enableCdrx)
+    {
+        auto ueDlEligibility = [ueNetDev](uint16_t rnti, Time grantStart, Time grantEnd) {
+            if (rnti == 0)
+            {
+                return true;
+            }
+            for (uint32_t ueId = 0; ueId < ueNetDev.GetN(); ++ueId)
+            {
+                Ptr<NrUeNetDevice> ue = DynamicCast<NrUeNetDevice>(ueNetDev.Get(ueId));
+                if (ue && ue->GetRrc() && ue->GetRrc()->GetRnti() == rnti)
+                {
+                    Ptr<NrUeDrxModel> drx = ue->GetNode()->GetObject<NrUeDrxModel>();
+                    NS_ABORT_MSG_IF(!drx, "C-DRX is enabled but the UE has no DRX model");
+                    return drx->IsActiveFor(grantStart, grantEnd);
+                }
+            }
+            // RNTI assignment and initial access happen before connected-mode
+            // DRX applies. Unknown temporary RNTIs must remain schedulable.
+            return true;
+        };
+        if (physicalSchedulers.empty())
+        {
+            scheduler->SetUeDlEligibilityCallback(ueDlEligibility);
+        }
+        else
+        {
+            for (const auto& physicalScheduler : physicalSchedulers)
+            {
+                physicalScheduler->SetUeDlEligibilityCallback(ueDlEligibility);
+            }
+        }
+    }
+    std::vector<Ptr<NrUeDrxModel>> ueDrxModels;
+    ueDrxModels.reserve(ueNetDev.GetN());
+    for (uint32_t ueId = 0; ueId < ueNetDev.GetN(); ++ueId)
+    {
+        ueDrxModels.push_back(
+            ueNetDev.Get(ueId)->GetNode()->GetObject<NrUeDrxModel>());
+    }
+    const Time eligibilitySampleInterval =
+        Seconds(0.001 / static_cast<double>(1u << numerology));
+    EligibilityOverlapTracker eligibilityTracker(ueDrxModels,
+                                                  &radioController,
+                                                  eligibilitySampleInterval,
+                                                  Seconds(simTime));
     OfficialEnergyMetrics energyMetrics(gnbEnergyModels, ueEnergyModels, ueNodes);
+    Ptr<NrGnbEnergyModel> gnbEnergyModel =
+        DynamicCast<NrGnbEnergyModel>(gnbEnergyModels.Get(0));
+    NS_ABORT_MSG_IF(!gnbEnergyModel,
+                    "The Cell-DTX controller needs the carrier-level gNB energy model");
+    radioController.SetGnbEnergyModel(gnbEnergyModel);
     if (enableTrueBwp)
     {
         const double initializeEnergySec = std::max(0.0, trafficStartSec - 1e-6);
@@ -1975,13 +2717,17 @@ int main(int argc, char *argv[])
                                            controllerMinActiveMs, controllerMaxActiveMs,
                                            controllerInitialActiveMs,
                                            controllerStepUpMs, controllerStepDownMs,
-                                           controllerBacklogThresholdBytes, timelineCsvName,
+                                           controllerQueueWarnRatio, controllerQueueHighRatio,
+                                           controllerBwpDwellMs,
+                                           timelineCsvName,
                                            controllerWarmupMs,
+                                           initialBwp,
                                            enableTrueBwp && enableBwpDynamic,
                                            ueNetDev,
                                            ueEnergyModels);
     bool dynamicControlEnabled = enableQueueAware || enableRlIpc || enableBwpDynamic;
     radioController.Start(cellDtxActiveMs, initialBwp);
+    eligibilityTracker.Start(Seconds(trafficStartSec));
     if (dynamicControlEnabled)
     {
         dynamicController.Start();
@@ -1993,8 +2739,18 @@ int main(int argc, char *argv[])
     monitor->CheckForLostPackets();
     FlowMonitor::FlowStatsContainer flowStats = monitor->GetFlowStats();
     uint64_t totalRxBytes = 0;
+    uint64_t flowTxPackets = 0;
+    uint64_t flowRxPackets = 0;
+    uint64_t flowLostPackets = 0;
+    uint64_t flowTxBytes = 0;
+    uint64_t flowRxBytes = 0;
     for (auto iter = flowStats.begin(); iter != flowStats.end(); ++iter)
     {
+        flowTxPackets += iter->second.txPackets;
+        flowRxPackets += iter->second.rxPackets;
+        flowLostPackets += iter->second.lostPackets;
+        flowTxBytes += iter->second.txBytes;
+        flowRxBytes += iter->second.rxBytes;
         totalRxBytes += iter->second.rxBytes;
     }
 
@@ -2005,16 +2761,84 @@ int main(int argc, char *argv[])
     double totalRxMbits = (totalRxBytes * 8.0) / 1e6;
     double energyEff = (totalEnergy > 0) ? (totalRxMbits / totalEnergy) : 0.0;
     double p99Latency = delayTracker.GetP99Latency();
+    double p50Latency = delayTracker.GetLatencyPercentile(0.50);
+    double p95Latency = delayTracker.GetLatencyPercentile(0.95);
     double qosSatisfaction = delayTracker.GetQosSatisfactionRate(qosTargetDelayMs);
+    double qos20 = delayTracker.GetQosSatisfactionRate(20.0);
+    double qos30 = delayTracker.GetQosSatisfactionRate(30.0);
+    double qos50 = delayTracker.GetQosSatisfactionRate(50.0);
+    std::string perUeP99LatencyMs = delayTracker.GetPerUeLatencyPercentile(0.99);
+    std::string perUeQos20Pct = delayTracker.GetPerUeQosSatisfactionRate(20.0);
+    std::string perUeQos30Pct = delayTracker.GetPerUeQosSatisfactionRate(30.0);
+    std::string perUeQos50Pct = delayTracker.GetPerUeQosSatisfactionRate(50.0);
+    double ueAwakePct = eligibilityTracker.GetAwakePct();
+    double ueAwakeCellInactivePct = eligibilityTracker.GetAwakeCellInactivePct();
+    double wasteWithinUeAwakePct = eligibilityTracker.GetWasteWithinAwakePct();
+    std::string ueAwakeCellInactivePctPerUe =
+        eligibilityTracker.GetAwakeCellInactivePctPerUe();
+    std::string wasteWithinUeAwakePctPerUe =
+        eligibilityTracker.GetWasteWithinAwakePctPerUe();
+
+    uint64_t rlcTxDropPackets = 0;
+    uint64_t rlcTxDropBytes = 0;
+    for (const auto& [key, counters] : delayTracker.GetDropByBearer())
+    {
+        rlcTxDropPackets += counters.first;
+        rlcTxDropBytes += counters.second;
+    }
+    const uint64_t harqNackEvents = harqDiagnostics.GetTotalNacks();
+    const uint32_t harqMaxRetx = harqDiagnostics.GetMaxRetx();
+    const uint64_t unattributedFlowLostPackets =
+        flowLostPackets > rlcTxDropPackets ? flowLostPackets - rlcTxDropPackets : 0;
 
     std::cout << "OfferedTxBytes=" << delayTracker.GetTotalTxBytes()
               << ", PendingBytes=" << delayTracker.GetPendingBytes()
-              << ", AppRxBytes=" << delayTracker.GetTotalRxBytes() << std::endl;
+              << ", PendingBytesAtTrafficStop=" << pendingAtTrafficStop
+              << ", AppRxBytes=" << delayTracker.GetTotalRxBytes()
+              << ", TrackerDropBytes=" << delayTracker.GetTotalDropBytes()
+              << ", FlowTxPackets=" << flowTxPackets
+              << ", FlowRxPackets=" << flowRxPackets
+              << ", FlowLostPackets=" << flowLostPackets
+              << ", RlcTxDropPackets=" << rlcTxDropPackets
+              << ", RlcTxDropBytes=" << rlcTxDropBytes
+              << ", HarqNackEvents=" << harqNackEvents
+              << ", HarqMaxRetx=" << harqMaxRetx
+              << ", UnattributedFlowLostPackets=" << unattributedFlowLostPackets
+              << ", FlowTxBytes=" << flowTxBytes
+              << ", FlowRxBytes=" << flowRxBytes << std::endl;
+    std::cout << "UeAwakePct=" << ueAwakePct
+              << ", UeAwakeCellInactivePct=" << ueAwakeCellInactivePct
+              << ", WasteWithinUeAwakePct=" << wasteWithinUeAwakePct
+              << ", UeAwakeCellInactivePctPerUe=" << ueAwakeCellInactivePctPerUe
+              << ", WasteWithinUeAwakePctPerUe=" << wasteWithinUeAwakePctPerUe
+              << std::endl;
+    std::cout << "PerUeP99LatencyMs=" << perUeP99LatencyMs
+              << ", PerUeQos20Pct=" << perUeQos20Pct
+              << ", PerUeQos30Pct=" << perUeQos30Pct
+              << ", PerUeQos50Pct=" << perUeQos50Pct << std::endl;
+    PrintDlBearerBufferStats(scheduler, "simulation-end");
+    for (const auto& [key, counters] : delayTracker.GetDropByBearer())
+    {
+        std::cout << "RlcBearerDrop,Rnti=" << key.first
+                  << ",Lcid=" << static_cast<uint32_t>(key.second)
+                  << ",Packets=" << counters.first
+                  << ",Bytes=" << counters.second << std::endl;
+    }
+    if (rlcBearerProbe)
+    {
+        rlcBearerProbe->PrintPeaks();
+    }
+    harqDiagnostics.Print();
 
     double ueAvgPowerMw = energyMetrics.GetAvgUePowerMwPerUe();
     double ueTotalEnergy = energyMetrics.GetTotalUeEnergyJ();
     double ueBatteryMah = energyMetrics.GetBatteryConsumptionMah();
     double ue3EnergyJoules = energyMetrics.GetUeEnergyJ(2);
+    for (uint32_t ueId = 0; ueId < ueNetDev.GetN(); ++ueId)
+    {
+        std::cout << "UeEnergyJ[" << ueId << "]=" << energyMetrics.GetUeEnergyJ(ueId)
+                  << std::endl;
+    }
 
     std::cout << "EnergyModel=5G-LENA-Official-TR38.864/TR38.840"
               << ", GnbRefConfig=" << gnbEnergyRefConfig
@@ -2035,7 +2859,7 @@ int main(int argc, char *argv[])
                       : 100u)
               << std::endl;
 
-    ExportStatsToCsv(csvFileName, Simulator::Now().GetSeconds(), enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules);
+    ExportStatsToCsv(csvFileName, Simulator::Now().GetSeconds(), numUes, enableGating, enableQueueAware, cellDtxPeriodMs, finalActiveMs, udpPacketRateMbps, totalRxBytes, delayTracker.GetTotalDropBytes(), delayTracker.GetPendingBytes(), pendingAtTrafficStop, rlcTxDropPackets, rlcTxDropBytes, harqNackEvents, harqMaxRetx, unattributedFlowLostPackets, flowTxPackets, flowRxPackets, flowLostPackets, flowTxBytes, flowRxBytes, avgPower, totalEnergy, energyEff, p99Latency, qosSatisfaction, enableCdrx, enableDciDynamic, enableBwpDynamic, phaseOffsetMs, ueCdrxOffsetsMs, cdrxInactivityMs, ueCdrxInactivityMs, ueAvgPowerMw, ueTotalEnergy, ueBatteryMah, ue3EnergyJoules, p50Latency, p95Latency, qos20, qos30, qos50, ueAwakePct, ueAwakeCellInactivePct, wasteWithinUeAwakePct, ueAwakeCellInactivePctPerUe, wasteWithinUeAwakePctPerUe, perUeP99LatencyMs, perUeQos20Pct, perUeQos30Pct, perUeQos50Pct);
 
     Simulator::Destroy();
     return 0;

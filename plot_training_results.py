@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-5G-Advanced Joint 2D DRL Agent Training Results Plotter
-File: plot_training_results.py
-
-Visualizes PPO DRL training results:
-1. Episode Reward Convergence Curve
-2. P99 Latency Reduction Trend (with 20ms SLA Target Line)
-3. Power Consumption Trade-off (gNB Power & UE Power)
-"""
+"""Plot PPO training convergence, optimization diagnostics, QoS, and energy."""
 
 import argparse
 import csv
@@ -20,7 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-CSV_COLUMNS = {
+REQUIRED_COLUMNS = {
     "Episode",
     "EpisodeReward",
     "AvgP99LatencyMs",
@@ -28,6 +20,39 @@ CSV_COLUMNS = {
     "AvgUePowerMw",
     "Loss",
 }
+
+OPTIONAL_COLUMNS = {
+    "reward_gnb": "RewardGnbPower",
+    "reward_ue": "RewardUePower",
+    "reward_latency": "RewardLatency",
+    "reward_backlog": "RewardBacklog",
+    "policy_loss": "PolicyLoss",
+    "value_loss": "ValueLoss",
+    "entropy": "Entropy",
+    "approx_kl": "ApproxKl",
+    "clip_fraction": "ClipFraction",
+    "qos_satisfaction_pct": "QosSatisfactionRatePct",
+    "sla_violation_rate": "SlaViolationRate",
+    "qos_target_ms": "QosTargetMs",
+    "gnb_efficiency": "GnbEnergyEfficiencyMbitPerJ",
+    "network_efficiency": "NetworkEnergyEfficiencyMbitPerJ",
+    "gnb_kwh_per_tb": "GnbEnergyKwhPerTb",
+    "offered_rate": "AvgOfferedRateMbps",
+    "delivered_rate": "AvgDeliveredRateMbps",
+    "backlog": "AvgBacklogBytes",
+    "max_ue_backlog": "AvgMaxUeBacklogBytes",
+}
+
+
+def _float_column(rows, column, default=np.nan):
+    values = []
+    for row in rows:
+        raw_value = row.get(column, "")
+        try:
+            values.append(float(raw_value))
+        except (TypeError, ValueError):
+            values.append(default)
+    return np.asarray(values, dtype=float)
 
 
 def load_history(csv_filename):
@@ -37,7 +62,7 @@ def load_history(csv_filename):
 
     with csv_path.open("r", newline="", encoding="utf-8") as csv_file:
         reader = csv.DictReader(csv_file)
-        missing_columns = CSV_COLUMNS.difference(reader.fieldnames or [])
+        missing_columns = REQUIRED_COLUMNS.difference(reader.fieldnames or [])
         if missing_columns:
             missing = ", ".join(sorted(missing_columns))
             raise ValueError(f"Training history CSV is missing columns: {missing}")
@@ -47,14 +72,17 @@ def load_history(csv_filename):
         raise ValueError(f"Training history CSV has no episode rows: {csv_path}")
 
     try:
-        return {
+        history = {
             "episodes": np.array([int(row["Episode"]) for row in rows]),
-            "episode_rewards": np.array([float(row["EpisodeReward"]) for row in rows]),
-            "p99_latencies": np.array([float(row["AvgP99LatencyMs"]) for row in rows]),
-            "gnb_powers": np.array([float(row["AvgGnbPowerW"]) for row in rows]),
-            "ue_powers": np.array([float(row["AvgUePowerMw"]) for row in rows]),
-            "losses": np.array([float(row["Loss"]) for row in rows]),
+            "episode_rewards": _float_column(rows, "EpisodeReward"),
+            "p99_latencies": _float_column(rows, "AvgP99LatencyMs"),
+            "gnb_powers": _float_column(rows, "AvgGnbPowerW"),
+            "ue_powers": _float_column(rows, "AvgUePowerMw"),
+            "losses": _float_column(rows, "Loss"),
         }
+        for key, column in OPTIONAL_COLUMNS.items():
+            history[key] = _float_column(rows, column)
+        return history
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Training history CSV contains invalid numeric data: {csv_path}") from exc
 
@@ -65,99 +93,293 @@ def parse_args():
     )
     parser.add_argument("--history-csv", default="ppo_training_history.csv")
     parser.add_argument("--output", default="plot_training_results.png")
-    parser.add_argument("--smooth-window", type=int, default=3)
+    parser.add_argument("--smooth-window", type=int, default=5)
+    parser.add_argument(
+        "--qos-target-ms",
+        type=float,
+        default=None,
+        help="Override the CSV QoS target; legacy CSV files default to 20 ms",
+    )
     args = parser.parse_args()
 
     if args.smooth_window <= 0:
         parser.error("--smooth-window must be greater than zero")
+    if args.qos_target_ms is not None and args.qos_target_ms <= 0:
+        parser.error("--qos-target-ms must be greater than zero")
 
     return args
+
+
+def _has_data(values):
+    return np.any(np.isfinite(values))
+
+
+def _plot_series(ax, episodes, values, label, color, marker=None, alpha=0.35):
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return
+    ax.plot(
+        episodes[finite],
+        values[finite],
+        color=color,
+        linewidth=1.1,
+        marker=marker,
+        markersize=3,
+        alpha=alpha,
+        label=f"{label} (raw)",
+    )
+
+
+def _plot_smoothed(ax, episodes, values, label, color, window, linestyle="-"):
+    finite = np.isfinite(values)
+    x = episodes[finite]
+    y = values[finite]
+    if len(y) == 0:
+        return
+    effective_window = min(window, len(y))
+    if effective_window == 1:
+        smooth = y
+        smooth_x = x
+    else:
+        kernel = np.ones(effective_window) / effective_window
+        smooth = np.convolve(y, kernel, mode="valid")
+        smooth_x = x[effective_window - 1:]
+    ax.plot(
+        smooth_x,
+        smooth,
+        color=color,
+        linewidth=2.1,
+        linestyle=linestyle,
+        label=f"{label} ({effective_window}-ep mean)",
+    )
+
+
+def _combined_legend(ax, twin=None, loc="best"):
+    handles, labels = ax.get_legend_handles_labels()
+    if twin is not None:
+        twin_handles, twin_labels = twin.get_legend_handles_labels()
+        handles += twin_handles
+        labels += twin_labels
+    if handles:
+        ax.legend(handles, labels, loc=loc, fontsize=8, frameon=True)
 
 
 def main():
     args = parse_args()
     history = load_history(args.history_csv)
-
     print(f"📊 Reading training history from: {Path(args.history_csv).resolve()}")
 
     episodes = history["episodes"]
-    rewards = np.array(history["episode_rewards"])
-    p99_latencies = np.array(history["p99_latencies"])
-    gnb_powers = np.array(history["gnb_powers"])
-    ue_powers = np.array(history["ue_powers"])
-    
-    # Configure publication-quality Seaborn theme
-    sns.set_theme(style='whitegrid', palette='colorblind', font='DejaVu Sans')
-    
-    fig, axes = plt.subplots(3, 1, figsize=(11, 13), sharex=True)
-    fig.suptitle('5G-Advanced Joint 2D DRL (PPO) Convergence & Performance Analysis', 
-                 fontsize=14, fontweight='bold', y=0.98)
-    
-    # Subplot 1: Episode Reward Convergence Curve
-    ax1 = axes[0]
-    ax1.plot(episodes, rewards, color='#2b5c8f', linewidth=2.2, marker='o', markersize=4, label='Episode Reward')
-    
     window = args.smooth_window
-    if len(rewards) >= window:
-        rewards_smooth = np.convolve(rewards, np.ones(window)/window, mode='valid')
-        ax1.plot(episodes[window-1:], rewards_smooth, color='#e74c3c', linestyle='--', linewidth=2.0, label=f'Moving Average ({window} Ep)')
-        
-    ax1.set_title('Episode Reward Convergence (Multi-Objective Optimization)', fontsize=11, fontweight='bold', loc='left')
-    ax1.set_ylabel('Reward Score', fontsize=10, fontweight='bold')
-    ax1.legend(loc='lower right', frameon=True)
-    
-    ax1.annotate(f'Initial: {rewards[0]:.1f}', xy=(episodes[0], rewards[0]),
-                 xytext=(10, 10), textcoords='offset points',
-                 arrowprops=dict(facecolor='#2b5c8f', shrink=0.08, width=1, headwidth=5),
-                 fontsize=9, fontweight='bold')
-    if len(rewards) > 1:
-        ax1.annotate(f'Final: {rewards[-1]:.1f}', xy=(episodes[-1], rewards[-1]),
-                     xytext=(-75, -25), textcoords='offset points',
-                     arrowprops=dict(facecolor='#2b5c8f', shrink=0.08, width=1, headwidth=5),
-                     fontsize=9, fontweight='bold')
-                 
-    # Subplot 2: P99 Latency Reduction Trend
-    ax2 = axes[1]
-    ax2.plot(episodes, p99_latencies, color='#d35400', linewidth=2.2, marker='s', markersize=4, label='Avg P99 Latency')
-    
-    ax2.axhline(y=20.0, color='#27ae60', linestyle='--', linewidth=2.0, label='20 ms QoS SLA Target Bound')
-    ax2.fill_between(episodes, 0, 20.0, color='#27ae60', alpha=0.1, label='SLA Compliant Zone')
-    
-    ax2.set_title('P99 Tail Latency Reduction Trend (Target SLA = 20.0 ms)', fontsize=11, fontweight='bold', loc='left')
-    ax2.set_ylabel('P99 Latency (ms)', fontsize=10, fontweight='bold')
-    ax2.set_ylim(0, max(max(p99_latencies) * 1.15, 30.0))
-    ax2.legend(loc='upper right', frameon=True)
-    
-    # Subplot 3: Power Consumption Trade-off
-    ax3 = axes[2]
-    color_gnb = '#2980b9'
-    color_ue = '#8e44ad'
-    
-    line1 = ax3.plot(episodes, gnb_powers, color=color_gnb, linewidth=2.2, marker='^', markersize=4, label='gNB Power (W)')
-    ax3.set_ylabel('gNB Avg Power (W)', color=color_gnb, fontsize=10, fontweight='bold')
-    ax3.tick_params(axis='y', labelcolor=color_gnb)
-    
-    ax3_twin = ax3.twinx()
-    line2 = ax3_twin.plot(episodes, ue_powers, color=color_ue, linewidth=2.2, marker='v', markersize=4, label='UE Power (mW)')
-    ax3_twin.set_ylabel('UE Avg Power (mW)', color=color_ue, fontsize=10, fontweight='bold')
-    ax3_twin.tick_params(axis='y', labelcolor=color_ue)
-    
-    lines = line1 + line2
-    labels = [l.get_label() for l in lines]
-    ax3.legend(lines, labels, loc='lower right', frameon=True)
-    
-    ax3.set_title('gNB vs UE Power Consumption Trade-off Balancing', fontsize=11, fontweight='bold', loc='left')
-    ax3.set_xlabel('Training Episodes', fontsize=10, fontweight='bold')
-    
+    csv_targets = history["qos_target_ms"]
+    if args.qos_target_ms is not None:
+        qos_targets = np.full(len(episodes), args.qos_target_ms, dtype=float)
+    elif _has_data(csv_targets):
+        qos_targets = csv_targets
+    else:
+        qos_targets = np.full(len(episodes), 20.0, dtype=float)
+
+    qos_satisfaction = history["qos_satisfaction_pct"].copy()
+    if not _has_data(qos_satisfaction) and _has_data(history["sla_violation_rate"]):
+        qos_satisfaction = 100.0 * (1.0 - history["sla_violation_rate"])
+
+    sns.set_theme(style="whitegrid", palette="colorblind", font="DejaVu Sans")
+    fig, axes = plt.subplots(4, 2, figsize=(15, 19), sharex=True)
+    fig.suptitle(
+        "5G-Advanced Joint 2D PPO Training Diagnostics",
+        fontsize=15,
+        fontweight="bold",
+        y=0.995,
+    )
+
+    ax = axes[0, 0]
+    rewards = history["episode_rewards"]
+    _plot_series(ax, episodes, rewards, "Episode reward", "#2b5c8f", "o")
+    _plot_smoothed(ax, episodes, rewards, "Episode reward", "#2b5c8f", window)
+    ax.set_title("Reward Convergence", fontweight="bold", loc="left")
+    ax.set_ylabel("Episode reward")
+    _combined_legend(ax)
+
+    ax = axes[0, 1]
+    reward_components = [
+        ("gNB power", history["reward_gnb"], "#2980b9"),
+        ("UE power", history["reward_ue"], "#8e44ad"),
+        ("P99 latency", history["reward_latency"], "#d35400"),
+        ("Backlog", history["reward_backlog"], "#16a085"),
+    ]
+    for label, values, color in reward_components:
+        _plot_smoothed(ax, episodes, values, label, color, window)
+    if not any(_has_data(values) for _, values, _ in reward_components):
+        ax.text(
+            0.5,
+            0.5,
+            "Reward components unavailable in legacy CSV",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("Reward Decomposition", fontweight="bold", loc="left")
+    ax.set_ylabel("Episode reward contribution")
+    _combined_legend(ax)
+
+    ax = axes[1, 0]
+    _plot_smoothed(
+        ax, episodes, history["losses"], "Total loss", "#2c3e50", window
+    )
+    _plot_smoothed(
+        ax, episodes, history["policy_loss"], "Policy loss", "#c0392b", window
+    )
+    _plot_smoothed(
+        ax, episodes, history["value_loss"], "Value loss", "#27ae60", window
+    )
+    entropy_ax = ax.twinx()
+    _plot_smoothed(
+        entropy_ax,
+        episodes,
+        history["entropy"],
+        "Policy entropy",
+        "#f39c12",
+        window,
+        linestyle="--",
+    )
+    ax.set_title("PPO Loss Decomposition", fontweight="bold", loc="left")
+    ax.set_ylabel("Loss")
+    entropy_ax.set_ylabel("Entropy", color="#f39c12")
+    entropy_ax.tick_params(axis="y", labelcolor="#f39c12")
+    _combined_legend(ax, entropy_ax)
+
+    ax = axes[1, 1]
+    p99 = history["p99_latencies"]
+    _plot_series(ax, episodes, p99, "Average P99 latency", "#d35400", "s")
+    _plot_smoothed(
+        ax, episodes, p99, "Average P99 latency", "#d35400", window
+    )
+    ax.plot(
+        episodes,
+        qos_targets,
+        color="#1e8449",
+        linestyle="--",
+        linewidth=2.0,
+        label="QoS target",
+    )
+    qos_ax = ax.twinx()
+    if _has_data(qos_satisfaction):
+        qos_ax.plot(
+            episodes,
+            qos_satisfaction,
+            color="#2471a3",
+            linewidth=1.8,
+            label="QoS satisfaction",
+        )
+    ax.set_title("Tail Latency and QoS Compliance", fontweight="bold", loc="left")
+    ax.set_ylabel("P99 latency (ms)")
+    qos_ax.set_ylabel("QoS satisfaction (%)", color="#2471a3")
+    qos_ax.set_ylim(0.0, 105.0)
+    qos_ax.tick_params(axis="y", labelcolor="#2471a3")
+    _combined_legend(ax, qos_ax)
+
+    ax = axes[2, 0]
+    _plot_smoothed(
+        ax,
+        episodes,
+        history["gnb_efficiency"],
+        "gNB efficiency",
+        "#2980b9",
+        window,
+    )
+    _plot_smoothed(
+        ax,
+        episodes,
+        history["network_efficiency"],
+        "Network efficiency",
+        "#16a085",
+        window,
+    )
+    kwh_ax = ax.twinx()
+    _plot_smoothed(
+        kwh_ax,
+        episodes,
+        history["gnb_kwh_per_tb"],
+        "gNB energy intensity",
+        "#7f8c8d",
+        window,
+        linestyle="--",
+    )
+    ax.set_title("Energy Efficiency", fontweight="bold", loc="left")
+    ax.set_ylabel("Delivered traffic (Mbit/J)")
+    kwh_ax.set_ylabel("gNB energy intensity (kWh/TB)", color="#7f8c8d")
+    kwh_ax.tick_params(axis="y", labelcolor="#7f8c8d")
+    _combined_legend(ax, kwh_ax)
+
+    ax = axes[2, 1]
+    _plot_smoothed(
+        ax, episodes, history["gnb_powers"], "gNB power", "#2980b9", window
+    )
+    ue_ax = ax.twinx()
+    _plot_smoothed(
+        ue_ax, episodes, history["ue_powers"], "UE power", "#8e44ad", window
+    )
+    ax.set_title("gNB and UE Power", fontweight="bold", loc="left")
+    ax.set_ylabel("Average gNB power (W)", color="#2980b9")
+    ue_ax.set_ylabel("Average UE power (mW/UE)", color="#8e44ad")
+    ax.tick_params(axis="y", labelcolor="#2980b9")
+    ue_ax.tick_params(axis="y", labelcolor="#8e44ad")
+    _combined_legend(ax, ue_ax)
+
+    ax = axes[3, 0]
+    _plot_series(
+        ax, episodes, history["offered_rate"], "Offered load",
+        "#c0392b", "o", alpha=0.25,
+    )
+    _plot_smoothed(
+        ax, episodes, history["offered_rate"], "Offered load",
+        "#c0392b", window,
+    )
+    _plot_series(
+        ax, episodes, history["delivered_rate"], "Delivered throughput",
+        "#2471a3", "s", alpha=0.25,
+    )
+    _plot_smoothed(
+        ax, episodes, history["delivered_rate"], "Delivered throughput",
+        "#2471a3", window,
+    )
+    ax.set_title("Offered Load and Delivered Throughput", fontweight="bold", loc="left")
+    ax.set_ylabel("Aggregate traffic (Mbps)")
+    _combined_legend(ax)
+
+    ax = axes[3, 1]
+    delivery_ratio = np.divide(
+        100.0 * history["delivered_rate"],
+        history["offered_rate"],
+        out=np.full_like(history["delivered_rate"], np.nan),
+        where=history["offered_rate"] > 0.0,
+    )
+    _plot_smoothed(
+        ax, episodes, delivery_ratio, "Delivery ratio", "#1e8449", window,
+    )
+    backlog_ax = ax.twinx()
+    _plot_smoothed(
+        backlog_ax, episodes, history["backlog"], "RLC backlog",
+        "#7d3c98", window, linestyle="--",
+    )
+    ax.set_title("Traffic Delivery and Queue", fontweight="bold", loc="left")
+    ax.set_ylabel("Delivered / offered (%)", color="#1e8449")
+    backlog_ax.set_ylabel("Average RLC backlog (bytes)", color="#7d3c98")
+    ax.tick_params(axis="y", labelcolor="#1e8449")
+    backlog_ax.tick_params(axis="y", labelcolor="#7d3c98")
+    _combined_legend(ax, backlog_ax)
+
+    for ax in axes[3, :]:
+        ax.set_xlabel("Training episode")
     sns.despine(fig=fig, right=False)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+
     output_png = Path(args.output).expanduser().resolve()
     output_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_png, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✅ Training results plot saved successfully to: {output_png}")
+    fig.savefig(output_png, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"✅ Training diagnostics plot saved to: {output_png}")
 
 
 if __name__ == "__main__":
