@@ -1,0 +1,588 @@
+diff --git a/helper/nr-energy-helper.cc b/helper/nr-energy-helper.cc
+index cedb4d12..3ffa007e 100644
+--- a/helper/nr-energy-helper.cc
++++ b/helper/nr-energy-helper.cc
+@@ -111,6 +111,20 @@ NrEnergyHelper::SetDrxModelAttribute(std::string n, const AttributeValue& v)
+     m_drxFactory.Set(n, v);
+ }
+ 
++void
++NrEnergyHelper::SetDrxStartOffsets(const std::vector<Time>& offsets)
++{
++    NS_LOG_FUNCTION(this << offsets.size());
++    m_drxStartOffsets = offsets;
++}
++
++void
++NrEnergyHelper::SetDrxInactivityTimers(const std::vector<Time>& timers)
++{
++    NS_LOG_FUNCTION(this << timers.size());
++    m_drxInactivityTimers = timers;
++}
++
+ void
+ NrEnergyHelper::EnableDrx(bool enable)
+ {
+@@ -317,6 +331,11 @@ NrEnergyHelper::InstallUe(NetDeviceContainer ueDevs,
+     NS_LOG_FUNCTION(this << ueDevs.GetN() << bwpIndex);
+     NS_ASSERT_MSG(ueDevs.GetN() == sources.GetN(),
+                   "One energy source per UE device is required (index-aligned)");
++    NS_ABORT_MSG_IF(!m_drxStartOffsets.empty() && m_drxStartOffsets.size() != ueDevs.GetN(),
++                    "Per-UE DRX offset count must match the UE device count");
++    NS_ABORT_MSG_IF(!m_drxInactivityTimers.empty() &&
++                        m_drxInactivityTimers.size() != ueDevs.GetN(),
++                    "Per-UE DRX inactivity timer count must match the UE device count");
+ 
+     energy::DeviceEnergyModelContainer models;
+     for (uint32_t i = 0; i < ueDevs.GetN(); ++i)
+@@ -345,9 +364,17 @@ NrEnergyHelper::InstallUe(NetDeviceContainer ueDevs,
+             // The DRX model owns the sleep transitions; the listener restarts
+             // its inactivity timer on each transport block.
+             Ptr<NrUeDrxModel> drx = m_drxFactory.Create<NrUeDrxModel>();
++            if (!m_drxStartOffsets.empty())
++            {
++                drx->SetAttribute("StartOffset", TimeValue(m_drxStartOffsets[i]));
++            }
++            if (!m_drxInactivityTimers.empty())
++            {
++                drx->SetAttribute("InactivityTimer", TimeValue(m_drxInactivityTimers[i]));
++            }
+             drx->SetEnergyModel(model);
+             listener->SetDrxModel(drx);
+-            drx->Start(Simulator::Now());
++            drx->Start(Simulator::Now() + drx->GetStartOffset());
+             dev->GetNode()->AggregateObject(drx);
+         }
+ 
+@@ -368,6 +395,11 @@ NrEnergyHelper::InstallUeAllBwps(NetDeviceContainer ueDevs,
+     NS_LOG_FUNCTION(this << ueDevs.GetN() << initialBwpIndex);
+     NS_ASSERT_MSG(ueDevs.GetN() == sources.GetN(),
+                   "One energy source per UE device is required (index-aligned)");
++    NS_ABORT_MSG_IF(!m_drxStartOffsets.empty() && m_drxStartOffsets.size() != ueDevs.GetN(),
++                    "Per-UE DRX offset count must match the UE device count");
++    NS_ABORT_MSG_IF(!m_drxInactivityTimers.empty() &&
++                        m_drxInactivityTimers.size() != ueDevs.GetN(),
++                    "Per-UE DRX inactivity timer count must match the UE device count");
+ 
+     energy::DeviceEnergyModelContainer models;
+     for (uint32_t i = 0; i < ueDevs.GetN(); ++i)
+@@ -402,9 +434,17 @@ NrEnergyHelper::InstallUeAllBwps(NetDeviceContainer ueDevs,
+         if (m_enableDrx)
+         {
+             Ptr<NrUeDrxModel> drx = m_drxFactory.Create<NrUeDrxModel>();
++            if (!m_drxStartOffsets.empty())
++            {
++                drx->SetAttribute("StartOffset", TimeValue(m_drxStartOffsets[i]));
++            }
++            if (!m_drxInactivityTimers.empty())
++            {
++                drx->SetAttribute("InactivityTimer", TimeValue(m_drxInactivityTimers[i]));
++            }
+             drx->SetEnergyModel(model);
+             listener->SetDrxModel(drx);
+-            drx->Start(Simulator::Now());
++            drx->Start(Simulator::Now() + drx->GetStartOffset());
+             dev->GetNode()->AggregateObject(drx);
+         }
+ 
+diff --git a/helper/nr-energy-helper.h b/helper/nr-energy-helper.h
+index 669ef24b..3aaf656a 100644
+--- a/helper/nr-energy-helper.h
++++ b/helper/nr-energy-helper.h
+@@ -17,6 +17,7 @@
+ #include "ns3/device-energy-model-container.h"
+ #include "ns3/energy-source-container.h"
+ #include "ns3/net-device-container.h"
++#include "ns3/nstime.h"
+ #include "ns3/object-factory.h"
+ 
+ #include <functional>
+@@ -129,6 +130,28 @@ class NrEnergyHelper
+      */
+     void SetDrxModelAttribute(std::string n, const AttributeValue& v);
+ 
++    /**
++     * @brief Set a distinct C-DRX start offset for each UE installed afterwards.
++     *
++     * The vector must be empty, or contain one entry per UE device passed to
++     * InstallUe() or InstallUeAllBwps(). Per-UE values override the common
++     * StartOffset configured through SetDrxModelAttribute().
++     *
++     * @param offsets Start offsets indexed like the UE device container.
++     */
++    void SetDrxStartOffsets(const std::vector<Time>& offsets);
++
++    /**
++     * @brief Set a distinct C-DRX inactivity timer for each UE installed afterwards.
++     *
++     * The vector must be empty, or contain one entry per UE device passed to
++     * InstallUe() or InstallUeAllBwps(). Per-UE values override the common
++     * InactivityTimer configured through SetDrxModelAttribute().
++     *
++     * @param timers Inactivity timers indexed like the UE device container.
++     */
++    void SetDrxInactivityTimers(const std::vector<Time>& timers);
++
+     /**
+      * @brief Enable or disable C-DRX on the UEs installed afterwards.
+      *
+@@ -341,6 +364,8 @@ class NrEnergyHelper
+     std::map<uint32_t, std::vector<std::pair<std::string, Ptr<AttributeValue>>>> m_ccAttributes;
+     ObjectFactory m_ueModelFactory; //!< Builds NrUeEnergyModel instances
+     ObjectFactory m_drxFactory;     //!< Builds NrUeDrxModel instances
++    std::vector<Time> m_drxStartOffsets; //!< Optional per-UE DRX start offsets
++    std::vector<Time> m_drxInactivityTimers; //!< Optional per-UE inactivity timers
+ 
+     bool m_enableDrx; //!< Install a DRX model on each UE (default false)
+ };
+diff --git a/model/nr-gnb-energy-model.cc b/model/nr-gnb-energy-model.cc
+index 8b436a2a..0accf79a 100644
+--- a/model/nr-gnb-energy-model.cc
++++ b/model/nr-gnb-energy-model.cc
+@@ -337,6 +337,31 @@ NrGnbEnergyModel::GetTransitionTime(NrGnbPowerState state) const
+     return (it != GNB_TRANSITIONS.end()) ? it->second.totalTime : Seconds(0);
+ }
+ 
++NrGnbPowerState
++NrGnbEnergyModel::SelectSleepState(Time idleDuration) const
++{
++    NS_ABORT_MSG_IF(idleDuration < Seconds(0), "Idle duration cannot be negative");
++
++    NrGnbPowerState best = NrGnbPowerState::MicroSleep;
++    double bestEnergyJ =
++        ToWatts(GetRelativePower(best)) * idleDuration.GetSeconds();
++    for (const auto candidate : {NrGnbPowerState::LightSleep, NrGnbPowerState::DeepSleep})
++    {
++        if (idleDuration < GetTransitionTime(candidate))
++        {
++            continue;
++        }
++        const double energyJ = ToWatts(GetRelativePower(candidate)) * idleDuration.GetSeconds() +
++                               GetTransitionEnergyJ(candidate);
++        if (energyJ < bestEnergyJ)
++        {
++            best = candidate;
++            bestEnergyJ = energyJ;
++        }
++    }
++    return best;
++}
++
+ double
+ NrGnbEnergyModel::ToWatts(double relative) const
+ {
+@@ -541,9 +566,17 @@ NrGnbEnergyModel::ReportBwpOccupancy(uint32_t bwpIndex, const BwpOccupancy& occu
+                                "separate carriers.");
+     }
+ 
++    const bool hasRadioActivity =
++        occupancy.dlDataMask != 0 || occupancy.dlCtrlMask != 0 || occupancy.ulMask != 0;
++    NS_ABORT_MSG_IF(IsDeepOrLightSleep(m_currentState) && hasRadioActivity,
++                    "Radio activity reported while the gNB energy model is in deep/light sleep");
++
+     CommitInterval();
+     m_bwpOccupancy[bwpIndex] = occupancy;
+-    m_currentPowerW = EvaluateCarrierPowerW();
++    if (!IsDeepOrLightSleep(m_currentState))
++    {
++        m_currentPowerW = EvaluateCarrierPowerW();
++    }
+     m_powerTrace = GetInstantaneousPowerW();
+ }
+ 
+diff --git a/model/nr-gnb-energy-model.h b/model/nr-gnb-energy-model.h
+index 98a236bc..6e991fe4 100644
+--- a/model/nr-gnb-energy-model.h
++++ b/model/nr-gnb-energy-model.h
+@@ -381,6 +381,18 @@ class NrGnbEnergyModel : public energy::DeviceEnergyModel
+      */
+     Time GetTransitionTime(NrGnbPowerState state) const;
+ 
++    /**
++     * @brief Select the lowest-energy feasible sleep state for an idle interval.
++     *
++     * Micro sleep is always feasible. Deep and light sleep are considered only
++     * when the interval covers their total transition time, and their transition
++     * energy is included in the comparison.
++     *
++     * @param idleDuration Duration for which no radio activity is permitted
++     * @return Lowest-energy feasible sleep state
++     */
++    NrGnbPowerState SelectSleepState(Time idleDuration) const;
++
+     /**
+      * @brief Get the most recently computed Tx power ratio sp.
+      *
+diff --git a/model/nr-gnb-phy.cc b/model/nr-gnb-phy.cc
+index bf07da48..62b408e5 100644
+--- a/model/nr-gnb-phy.cc
++++ b/model/nr-gnb-phy.cc
+@@ -793,6 +793,10 @@ NrGnbPhy::StartSlot(const SfnSf& startSlot)
+         m_currSlotAllocInfo = SlotAllocInfo(m_currentSlot);
+     }
+ 
++    const bool cellDtxEligible = IsCellDtxSlotEligible(m_currentSlot);
++    NS_ABORT_MSG_IF(!cellDtxEligible && !m_currSlotAllocInfo.m_varTtiAllocInfo.empty(),
++                    "A PHY allocation overlaps a Cell-DTX sleep slot " << m_currentSlot);
++
+     if (m_isPrimary)
+     {
+         if (m_currentSlot.GetSlot() == 0)
+@@ -805,32 +809,32 @@ NrGnbPhy::StartSlot(const SfnSf& startSlot)
+             {
+                 m_pendingSib = true;
+             }
++        }
+ 
+-            const bool hasPendingSystemInfo = m_pendingMib || m_pendingSib;
+-            const bool canSendSystemInfo =
+-                hasPendingSystemInfo && IsDlCapableSlot(GetCurrentSlotType());
+-            if (canSendSystemInfo)
++        const bool hasPendingSystemInfo = m_pendingMib || m_pendingSib;
++        const bool canSendSystemInfo = hasPendingSystemInfo && cellDtxEligible &&
++                                       IsDlCapableSlot(GetCurrentSlotType());
++        if (canSendSystemInfo)
++        {
++            if (!m_currSlotAllocInfo.ContainsDlCtrlAllocation())
+             {
+-                if (!m_currSlotAllocInfo.ContainsDlCtrlAllocation())
+-                {
+-                    VarTtiAllocInfo dlCtrlSlot(m_phySapUser->GetDlCtrlDci());
+-                    m_currSlotAllocInfo.m_varTtiAllocInfo.push_front(dlCtrlSlot);
+-                    m_currSlotAllocInfo.m_numSymAlloc += m_phySapUser->GetDlCtrlSymbols();
+-                    NS_ASSERT_MSG(m_currSlotAllocInfo.m_numSymAlloc <= 14,
+-                                  "Invalid number of symbols: " << m_currSlotAllocInfo.m_numSymAlloc
+-                                                                << " symbols. ");
+-                }
++                VarTtiAllocInfo dlCtrlSlot(m_phySapUser->GetDlCtrlDci());
++                m_currSlotAllocInfo.m_varTtiAllocInfo.push_front(dlCtrlSlot);
++                m_currSlotAllocInfo.m_numSymAlloc += m_phySapUser->GetDlCtrlSymbols();
++                NS_ASSERT_MSG(m_currSlotAllocInfo.m_numSymAlloc <= 14,
++                              "Invalid number of symbols: " << m_currSlotAllocInfo.m_numSymAlloc
++                                                            << " symbols. ");
++            }
+ 
+-                if (m_pendingMib)
+-                {
+-                    QueueMib();
+-                    m_pendingMib = false;
+-                }
+-                if (m_pendingSib)
+-                {
+-                    QueueSib();
+-                    m_pendingSib = false;
+-                }
++            if (m_pendingMib)
++            {
++                QueueMib();
++                m_pendingMib = false;
++            }
++            if (m_pendingSib)
++            {
++                QueueSib();
++                m_pendingSib = false;
+             }
+         }
+     }
+@@ -2206,6 +2210,44 @@ NrGnbPhy::GetPattern() const
+     return NrPhy::GetPattern(m_tddPattern);
+ }
+ 
++void
++NrGnbPhy::ConfigureCellDtx(Time period, Time activeWindow, Time startOffset)
++{
++    NS_ABORT_MSG_IF(period <= Seconds(0), "Cell-DTX period must be positive");
++    NS_ABORT_MSG_IF(activeWindow < Seconds(0) || activeWindow > period,
++                    "Cell-DTX active window must be inside [0, period]");
++    m_cellDtxPeriod = period;
++    m_cellDtxActiveWindow = activeWindow;
++    m_cellDtxStartOffset = startOffset;
++    m_cellDtxEnabled = activeWindow < period;
++}
++
++void
++NrGnbPhy::DisableCellDtx()
++{
++    m_cellDtxEnabled = false;
++}
++
++bool
++NrGnbPhy::IsCellDtxSlotEligible(const SfnSf& targetSlot) const
++{
++    if (!m_cellDtxEnabled)
++    {
++        return true;
++    }
++
++    const int64_t periodNs = m_cellDtxPeriod.GetNanoSeconds();
++    const double slotsPerSecond = 1000.0 * (1u << targetSlot.GetNumerology());
++    const int64_t targetNs =
++        Seconds(static_cast<double>(targetSlot.Normalize()) / slotsPerSecond).GetNanoSeconds();
++    int64_t phaseNs = (targetNs - m_cellDtxStartOffset.GetNanoSeconds()) % periodNs;
++    if (phaseNs < 0)
++    {
++        phaseNs += periodNs;
++    }
++    return phaseNs < m_cellDtxActiveWindow.GetNanoSeconds();
++}
++
+ void
+ NrGnbPhy::SetPrimary()
+ {
+diff --git a/model/nr-gnb-phy.h b/model/nr-gnb-phy.h
+index 29e215f3..738d8454 100644
+--- a/model/nr-gnb-phy.h
++++ b/model/nr-gnb-phy.h
+@@ -322,6 +322,29 @@ class NR_EXPORT NrGnbPhy : public NrPhy
+      */
+     std::string GetPattern() const;
+ 
++    /**
++     * @brief Configure the Cell-DTX slots in which radio activity is permitted.
++     *
++     * This gate covers PHY-originated activity such as MIB/SIB in addition to
++     * scheduler allocations. System information that falls in an ineligible
++     * slot is deferred until the next eligible DL-capable slot.
++     *
++     * @param period Cell-DTX cycle length
++     * @param activeWindow Eligible duration at the start of each cycle
++     * @param startOffset Cycle start offset
++     */
++    void ConfigureCellDtx(Time period, Time activeWindow, Time startOffset = Seconds(0));
++
++    /** @brief Disable the PHY Cell-DTX eligibility gate. */
++    void DisableCellDtx();
++
++    /**
++     * @brief Check whether a target slot belongs to the Cell-DTX active window.
++     * @param targetSlot Slot to check
++     * @return true when radio activity is permitted
++     */
++    bool IsCellDtxSlotEligible(const SfnSf& targetSlot) const;
++
+     /**
+      * @brief Set the CSI-RS model
+      * @param csiRsModel to be used
+@@ -994,6 +1017,10 @@ class NR_EXPORT NrGnbPhy : public NrPhy
+     bool m_isPrimary{false};  //!< Is this PHY a primary phy?
+     bool m_pendingMib{false}; //!< Whether MIB transmission is deferred to a DL-capable slot
+     bool m_pendingSib{false}; //!< Whether SIB1 transmission is deferred to a DL-capable slot
++    bool m_cellDtxEnabled{false};           //!< Whether PHY Cell-DTX gating is enabled
++    Time m_cellDtxPeriod{Seconds(0)};       //!< Cell-DTX cycle length
++    Time m_cellDtxActiveWindow{Seconds(0)}; //!< Eligible duration in each cycle
++    Time m_cellDtxStartOffset{Seconds(0)};  //!< Cell-DTX cycle start offset
+ 
+     bool m_enableCsiRs{false}; //!< Whether to enable or disable CSI-RS signalling
+     CsiRsModel m_csiRsModel{CsiRsModel::CSI_RS_PER_UE}; //!< The CSI-RS model to be used
+diff --git a/model/nr-mac-scheduler-lcg.cc b/model/nr-mac-scheduler-lcg.cc
+index e991f810..be4a4632 100644
+--- a/model/nr-mac-scheduler-lcg.cc
++++ b/model/nr-mac-scheduler-lcg.cc
+@@ -215,6 +215,14 @@ NrMacSchedulerLCG::GetLC(uint8_t lcId)
+     return m_lcMap.at(lcId);
+ }
+ 
++const std::unique_ptr<NrMacSchedulerLC>&
++NrMacSchedulerLCG::GetLC(uint8_t lcId) const
++{
++    NS_ASSERT(!m_lcMap.empty());
++    NS_ABORT_IF(GetTotalSizeOfLC(lcId) == 0);
++    return m_lcMap.at(lcId);
++}
++
+ void
+ NrMacSchedulerLCG::AssignedData(uint8_t lcId, uint32_t size, std::string type)
+ {
+diff --git a/model/nr-mac-scheduler-lcg.h b/model/nr-mac-scheduler-lcg.h
+index da2326a5..11a531a7 100644
+--- a/model/nr-mac-scheduler-lcg.h
++++ b/model/nr-mac-scheduler-lcg.h
+@@ -207,6 +207,7 @@ class NR_EXPORT NrMacSchedulerLCG
+      * @return the LC Ptr for the LC ID
+      */
+     std::unique_ptr<NrMacSchedulerLC>& GetLC(uint8_t lcId);
++    const std::unique_ptr<NrMacSchedulerLC>& GetLC(uint8_t lcId) const;
+ 
+     /**
+      * @brief Inform the LCG of the assigned data to a LC id
+diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
+index 3658ede2..14af94de 100644
+--- a/model/nr-mac-scheduler-ns3.cc
++++ b/model/nr-mac-scheduler-ns3.cc
+@@ -665,6 +665,7 @@ NrMacSchedulerNs3::GetDlObservationStats() const
+     {
+         const auto& ue = entry.second;
+         const uint32_t ueBufferBytes = ue->GetTotalDlBuffer();
++        stats.perUeBufferBytes.push_back(ueBufferBytes);
+         stats.totalBufferBytes += ueBufferBytes;
+         stats.maxUeBufferBytes = std::max(stats.maxUeBufferBytes, ueBufferBytes);
+         mcsSum += static_cast<double>(ue->GetDlMcs());
+diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
+index db23fce0..6ac5da32 100644
+--- a/model/nr-mac-scheduler-ns3.h
++++ b/model/nr-mac-scheduler-ns3.h
+@@ -677,6 +677,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+         double meanMcs{0.0};
+         uint32_t ueCount{0};
+         uint32_t validCqiCount{0};
++        std::vector<uint32_t> perUeBufferBytes;
+     };
+ 
+     /**
+diff --git a/test/nr-test-energy-models.cc b/test/nr-test-energy-models.cc
+index 37462f7a..b8b64d98 100644
+--- a/test/nr-test-energy-models.cc
++++ b/test/nr-test-energy-models.cc
+@@ -540,6 +540,25 @@ NrGnbEnergyModelTransitionTestCase::DoRun()
+     NS_TEST_ASSERT_MSG_EQ(cat1->GetTransitionTime(NrGnbPowerState::LightSleep),
+                           MilliSeconds(6),
+                           "Cat 1 light sleep transition time");
++    NS_TEST_ASSERT_MSG_EQ(static_cast<int>(cat1->SelectSleepState(MilliSeconds(5))),
++                          static_cast<int>(NrGnbPowerState::MicroSleep),
++                          "an interval shorter than the light transition stays at P3");
++    NS_TEST_ASSERT_MSG_EQ(static_cast<int>(cat1->SelectSleepState(MilliSeconds(30))),
++                          static_cast<int>(NrGnbPowerState::LightSleep),
++                          "a 30 ms interval selects the energy-optimal feasible light sleep");
++    NS_TEST_ASSERT_MSG_EQ(static_cast<int>(cat1->SelectSleepState(MilliSeconds(70))),
++                          static_cast<int>(NrGnbPowerState::DeepSleep),
++                          "a 70 ms interval selects the energy-optimal feasible deep sleep");
++
++    Ptr<NrGnbEnergyModel> sleeping = CreateObject<NrGnbEnergyModel>();
++    sleeping->Initialize();
++    sleeping->ChangeState(static_cast<int>(NrGnbPowerState::LightSleep));
++    const double lightSleepPowerW = sleeping->GetCurrentPowerW();
++    sleeping->ReportBwpOccupancy(0, NrGnbEnergyModel::BwpOccupancy{});
++    NS_TEST_ASSERT_MSG_EQ_TOL(sleeping->GetCurrentPowerW(),
++                              lightSleepPowerW,
++                              1e-12,
++                              "an idle PHY report must not overwrite P2 while the gNB sleeps");
+ 
+     Ptr<NrGnbEnergyModel> cat2 = CreateObject<NrGnbEnergyModel>();
+     cat2->SetAttribute("BsCategory", StringValue("BsCat2"));
+@@ -1393,16 +1412,81 @@ class NrUeDrxModelCycleTestCase : public TestCase
+      */
+     void CheckState(NrUePowerState expected, std::string context);
+ 
++    void CheckEligibility(Time time, bool expected, std::string context);
++
+     Ptr<NrUeEnergyModel> m_ue; //!< Driven energy model
+     Ptr<NrUeDrxModel> m_drx;   //!< DRX model under test
+ };
+ 
++/**
++ * @brief DRX start offset controls eligibility and energy on one timeline.
++ */
++class NrUeDrxModelOffsetTestCase : public TestCase
++{
++  public:
++    NrUeDrxModelOffsetTestCase()
++        : TestCase("NrUeDrxModel start offset shifts scheduling and energy together")
++    {
++    }
++
++  private:
++    void DoRun() override;
++};
++
++void
++NrUeDrxModelOffsetTestCase::DoRun()
++{
++    Ptr<NrUeEnergyModel> ue = CreateObject<NrUeEnergyModel>();
++    Ptr<NrUeDrxModel> drx = CreateObject<NrUeDrxModel>();
++    drx->SetAttribute("LongCycle", TimeValue(MilliSeconds(40)));
++    drx->SetAttribute("OnDuration", TimeValue(MilliSeconds(10)));
++    drx->SetAttribute("StartOffset", TimeValue(MilliSeconds(20)));
++    drx->SetEnergyModel(ue);
++    drx->Start(Simulator::Now() + drx->GetStartOffset());
++
++    NS_TEST_ASSERT_MSG_EQ(drx->IsActiveAt(MilliSeconds(10)),
++                          false,
++                          "UE must be asleep before its first offset onDuration");
++    NS_TEST_ASSERT_MSG_EQ(drx->IsActiveAt(MilliSeconds(25)),
++                          true,
++                          "UE must be active inside its offset onDuration");
++    NS_TEST_ASSERT_MSG_EQ(drx->IsActiveAt(MilliSeconds(35)),
++                          false,
++                          "UE must sleep after its offset onDuration");
++
++    Simulator::Schedule(MilliSeconds(10), [this, ue]() {
++        NS_TEST_ASSERT_MSG_EQ(ue->GetCurrentState(),
++                              NR_UE_DEEP_SLEEP,
++                              "Energy model must sleep before the offset onDuration");
++    });
++    Simulator::Schedule(MilliSeconds(25), [this, ue]() {
++        NS_TEST_ASSERT_MSG_EQ(ue->GetCurrentState(),
++                              NR_UE_PDCCH_ONLY,
++                              "Energy model must wake at the offset onDuration");
++    });
++    Simulator::Schedule(MilliSeconds(35), [this, ue]() {
++        NS_TEST_ASSERT_MSG_EQ(ue->GetCurrentState(),
++                              NR_UE_DEEP_SLEEP,
++                              "Energy model must sleep after the offset onDuration");
++    });
++
++    Simulator::Stop(MilliSeconds(40));
++    Simulator::Run();
++    Simulator::Destroy();
++}
++
+ void
+ NrUeDrxModelCycleTestCase::CheckState(NrUePowerState expected, std::string context)
+ {
+     NS_TEST_ASSERT_MSG_EQ(m_ue->GetCurrentState(), expected, context);
+ }
+ 
++void
++NrUeDrxModelCycleTestCase::CheckEligibility(Time time, bool expected, std::string context)
++{
++    NS_TEST_ASSERT_MSG_EQ(m_drx->IsActiveAt(time), expected, context);
++}
++
+ void
+ NrUeDrxModelCycleTestCase::DoRun()
+ {
+@@ -1414,6 +1498,10 @@ NrUeDrxModelCycleTestCase::DoRun()
+     // deep-sleep threshold 20 ms.
+     m_drx->Start(Seconds(0));
+ 
++    CheckEligibility(MilliSeconds(4), true, "onDuration is scheduler-eligible");
++    CheckEligibility(MilliSeconds(12), false, "sleep interval is scheduler-ineligible");
++    CheckEligibility(MilliSeconds(164), true, "later-cycle onDuration is eligible");
++
+     // Inside the first onDuration: PDCCH monitoring.
+     Simulator::Schedule(MilliSeconds(4),
+                         &NrUeDrxModelCycleTestCase::CheckState,
+@@ -1440,12 +1528,24 @@ NrUeDrxModelCycleTestCase::DoRun()
+                         this,
+                         NR_UE_PDCCH_ONLY,
+                         std::string("inactivity timer keeps the UE awake"));
++    Simulator::Schedule(MilliSeconds(172),
++                        &NrUeDrxModelCycleTestCase::CheckEligibility,
++                        this,
++                        MilliSeconds(172),
++                        true,
++                        std::string("inactivity timer extends scheduler eligibility"));
+     // After the inactivity expiry: gap to 320 ms is 144 ms -> deep sleep.
+     Simulator::Schedule(MilliSeconds(180),
+                         &NrUeDrxModelCycleTestCase::CheckState,
+                         this,
+                         NR_UE_DEEP_SLEEP,
+                         std::string("sleeps again after inactivity expiry"));
++    Simulator::Schedule(MilliSeconds(180),
++                        &NrUeDrxModelCycleTestCase::CheckEligibility,
++                        this,
++                        MilliSeconds(180),
++                        false,
++                        std::string("scheduler eligibility ends with inactivity"));
+ 
+     // Third cycle boundary: activity 1 ms before the 320 ms cycle start, so
+     // the inactivity timer it arms (expires at 329 ms) is still pending when
+@@ -1499,6 +1599,7 @@ class NrEnergyModelsTestSuite : public TestSuite
+         AddTestCase(new NrGnbEnergyModelFormulaTestCase(), Duration::QUICK);
+         AddTestCase(new NrGnbEnergyModelSlotAccumTestCase(), Duration::QUICK);
+         AddTestCase(new NrUeDrxModelCycleTestCase(), Duration::QUICK);
++        AddTestCase(new NrUeDrxModelOffsetTestCase(), Duration::QUICK);
+     }
+ };
+ 
+

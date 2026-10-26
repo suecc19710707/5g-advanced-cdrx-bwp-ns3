@@ -47,6 +47,15 @@ def main() -> None:
                 cwd=NR_DIR,
             )
 
+    runtime_patches = sorted(
+        (ROOT / "experiment_archive/true_bwp_dci_v6_2026-10-19").glob(
+            "0003-nr-runtime-api-completion.patch"
+        )
+    )
+    if len(runtime_patches) != 1:
+        raise SystemExit("Expected exactly one runtime API completion patch")
+    run("git", "apply", str(runtime_patches[0]), cwd=NR_DIR)
+
 
 if __name__ == "__main__":
     main()

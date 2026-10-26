@@ -67,6 +67,7 @@ git am ../../experiment_archive/true_bwp_dci_v6_2026-10-19/000*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0001-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0002-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0004-*.patch
+git apply ../../experiment_archive/true_bwp_dci_v6_2026-10-19/0003-nr-runtime-api-completion.patch
 cd ../..
 
 # Configure and build ns-3 (CMake-based ns-3.48 environment).
