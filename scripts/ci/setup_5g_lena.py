@@ -36,16 +36,16 @@ def main() -> None:
         if not patches:
             raise SystemExit(f"No patch matched experiment_archive/{pattern}")
         for patch in patches:
-            run("git", "am", str(patch), cwd=NR_DIR)
-
-    scenario_patches = sorted(
-        (ROOT / "experiment_archive/slot_start_eligibility_2026-10-23").glob(
-            "0003-*.patch"
-        )
-    )
-    if len(scenario_patches) != 1:
-        raise SystemExit("Expected exactly one scenario-side grant-span patch")
-    run("git", "apply", str(scenario_patches[0]), cwd=ROOT)
+            run(
+                "git",
+                "-c",
+                "user.name=CI 5G-LENA Setup",
+                "-c",
+                "user.email=ci-5g-lena@example.invalid",
+                "am",
+                str(patch),
+                cwd=NR_DIR,
+            )
 
 
 if __name__ == "__main__":

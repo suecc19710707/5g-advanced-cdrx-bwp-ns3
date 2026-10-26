@@ -68,7 +68,6 @@ git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0001-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0002-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0004-*.patch
 cd ../..
-git apply experiment_archive/slot_start_eligibility_2026-10-23/0003-*.patch
 
 # Configure and build ns-3 (CMake-based ns-3.48 environment).
 ./ns3 configure --enable-examples --enable-tests
@@ -80,7 +79,8 @@ eligibility. The scheduler checks the actual DCI symbol interval before
 assigning RLC bytes, clips a partially overlapping grant when possible, and
 defers only when the clipped TB is below the minimum size. It deliberately
 does not implement a fixed two-slot guard.
-Patch `0003` installs the matching scenario-side callback wiring.
+The scenario-side callback wiring is already present in this repository's
+`scratch/joint-energy-mvp.cc`; only the NR module patches are applied above.
 
 To run the main scenario after building:
 
