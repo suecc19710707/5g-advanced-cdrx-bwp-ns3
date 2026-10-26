@@ -17,6 +17,11 @@ The repository contains the ns-3 source tree and research scenario, but the
 compiler/toolchain and system libraries must already be installed. This is the
 one-time setup; it is **not** a second installation of ns-3 or 5G-LENA.
 
+The GitHub Actions build is pinned to Ubuntu 24.04 and prints `/etc/os-release`
+for reproducibility. Ubuntu 20.04 is not used by the hosted CI workflow; to
+validate that older distribution, use a separate Ubuntu 20.04 machine,
+self-hosted runner, or container with the prerequisites below.
+
 ```bash
 sudo apt-get update
 sudo apt-get install -y \

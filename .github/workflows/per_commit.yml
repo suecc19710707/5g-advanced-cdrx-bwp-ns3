@@ -3,11 +3,13 @@ name: "CI"
 on: [push]
 jobs:
   Ubuntu:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       cache_misses: ${{ env.cache_misses }}
     steps:
       - uses: actions/checkout@v6
+      - name: Print Ubuntu version
+        run: cat /etc/os-release
       - name: Setup pinned 5G-LENA module and research patches
         run: python3 scripts/ci/setup_5g_lena.py
       - name: Install required packages
@@ -50,11 +52,13 @@ jobs:
         run: python3 test.py --no-build --verbose-failed
 
   Codecov:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: Ubuntu
     if: needs.Ubuntu.outputs.cache_misses != '0'
     steps:
       - uses: actions/checkout@v6
+      - name: Print Ubuntu version
+        run: cat /etc/os-release
       - name: Setup pinned 5G-LENA module and research patches
         run: python3 scripts/ci/setup_5g_lena.py
       - name: Install required packages
