@@ -1,6 +1,24 @@
 name: "CI"
 
-on: [push]
+on:
+  push:
+    paths:
+      - ".github/workflows/**"
+      - "CMakeLists.txt"
+      - "ns3"
+      - "src/**"
+      - "contrib/**"
+      - "scratch/**"
+      - "build-support/**"
+      - "scripts/ci/**"
+      - "experiment_archive/**"
+      - "test.py"
+  workflow_dispatch:
+
+concurrency:
+  group: ubuntu-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   Ubuntu:
     runs-on: ubuntu-24.04
