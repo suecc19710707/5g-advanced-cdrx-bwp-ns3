@@ -124,7 +124,7 @@ baseline/grid experiments.
 | `controllerStepDownMs` | Active-window decrease per decision | `2` ms |
 | `controllerQueueWarnRatio` | Queue warning occupancy ratio | `0.50` |
 | `controllerQueueHighRatio` | Queue high occupancy ratio | `0.60` |
-| `controllerBwpDwellMs` | Minimum time between rule BWP switches | `100` ms |
+| `bwpInactivityTimerMs` | Standard-style per-UE timer before returning to default 20 MHz BWP | `40` ms |
 | `enableBwpDynamic` | Enable policy/rule BWP selection | `false` for 1D, `true` for 2D |
 | `enableTrueBwp` | Use physical 20/100 MHz BWPs | `false` for legacy/1D, `true` for physical 2D |
 | `fixedBwpMHz` | Fixed BWP profile when dynamic BWP is off | `20` or `100` |
@@ -159,7 +159,7 @@ is also visible with:
   --qosTargetDelayMs=50 --controllerInitialActiveMs=20 \
   --controllerStepUpMs=2 --controllerStepDownMs=2 \
   --controllerQueueWarnRatio=0.5 --controllerQueueHighRatio=0.6 \
-  --controllerBwpDwellMs=100 --gnbTxPowerDbm=30 \
+  --bwpInactivityTimerMs=40 --gnbTxPowerDbm=30 \
   --gnbEnergyRefConfig=Custom --gnbEnergyReferenceTxPowerDbm=30 \
   --gnbEnergyAntennaRatio=0.4 --rngSeed=42 --rngRun=1"
 ```

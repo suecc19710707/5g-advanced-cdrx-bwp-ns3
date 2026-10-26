@@ -36,7 +36,8 @@ np.random.seed(SEED)
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim=OBSERVATION_DIM, action_dim=22, hidden_dim=64):
+    def __init__(self, state_dim=OBSERVATION_DIM, action_dim=22, hidden_dim=64,
+                 context_conditioned_actor=False):
         super(ActorCritic, self).__init__()
         
         self.feature_net = nn.Sequential(
@@ -46,25 +47,30 @@ class ActorCritic(nn.Module):
             nn.Tanh()
         )
         
+        self.context_conditioned_actor = bool(context_conditioned_actor)
+        actor_input_dim = hidden_dim + (1 if self.context_conditioned_actor else 0)
         if isinstance(action_dim, (list, tuple, np.ndarray)):
             self.action_dims = tuple(int(value) for value in action_dim)
             self.actor_heads = nn.ModuleList(
-                nn.Linear(hidden_dim, branch_dim)
+                nn.Linear(actor_input_dim, branch_dim)
                 for branch_dim in self.action_dims
             )
             self.actor_head = None
         else:
             self.action_dims = None
-            self.actor_head = nn.Linear(hidden_dim, int(action_dim))
+            self.actor_head = nn.Linear(actor_input_dim, int(action_dim))
             self.actor_heads = None
         self.critic_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, state):
         features = self.feature_net(state)
+        actor_features = features
+        if self.context_conditioned_actor:
+            actor_features = torch.cat((features, state[:, 4:5]), dim=-1)
         if self.action_dims is None:
-            logits = self.actor_head(features)
+            logits = self.actor_head(actor_features)
         else:
-            logits = [head(features) for head in self.actor_heads]
+            logits = [head(actor_features) for head in self.actor_heads]
         value = self.critic_head(features)
         return logits, value
 
@@ -100,6 +106,7 @@ class RolloutBuffer:
         self.rewards = []
         self.values = []
         self.dones = []
+        self.contexts = []
 
     def clear(self):
         self.states.clear()
@@ -108,14 +115,16 @@ class RolloutBuffer:
         self.rewards.clear()
         self.values.clear()
         self.dones.clear()
+        self.contexts.clear()
 
-    def add(self, state, action, log_prob, reward, value, done):
+    def add(self, state, action, log_prob, reward, value, done, context=None):
         self.states.append(state)
         self.actions.append(action)
         self.log_probs.append(log_prob)
         self.rewards.append(reward)
         self.values.append(value)
         self.dones.append(done)
+        self.contexts.append(context)
 
 
 class PPOAgent:
@@ -132,6 +141,7 @@ class PPOAgent:
                  ppo_epochs=4,
                  batch_size=64,
                  target_kl=0.01,
+                 context_conditioned_actor=False,
                  safe_prior_actions=None,
                  safe_prior_mass=0.0):
         
@@ -151,7 +161,10 @@ class PPOAgent:
             self.action_dim = int(action_dim)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.policy = ActorCritic(state_dim, action_dim, hidden_dim).to(self.device)
+        self.policy = ActorCritic(
+            state_dim, action_dim, hidden_dim,
+            context_conditioned_actor=context_conditioned_actor,
+        ).to(self.device)
         self.safe_prior_actions = tuple(sorted(set(safe_prior_actions or ())))
         self.safe_prior_mass = float(safe_prior_mass)
         if self.safe_prior_actions and self.action_dims is not None:
@@ -197,6 +210,30 @@ class PPOAgent:
             [int(torch.argmax(branch, dim=-1).item()) for branch in logits],
             dtype=np.int64,
         )
+
+    def deterministic_action_distribution(self, state):
+        """Return greedy action plus per-head probabilities and entropies."""
+        state_tensor = torch.as_tensor(
+            state, dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        with torch.no_grad():
+            logits, _ = self.policy(state_tensor)
+            if self.action_dims is None:
+                probabilities = [torch.softmax(logits, dim=-1)[0].cpu().numpy()]
+            else:
+                probabilities = [
+                    torch.softmax(branch, dim=-1)[0].cpu().numpy()
+                    for branch in logits
+                ]
+        action = np.asarray(
+            [int(np.argmax(probability)) for probability in probabilities],
+            dtype=np.int64,
+        ) if self.action_dims is not None else int(np.argmax(probabilities[0]))
+        entropies = [
+            float(-np.sum(probability * np.log(np.maximum(probability, 1e-12))))
+            for probability in probabilities
+        ]
+        return action, probabilities, entropies
 
     def update(self):
         if not self.buffer.rewards:
@@ -286,9 +323,24 @@ class PPOAgent:
                 counts / max(1, len(actions)) for counts in action_counts
             ]
         
-        advantages = (advantages - advantages.mean()) / (
-            advantages.std(unbiased=False) + 1e-8
-        )
+        # Normalize advantages independently per traffic context.  This keeps
+        # a higher-load context's larger absolute return scale from dominating
+        # updates for lower-load contexts while preserving one shared actor.
+        if self.buffer.contexts and all(context is not None for context in self.buffer.contexts):
+            context_array = np.asarray(self.buffer.contexts, dtype=object)
+            normalized = torch.empty_like(advantages)
+            for context in np.unique(context_array):
+                indices = np.flatnonzero(context_array == context)
+                index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+                values_for_context = advantages[index_tensor]
+                normalized[index_tensor] = (
+                    values_for_context - values_for_context.mean()
+                ) / (values_for_context.std(unbiased=False) + 1e-8)
+            advantages = normalized
+        else:
+            advantages = (advantages - advantages.mean()) / (
+                advantages.std(unbiased=False) + 1e-8
+            )
 
         dataset_size = len(states)
         update_metrics = {
@@ -423,6 +475,7 @@ def train_ppo_agent(
     num_ues=10,
     udp_rate=2.0,
     udp_rate_choices=None,
+    udp_rate_block_size=1,
     enable_burst_traffic=False,
     synchronize_burst_traffic=False,
     udp_burst_rate=3.0,
@@ -450,6 +503,8 @@ def train_ppo_agent(
     rollout_samples=0,
     learning_rate=1e-4,
     value_loss_coefficient=0.5,
+    entropy_coefficient=0.01,
+    context_conditioned_actor=False,
     ppo_epochs=4,
     batch_size=64,
     target_kl=0.01,
@@ -463,7 +518,9 @@ def train_ppo_agent(
     warmup_ms=200.0,
     max_active_ms=30.0,
     initial_active_ms=30.0,
-    enable_dci_dynamic=False,
+    active_window_options=None,
+    fixed_bwp_state=None,
+    enable_dci_dynamic=True,
     weight_gnb_power=0.15,
     weight_ue_power=0.15,
     weight_system_power=0.30,
@@ -471,6 +528,7 @@ def train_ppo_agent(
     weight_backlog=0.25,
     reward_mode=REWARD_MODE,
     backlog_safe_bytes=50000.0,
+    terminal_qos_bonus=0.0,
     bwp_switch_penalty=0.0,
     safe_prior_active_ms=None,
     safe_prior_mass=0.7,
@@ -487,10 +545,21 @@ def train_ppo_agent(
         traffic_rates = tuple(float(rate) for rate in udp_rate_choices)
     if not traffic_rates or any(rate <= 0.0 for rate in traffic_rates):
         raise ValueError("udp_rate_choices must contain positive rates")
-    traffic_rng = np.random.default_rng(seed + 20261020)
+    if int(udp_rate_block_size) <= 0:
+        raise ValueError("udp_rate_block_size must be positive")
     traffic_schedule = []
-    while len(traffic_schedule) < num_episodes:
-        traffic_schedule.extend(traffic_rng.permutation(traffic_rates).tolist())
+    if int(udp_rate_block_size) == 1:
+        traffic_rng = np.random.default_rng(seed + 20261020)
+        while len(traffic_schedule) < num_episodes:
+            traffic_schedule.extend(traffic_rng.permutation(traffic_rates).tolist())
+    else:
+        # Deterministic context blocks: hold each load for several complete
+        # episodes before moving to the next one.
+        while len(traffic_schedule) < num_episodes:
+            for rate in traffic_rates:
+                traffic_schedule.extend([rate] * int(udp_rate_block_size))
+                if len(traffic_schedule) >= num_episodes:
+                    break
     traffic_schedule = traffic_schedule[:num_episodes]
     offered_rate_max_mbps = num_ues * (
         max(traffic_rates) + (udp_burst_rate if enable_burst_traffic else 0.0)
@@ -545,7 +614,8 @@ def train_ppo_agent(
         f"🧠 PPO: lr={learning_rate:g} | rollout={episodes_per_update} episodes "
         f"(~{rollout_samples_target} target samples) | "
         f"epochs={ppo_epochs} | batch={batch_size} | target-KL={target_kl:g} | "
-        f"value-loss-coef={value_loss_coefficient:g}"
+        f"value-loss-coef={value_loss_coefficient:g} | entropy-coef={entropy_coefficient:g} | "
+        f"context-actor={context_conditioned_actor}"
     )
     print(
         f"🎯 Best-model selection: deterministic evaluation every "
@@ -581,6 +651,8 @@ def train_ppo_agent(
         controller_warmup_ms=warmup_ms,
         controller_max_active_ms=max_active_ms,
         controller_initial_active_ms=initial_active_ms,
+        active_window_options=active_window_options,
+        fixed_bwp_state=fixed_bwp_state,
         enable_dci_dynamic=enable_dci_dynamic,
         rng_seed=seed,
         weight_gnb_power=weight_gnb_power,
@@ -633,6 +705,8 @@ def train_ppo_agent(
         hidden_dim=64,
         lr=learning_rate,
         c_val=value_loss_coefficient,
+        c_ent=entropy_coefficient,
+        context_conditioned_actor=context_conditioned_actor,
         ppo_epochs=ppo_epochs,
         batch_size=batch_size,
         target_kl=target_kl,
@@ -695,6 +769,7 @@ def train_ppo_agent(
             "RewardSystemPower",
             "RewardLatency",
             "RewardBacklog",
+            "TerminalReward",
             "AvgP99LatencyMs",
             "AvgGnbPowerW",
             "AvgUePowerMw",
@@ -830,8 +905,10 @@ def train_ppo_agent(
         fieldnames=[
             "TrainingEpisode", "UdpRateMbpsPerUe", "Seed", "Steps",
             "EpisodeReward", "QosSatisfactionRatePct", "AvgP99LatencyMs",
-            "AvgGnbPowerW", "AvgUePowerMw", "AvgActiveWindowMs",
-            "Actions", "PerUeBwpStates", "IsFeasible", "IsBestCheckpoint",
+            "AvgGnbPowerW", "AvgUePowerMw", "AvgSystemPowerW",
+            "AvgActiveWindowMs",
+            "Actions", "PerUeBwpStates", "ActionProbabilities", "ActionEntropies",
+            "IsFeasible", "IsBestCheckpoint",
         ],
     )
     history_writer.writeheader()
@@ -844,7 +921,12 @@ def train_ppo_agent(
     print(f"🎯 Deterministic evaluation CSV: {deterministic_eval_csv}")
 
     start_time = time.time()
+    # Deployment checkpoint selection is based on the deterministic evaluation
+    # objective: among QoS-feasible candidates, keep the lowest total system
+    # power (gNB plus all UE power). Reward remains useful for diagnostics, but
+    # must not select a higher-energy checkpoint.
     best_score = -float("inf")
+    best_deterministic_system_power = float("inf")
     best_episode = None
     next_checkpoint_episode = checkpoint_interval
     next_deterministic_eval_episode = deterministic_eval_interval
@@ -886,6 +968,8 @@ def train_ppo_agent(
                         controller_warmup_ms=warmup_ms,
                         controller_max_active_ms=max_active_ms,
                         controller_initial_active_ms=initial_active_ms,
+                        active_window_options=active_window_options,
+                        fixed_bwp_state=fixed_bwp_state,
                         enable_dci_dynamic=enable_dci_dynamic,
                         rng_seed=eval_seed,
                         port=env.port + 1,
@@ -907,10 +991,16 @@ def train_ppo_agent(
                     active_windows = []
                     actions = []
                     per_ue_bwp_states = []
+                    action_probability_samples = []
+                    action_entropy_samples = []
                     try:
                         eval_obs, _ = eval_env.reset()
                         for _ in range(max_steps_per_episode):
-                            eval_action = agent.select_deterministic_action(eval_obs)
+                            (
+                                eval_action,
+                                eval_probabilities,
+                                eval_entropies,
+                            ) = agent.deterministic_action_distribution(eval_obs)
                             eval_obs, eval_reward, terminated, truncated, eval_info = (
                                 eval_env.step(eval_action)
                             )
@@ -924,6 +1014,8 @@ def train_ppo_agent(
                                 if isinstance(eval_action, np.ndarray) else eval_action
                             ))
                             per_ue_bwp_states.append(str(eval_info.get("per_ue_bwp", [])))
+                            action_probability_samples.append(eval_probabilities)
+                            action_entropy_samples.append(eval_entropies)
                             if terminated or truncated:
                                 break
                     finally:
@@ -932,6 +1024,16 @@ def train_ppo_agent(
                     qos_pct = 100.0 * float(np.mean(
                         np.asarray(p99_values) <= qos_target_ms
                     ))
+                    mean_action_probabilities = [
+                        np.mean([
+                            sample[head]
+                            for sample in action_probability_samples
+                        ], axis=0)
+                        for head in range(len(action_probability_samples[0]))
+                    ]
+                    mean_action_entropies = np.mean(
+                        np.asarray(action_entropy_samples), axis=0
+                    )
                     eval_rows.append({
                         "TrainingEpisode": training_episode,
                         "UdpRateMbpsPerUe": eval_rate,
@@ -942,9 +1044,20 @@ def train_ppo_agent(
                         "AvgP99LatencyMs": float(np.mean(p99_values)),
                         "AvgGnbPowerW": float(np.mean(gnb_powers)),
                         "AvgUePowerMw": float(np.mean(ue_powers)),
+                        "AvgSystemPowerW": float(
+                            np.mean(gnb_powers)
+                            + num_ues * np.mean(ue_powers) / 1000.0
+                        ),
                         "AvgActiveWindowMs": float(np.mean(active_windows)),
                         "Actions": ";".join(sorted(set(actions))),
                         "PerUeBwpStates": ";".join(sorted(set(per_ue_bwp_states))),
+                        "ActionProbabilities": "|".join(
+                            ",".join(f"{value:.6f}" for value in probabilities)
+                            for probabilities in mean_action_probabilities
+                        ),
+                        "ActionEntropies": ";".join(
+                            f"{value:.6f}" for value in mean_action_entropies
+                        ),
                         "IsFeasible": int(qos_pct >= best_qos_threshold_pct),
                         "IsBestCheckpoint": 0,
                     })
@@ -997,7 +1110,10 @@ def train_ppo_agent(
                 done = terminated or truncated
                 global_step += 1
 
-                agent.buffer.add(obs, action, log_prob, reward, value, done)
+                agent.buffer.add(
+                    obs, action, log_prob, reward, value, done,
+                    context=episode_udp_rate,
+                )
 
                 obs = next_obs
                 episode_reward += reward
@@ -1173,6 +1289,17 @@ def train_ppo_agent(
                 all_ue_wide_bwp_rate_pct = wide_bwp_rate_pct
             sla_violation_rate = np.mean(ep_sla_violations)
             qos_satisfaction_rate_pct = 100.0 * (1.0 - sla_violation_rate)
+            terminal_reward = (
+                float(terminal_qos_bonus)
+                if qos_satisfaction_rate_pct >= best_qos_threshold_pct
+                else 0.0
+            )
+            # Attach the episode-level outcome to the final transition. GAE
+            # then propagates it backward while preserving dense per-step
+            # energy/QoS shaping rewards.
+            if terminal_reward != 0.0 and agent.buffer.rewards:
+                agent.buffer.rewards[-1] += terminal_reward
+            episode_reward += terminal_reward
             control_interval_sec = 0.040
             total_delivered_mbits = float(
                 np.sum(ep_delivered_rates) * control_interval_sec
@@ -1285,6 +1412,9 @@ def train_ppo_agent(
                 deterministic_eval_mean_ue_power = float(np.mean([
                     row["AvgUePowerMw"] for row in eval_rows
                 ]))
+                deterministic_eval_mean_system_power = float(np.mean([
+                    row["AvgSystemPowerW"] for row in eval_rows
+                ]))
                 deterministic_eval_mean_active_window = float(np.mean([
                     row["AvgActiveWindowMs"] for row in eval_rows
                 ]))
@@ -1294,12 +1424,23 @@ def train_ppo_agent(
                 candidate_is_feasible = (
                     deterministic_eval_min_qos_pct >= best_qos_threshold_pct
                 )
-                is_best_checkpoint = (
-                    candidate_is_feasible
-                    and deterministic_eval_mean_reward > best_score
+                is_best_checkpoint = candidate_is_feasible and (
+                    deterministic_eval_mean_system_power
+                    < best_deterministic_system_power - 1e-9
+                    or (
+                        abs(
+                            deterministic_eval_mean_system_power
+                            - best_deterministic_system_power
+                        )
+                        <= 1e-9
+                        and deterministic_eval_mean_reward > best_score
+                    )
                 )
                 if is_best_checkpoint:
                     best_score = deterministic_eval_mean_reward
+                    best_deterministic_system_power = (
+                        deterministic_eval_mean_system_power
+                    )
                     best_episode = episode
                     torch.save(agent.policy.state_dict(), best_model_out)
                     try:
@@ -1321,6 +1462,7 @@ def train_ppo_agent(
                 if is_best_checkpoint:
                     print(
                         f"🏆 Best deterministic model @ episode {episode}: "
+                        f"system={best_deterministic_system_power:.2f}W, "
                         f"reward={best_score:.4f}, "
                         f"min QoS={deterministic_eval_min_qos_pct:.1f}%"
                     )
@@ -1339,6 +1481,7 @@ def train_ppo_agent(
                     "optimizer_state_dict": agent.optimizer.state_dict(),
                     "best_episode": best_episode,
                     "best_deterministic_reward": best_score,
+                    "best_deterministic_system_power_w": best_deterministic_system_power,
                     "episodes_per_update": episodes_per_update,
                     "learning_rate": learning_rate,
                     "value_loss_coefficient": value_loss_coefficient,
@@ -1380,6 +1523,7 @@ def train_ppo_agent(
                 "RewardSystemPower": np.sum(ep_reward_system),
                 "RewardLatency": np.sum(ep_reward_latency),
                 "RewardBacklog": np.sum(ep_reward_backlog),
+                "TerminalReward": terminal_reward,
                 "AvgP99LatencyMs": avg_p99,
                 "AvgGnbPowerW": avg_gnb,
                 "AvgUePowerMw": avg_ue,
@@ -1578,6 +1722,10 @@ def parse_args():
             "shuffled blocks (for example: 0.5 1 2 4)"
         ),
     )
+    parser.add_argument(
+        "--udp-rate-block-size", type=int, default=1,
+        help="hold each --udp-rate-choices context for this many episodes; 1 keeps shuffled schedule",
+    )
     parser.add_argument("--enable-burst-traffic", action="store_true")
     parser.add_argument("--synchronize-burst-traffic", action="store_true")
     parser.add_argument("--udp-burst-rate", type=float, default=3.0)
@@ -1627,6 +1775,11 @@ def parse_args():
     )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--value-loss-coef", type=float, default=0.5)
+    parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument(
+        "--context-conditioned-actor", action="store_true",
+        help="concatenate normalized offered-rate observation to actor heads",
+    )
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--target-kl", type=float, default=0.01)
@@ -1650,9 +1803,17 @@ def parse_args():
     parser.add_argument("--max-active-ms", type=float, default=30.0)
     parser.add_argument("--initial-active-ms", type=float, default=30.0)
     parser.add_argument(
+        "--active-window-options", type=float, nargs="+", default=None,
+        help="explicit active-window action options, e.g. 10 12 14 16",
+    )
+    parser.add_argument(
+        "--fixed-bwp-state", type=int, choices=(0, 1), default=None,
+        help="diagnostic mode: fix all per-UE BWP actions to 0 (20 MHz) or 1 (100 MHz)",
+    )
+    parser.add_argument(
         "--enable-dci-dynamic",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="couple Cell-DTX active-window actions to UE C-DRX on-duration",
     )
     parser.add_argument("--weight-gnb-power", type=float, default=0.15)
@@ -1661,8 +1822,16 @@ def parse_args():
     parser.add_argument("--weight-latency", type=float, default=0.45)
     parser.add_argument("--weight-backlog", type=float, default=0.25)
     parser.add_argument(
+        "--terminal-qos-bonus", type=float, default=0.0,
+        help="episode-end bonus when QoS satisfaction reaches the best-QoS threshold",
+    )
+    parser.add_argument(
         "--reward-mode",
-        choices=("total-system-threshold-v1", "legacy-separated-v1"),
+        choices=(
+            "total-system-threshold-v1",
+            "balanced-system-threshold-v1",
+            "legacy-separated-v1",
+        ),
         default=REWARD_MODE,
     )
     parser.add_argument("--backlog-safe-bytes", type=float, default=50000.0)
@@ -1696,6 +1865,8 @@ def parse_args():
         parser.error("--rollout-samples cannot be negative")
     if args.learning_rate <= 0.0:
         parser.error("--learning-rate must be greater than zero")
+    if args.entropy_coef < 0.0:
+        parser.error("--entropy-coef cannot be negative")
     if args.value_loss_coef < 0.0:
         parser.error("--value-loss-coef cannot be negative")
     if args.bwp_switch_penalty < 0.0:
@@ -1723,6 +1894,8 @@ def parse_args():
         or any(rate <= 0.0 for rate in args.udp_rate_choices)
     ):
         parser.error("--udp-rate-choices values must be greater than zero")
+    if args.udp_rate_block_size <= 0:
+        parser.error("--udp-rate-block-size must be greater than zero")
     if args.enable_burst_traffic and args.udp_burst_rate <= 0:
         parser.error("--udp-burst-rate must be greater than zero")
     if args.enable_burst_traffic and (
@@ -1754,6 +1927,8 @@ def parse_args():
     ]
     if any(weight < 0 for weight in reward_weights):
         parser.error("reward weights cannot be negative")
+    if args.terminal_qos_bonus < 0.0:
+        parser.error("terminal QoS bonus cannot be negative")
     active_reward_weights = (
         [args.weight_system_power, args.weight_latency, args.weight_backlog]
         if args.reward_mode == "total-system-threshold-v1"
@@ -1782,6 +1957,7 @@ if __name__ == "__main__":
         num_ues=cli_args.num_ues,
         udp_rate=cli_args.udp_rate,
         udp_rate_choices=cli_args.udp_rate_choices,
+        udp_rate_block_size=cli_args.udp_rate_block_size,
         enable_burst_traffic=cli_args.enable_burst_traffic,
         synchronize_burst_traffic=cli_args.synchronize_burst_traffic,
         udp_burst_rate=cli_args.udp_burst_rate,
@@ -1809,6 +1985,8 @@ if __name__ == "__main__":
         rollout_samples=cli_args.rollout_samples,
         learning_rate=cli_args.learning_rate,
         value_loss_coefficient=cli_args.value_loss_coef,
+        entropy_coefficient=cli_args.entropy_coef,
+        context_conditioned_actor=cli_args.context_conditioned_actor,
         ppo_epochs=cli_args.ppo_epochs,
         batch_size=cli_args.batch_size,
         target_kl=cli_args.target_kl,
@@ -1822,6 +2000,8 @@ if __name__ == "__main__":
         warmup_ms=cli_args.warmup_ms,
         max_active_ms=cli_args.max_active_ms,
         initial_active_ms=cli_args.initial_active_ms,
+        active_window_options=cli_args.active_window_options,
+        fixed_bwp_state=cli_args.fixed_bwp_state,
         enable_dci_dynamic=cli_args.enable_dci_dynamic,
         weight_gnb_power=cli_args.weight_gnb_power,
         weight_ue_power=cli_args.weight_ue_power,
@@ -1830,6 +2010,7 @@ if __name__ == "__main__":
         weight_backlog=cli_args.weight_backlog,
         reward_mode=cli_args.reward_mode,
         backlog_safe_bytes=cli_args.backlog_safe_bytes,
+        terminal_qos_bonus=cli_args.terminal_qos_bonus,
         bwp_switch_penalty=cli_args.bwp_switch_penalty,
         safe_prior_active_ms=cli_args.safe_prior_active_ms,
         safe_prior_mass=cli_args.safe_prior_mass,

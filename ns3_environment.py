@@ -103,7 +103,9 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                  controller_warmup_ms=200.0,
                  controller_max_active_ms=30.0,
                  controller_initial_active_ms=30.0,
-                 enable_dci_dynamic=False,
+                 active_window_options=None,
+                 fixed_bwp_state=None,
+                 enable_dci_dynamic=True,
                  rng_seed=42,
                  weight_gnb_power=0.15,
                  weight_ue_power=0.15,
@@ -136,6 +138,9 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.ue_energy_power_unit_mw = ue_energy_power_unit_mw
         self.enable_true_bwp = enable_true_bwp
         self.enable_per_ue_bwp_action = bool(enable_per_ue_bwp_action)
+        self.fixed_bwp_state = None if fixed_bwp_state is None else int(fixed_bwp_state)
+        if self.fixed_bwp_state not in (None, 0, 1):
+            raise ValueError("fixed_bwp_state must be 0, 1, or None")
         self.sim_time = sim_time
         self.enable_mock = enable_mock
         self.port = port
@@ -178,9 +183,12 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
         self.P_GNB_IDLE_W = p3_relative * gnb_energy_power_unit_w
         self.P_GNB_MAX_W = max(p4_relative * gnb_energy_power_unit_w, 1.0)
         self.P_UE_MAX_MW = max(300.0 * ue_energy_power_unit_mw, 1.0)
+        self.P_UE_TOTAL_MAX_W = (
+            self.num_ues * self.P_UE_MAX_MW / 1000.0
+        )
         self.P_TOTAL_MAX_W = (
             self.P_GNB_MAX_W
-            + self.num_ues * self.P_UE_MAX_MW / 1000.0
+            + self.P_UE_TOTAL_MAX_W
         )
         self.QOS_SLA_TARGET_MS = qos_target_ms
 
@@ -196,6 +204,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             raise ValueError("bwp_switch_penalty cannot be negative")
         if self.REWARD_MODE not in {
             "legacy-separated-v1",
+            "balanced-system-threshold-v1",
             "total-system-threshold-v1",
         }:
             raise ValueError(f"Unsupported reward_mode: {self.REWARD_MODE}")
@@ -211,11 +220,20 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
                 "controller active-window range must be divisible by the "
                 f"{ACTIVE_WINDOW_ACTION_STEP_MS:g} ms absolute-action step"
             )
-        self.ACTIVE_WINDOW_OPTIONS = tuple(
-            self.W_MIN_MS + index * ACTIVE_WINDOW_ACTION_STEP_MS
-            for index in range(int(round(action_span)) + 1)
-        )
-        if self.enable_per_ue_bwp_action:
+        if active_window_options is None:
+            self.ACTIVE_WINDOW_OPTIONS = tuple(
+                self.W_MIN_MS + index * ACTIVE_WINDOW_ACTION_STEP_MS
+                for index in range(int(round(action_span)) + 1)
+            )
+        else:
+            self.ACTIVE_WINDOW_OPTIONS = tuple(float(value) for value in active_window_options)
+            if not self.ACTIVE_WINDOW_OPTIONS:
+                raise ValueError("active_window_options must not be empty")
+            if any(value < self.W_MIN_MS or value > self.W_MAX_MS for value in self.ACTIVE_WINDOW_OPTIONS):
+                raise ValueError("active_window_options must lie within controller active-window bounds")
+        if self.enable_per_ue_bwp_action and self.fixed_bwp_state is not None:
+            self.action_space = spaces.MultiDiscrete([len(self.ACTIVE_WINDOW_OPTIONS)])
+        elif self.enable_per_ue_bwp_action:
             self.action_space = spaces.MultiDiscrete(
                 [len(self.ACTIVE_WINDOW_OPTIONS)] + [len(self.BWP_OPTIONS)] * self.num_ues
             )
@@ -397,6 +415,11 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             action = np.asarray(action_idx, dtype=np.int64).reshape(-1)
             expected = 1 + self.num_ues
             if action.size != expected:
+                if self.fixed_bwp_state is not None and action.size == 1:
+                    active_index = int(action[0])
+                    if not 0 <= active_index < len(self.ACTIVE_WINDOW_OPTIONS):
+                        raise ValueError(f"active action outside [0, {len(self.ACTIVE_WINDOW_OPTIONS)})")
+                    return self.ACTIVE_WINDOW_OPTIONS[active_index], [self.fixed_bwp_state] * self.num_ues
                 raise ValueError(f"expected {expected} factorized action values, got {action_idx}")
             if action[0] < 0 or action[0] >= len(self.ACTIVE_WINDOW_OPTIONS):
                 raise ValueError(f"active action outside [0, {len(self.ACTIVE_WINDOW_OPTIONS)})")
@@ -562,6 +585,11 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             0.0,
             1.0,
         )
+        p_ue_total_norm = np.clip(
+            total_ue_power_watts / self.P_UE_TOTAL_MAX_W,
+            0.0,
+            1.0,
+        )
 
         latency_excess_ratio = max(
             0.0,
@@ -577,6 +605,14 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             reward_ue_power = -self.W_UE_POWER * p_ue_norm
             reward_system_power = reward_gnb_power + reward_ue_power
             backlog_penalty_norm = raw_backlog_norm
+        elif self.REWARD_MODE == "balanced-system-threshold-v1":
+            # Normalize each device class against its own physical range so
+            # the UE term is not numerically erased by gNB watts being three
+            # orders of magnitude larger than UE milliwatts.
+            reward_gnb_power = -self.W_GNB_POWER * p_gnb_norm
+            reward_ue_power = -self.W_UE_POWER * p_ue_total_norm
+            reward_system_power = reward_gnb_power + reward_ue_power
+            backlog_penalty_norm = backlog_excess_norm
         else:
             # Split one physically consistent total-system reward into gNB and
             # all-UE contributions.  Their sum is exactly
@@ -613,6 +649,7 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             "bwp_switch_count": int(bwp_switch_count),
             "p_gnb_norm": float(p_gnb_norm),
             "p_ue_norm": float(p_ue_norm),
+            "p_ue_total_norm": float(p_ue_total_norm),
             "p_system_norm": float(p_system_norm),
             "total_ue_power_w": float(total_ue_power_watts),
             "total_system_power_w": float(total_system_power_watts),
@@ -748,6 +785,11 @@ class Ns3MultiUserEnv(ENV_BASE_CLASS):
             try:
                 if self.enable_per_ue_bwp_action:
                     action_values = np.asarray(action, dtype=np.int64).reshape(-1)
+                    if self.fixed_bwp_state is not None and action_values.size == 1:
+                        action_values = np.concatenate((
+                            action_values,
+                            np.full(self.num_ues, self.fixed_bwp_state, dtype=np.int64),
+                        ))
                     wire_action = ",".join(str(int(value)) for value in action_values)
                 else:
                     wire_action = str(int(action))

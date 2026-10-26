@@ -382,3 +382,375 @@ claim explicitly. Avoid rewriting the entire scheduler.
 ---
 
 **最終研究原則**：先證明 *under alignment constraints* 的 joint configuration **確實比獨立/啟發式配置有收益**，再用 HRL 解決大規模 action space；不要把 alignment、energy accounting 或 power-state transitions 誤當成完整的 Rel-18 Cell DTX scheduling implementation。
+
+---
+
+## 13. Per-UE 標準 BWP timer 整改順序（2026-10-25）
+
+正式模型固定使用 `enableDciDynamic=true`。每個 UE 維護自己的 `defaultBwp=20 MHz`、`effectiveBwp`、`requestedBwp`、`pendingBwp` 與 `bwp-InactivityTimer`。BWP 切換的 reward/accounting 一律以 `effectiveBwp` 為準，不以 controller 的 requested action 代替實際狀態。
+
+### Timer 與 action 的時間語意
+
+一個 40 ms evaluation window 內可能發生 BWP switch。例如 window 前半段 UE 使用 100 MHz，bwp-InactivityTimer 到期後後半段回到 default 20 MHz。此時 action 只有一個（該 window 開始時的 request），但能量與 throughput 必須依實際事件切成兩段積分：
+
+```text
+E_window = P_100 * Δt_100 + P_20 * Δt_20
+```
+
+controller 需要記錄 `effectiveBwp` 的 transition timestamp；`AvgPower`、`UePower`、`J/bit`、throughput 與 reward 使用 event-segmented accounting。若 switch 尚未生效，`effectiveBwp` 保持舊值，`pendingBwp=1`，不能提前使用新 BWP 的功耗或 QoS。
+
+### 實作順序
+
+1. 建立 per-UE BWP state machine：`default/effective/requested/pending/timer/applied`。（第一階段已完成 state 欄位與 timeline schema；目前仍保留 immediate-switch，等待 grant hook 後才啟用 pending。）
+2. 在 `NrGnbMac::DlScheduling` grant activity hook 記錄 per-UE DL scheduling activity。該 trace 提供 `RNTI、BWP ID、slot、symbol span、TB size`；目前以 `TB size > 0` 的 DL grant 作為可觀測的 gNB-side scheduling activity，不把 PHY TX 或 FlowMonitor RX 當作 timer 來源。
+3. 只有該 UE 的 scheduling activity 才 restart 該 UE 的 `bwp-InactivityTimer`；aggregate queue 或 FlowMonitor RX 不得直接重設 timer。
+4. timer 到期時，該 UE 回到 `default BWP=20 MHz`；移除 custom queue-based return timer。
+5. 移除 custom `controllerBwpDwellMs` 與 `m_bwpDwellRemainingMs`；保留標準 switch delay、slot eligibility 與 grant-span constraints。
+6. 初始化時令 UE `OnDuration` 對齊 Cell-DTX initial active window；後續 `enableDciDynamic=true` 時，active-window 更新同步更新 UE OnDuration。
+7. Observation 增加 per-UE `effective/requested/pending/timer/applied` 欄位。
+8. PPO action 定義為 switch request；reward 僅使用實際已套用的 `effectiveBwp` 與分段 energy/QoS。
+9. 依序驗證固定 per-UE BWP、單 UE 切換、timer 獨立到期、requested/effective 不一致及 window 內兩段 energy accounting。
+10. 通過底層驗證後，使用同一套 timer semantics 重新跑 static、1D、2D、grid search，最後才重訓 PPO。
+
+### 目前進度（phase 2）
+
+- 已加入 `bwpInactivityTimerMs` CLI 參數，預設 40 ms，與目前 40 ms controller evaluation/cycle 對齊；它與 `cdrxInactivityMs` 是不同 timer。
+- 已加入 per-UE timer 剩餘時間與 requested/effective/pending 分離。controller 要求 100 MHz 時可立即套用；要求回到 20 MHz 時先記為 `pending=20`，只有 timer 到期才套用 default BWP。
+- 已連接每個 physical BWP 的 `NrGnbMac::DlScheduling` trace；`PerUeBwpDlSchedulingTraceConnected=1` 的 smoke test 已通過，程式也可正常 build。
+- custom dwell 與 queue-based return 尚未移除；必須先完成 timer expiry、window 內 transition trace 與 energy segmentation 驗證，再進行下一階段清理，避免把尚未驗證的 timer 行為混入正式 baseline。
+
+### Timer expiry smoke test
+
+固定 S5 response：第一次回覆 `UE0=100, UE1=20`，後續回覆兩者皆請求 20 MHz；traffic 在第一次 controller decision 後停止，避免新的 DL grant 重設 timer。結果：
+
+```text
+t=0.20 s: effective=100;20, requested=100;20, timer=40;0 ms
+t=0.24 s: effective=20;20,  requested=20;20,  timer=0;0 ms
+```
+
+因此目前 state machine 已驗證「requested 20 不立即覆寫 effective 100；timer 到期後才回 default 20」。輸出保留於 `experiment_archive/per_ue_bwp_timer_expiry_2026-10-25/timeline2.csv`。下一步才是將同一語意擴展至 scalar 2D controller，並移除舊 custom dwell/queue return。
+
+### Scalar 2D phase
+
+已將 physical-BWP 的 scalar 2D path 也接到同一個 `NrGnbMac::DlScheduling` activity hook。當 `enableTrueBwp=true` 且使用 scalar 2D 時，custom dwell 不再阻擋標準 timer 的回切；只有 legacy PRB-profile 模式仍保留舊 dwell 行為。`scalar_2d_bwp_timer_smoke_2026-10-25` 已 build、啟動與結束正常，trace connection 為 1。
+
+高負載測試 `scalar_2d_bwp_timer_highload_2026-10-25/timeline_high.csv` 顯示：threshold 設為 `Warn=0.4, High=0.5` 時，controller 可以觸發 20→100 MHz；但切換後若在下一個 40 ms window 沒有觀測到 DL grant，timer 會使它回到 20 MHz。這不是 crash，而是暴露出「切換後第一個有效 scheduling activity 是否應被視為 timer 起算事件」仍需明確定義；下一步要加入 transition/activity trace，區分真正無 grant 與 callback 尚未對應到 UE 的情況，再決定是否需要一次性的 post-switch grace window。
+
+已加入 `timeline.csv.bwp-activity.csv` trace，欄位為 `SimTimeMs,UeId,Rnti,BwpId,TbSize,TimerBeforeMs,TimerAfterMs`。重跑結果顯示 callback 確實收到兩個 UE 的 DL scheduling activity，但在本次 physical-BWP 配置中 `BwpId` 全部為 0；因此 100 MHz request 後沒有看到 BWP 1 的 grant，timer 回切是「實際沒有觀測到 wide-BWP scheduling」的結果，不是 trace 靜默。下一步應先查明 physical BWP scheduler selection 為何仍落在 BWP 0，再做 timer behavior 的正式判定。
+
+目前最可能的原因已縮小為：`SwitchUeToPrimaryBwp()` 只改變 UE RRC/primary BWP 與 UE energy scaling，並沒有把 gNB 端 RLC bearer、BSR/queue ownership 或 CCM routing 從 BWP 0 遷移到 BWP 1。`NrGnbMac::DlScheduling` 的 trace 不是漏記錄；它回報的是實際產生 grant 的 MAC，而目前所有實際 grant 都仍由 BWP 0 scheduler 產生。`m_currentBwp=100` 只是 controller state，不能視為 BWP 1 已經承接 bearer。這是 timer 之前必須修正的 physical-BWP routing 一致性問題。
+
+### Routing A/B 修正結論
+
+上述「bearer 未遷移」只是第一次觀察下的假設，已用 `enableCdrx=false` 做 A/B 修正。關閉 C-DRX 後，同一 physical-BWP routing 測試可在 `BwpId=1` 觀測到 DL grants（例如 321.5 ms 起連續出現兩個 UE 的 BWP 1 grants）。因此 BWP1 routing/CCM 並非根本缺失；原本 C-DRX 開啟時看不到 BWP1 grant，較可能是新 BWP 的 target slot 被 UE C-DRX eligibility gate 排除，而不是 trace 漏記錄。下一步要在 activity trace 同時輸出 `CellActive`、`UEActive` 與 reject reason，才能區分 C-DRX phase/OnDuration 對 BWP1 的影響。
+
+per-BWP eligibility decision trace 已加入並重跑。最新結果在 `BwpId=1` 的 decisions 中出現 `CellActive=1, UeActive=1, Allowed=1`，同時 activity trace 也觀測到 BWP1 grants；因此目前不能把「BWP1 沒有 grant」當成固定 routing 問題。若某次 transition window 仍只有 BWP0，應以同一時間範圍的 eligibility decision trace 判斷是 slot eligibility、event ordering 或尚未完成 primary-BWP indication，而不是直接修改 timer。
+
+### Transition trace 完成
+
+新增 `timeline.csv.bwp-transition.csv`，記錄 `controller-request`、`controller-request-pending`、`gnb-routing-observed` 與 `timer-expiry`。gNB routing observation 延後 1 ns 取樣，以避開同一 simulation timestamp 中 RRC indication 的 event ordering。測試結果顯示：
+
+```text
+t=320 ms: request BWP 1 → gNB routing observed BWP 1
+t=360 ms: request BWP 0 → gNB routing observed BWP 0
+```
+
+因此 transition trace 已能直接確認 controller request 與 gNB routing 的先後關係，不再需要從 grant trace 間接猜測。
+
+### Phase-offset A/B validation
+
+在 Torch CU118 terminal 1 使用相同高負載條件比較 `phaseOffsetMs=0` 與 `phaseOffsetMs=10`：
+
+- aligned（offset=0）：BWP1 grant 156、BWP1 eligibility allowed 312。
+- misaligned（offset=10）：BWP1 grant 290、eligibility allowed 581、rejected 239。
+- 239 個 rejection 全部是 `ue-cdrx-inactive`，不是 Cell-DTX inactive。
+
+這證明 transition trace 與 decision trace 可以把「BWP routing 已完成，但 UE C-DRX 不在 Active Time」和「沒有 BWP routing」區分開來。此結果也支持保留立即倒數的 timer 語意；若 target slot 沒有 UE eligibility，不能把它誤判成 BWP routing failure。
+
+---
+
+## 14. 重要研究記錄：BWP transition-aware observability（2026-10-25）
+
+### 14.1 為什麼必須記錄 transition
+
+controller 的 action 只是 request，不等於 radio 已經完成切換。若只看 controller timeline 的 `CurrentBwp=100`，可能錯誤地把尚未完成 routing、尚未通過 UE C-DRX eligibility，或尚未產生實際 grant 的區間，當成「100 MHz 已經有效運作」。
+
+因此本研究將 BWP 狀態拆成以下事件鏈：
+
+```text
+Controller request
+    → UE primary-BWP indication
+    → gNB BwpManager routing update
+    → scheduler eligibility decision
+    → actual DL grant
+    → PHY/energy activity
+```
+
+每一層都可能有不同時間點；不能以單一 action 或單一 `CurrentBwp` 欄位代替整條事件鏈。
+
+### 14.2 三種狀態不可混用
+
+- `requestedBwp`：controller 要求的目標 BWP。
+- `effectiveBwp`：UE energy/accounting 與實際狀態所使用的 BWP。
+- `gNB routing BWP`：gNB CCM/BwpManager 對該 UE DL bearer 實際選用的 BWP。
+
+只有在 transition trace 證明 gNB routing 已更新、並且 scheduler/PHY 有相符活動後，才能將 request 視為已套用。reward、power、throughput 與 J/bit 必須使用 `effectiveBwp`，不能直接使用 requested action。
+
+### 14.3 三份 trace 的責任分工
+
+1. `timeline.csv`：evaluation window 的 aggregate controller state、queue、effective/requested/pending BWP。
+2. `timeline.csv.eligibility-decisions.csv`：scheduler 建立 grant 前的 per-BWP decision，包含 `CellActive`、`UeActive`、`Allowed` 與拒絕原因。
+3. `timeline.csv.bwp-activity.csv`：`NrGnbMac::DlScheduling` 實際建立 DL grant 的時間、UE、BWP 與 TB size。
+4. `timeline.csv.bwp-transition.csv`：request、pending、gNB routing observation 與 timer expiry 的事件時間戳。
+
+### 14.4 transition trace 的判讀規則
+
+```text
+有 BWP 1 decision 且 Allowed=0
+    → eligibility gate 拒絕，不能歸因於 routing。
+
+有 BWP 1 decision 且 Allowed=1，但沒有 BWP 1 activity
+    → eligibility 通過，但沒有實際 data grant；需查 queue/HARQ/scheduler resource。
+
+完全沒有 BWP 1 decision
+    → BWP 1 scheduler 尚未被執行、routing/event ordering 尚未完成，或該 window 沒有進入該 scheduler。
+
+有 BWP 1 activity
+    → gNB routing、eligibility 與實際 DL scheduling 至少已在該時間點一致。
+```
+
+### 14.5 event ordering 的實作細節
+
+gNB 的 ideal primary-BWP indication 與 controller request 可能位於同一 simulation timestamp 的不同 event。若在 `ScheduleNow` 中立即讀 routing 狀態，可能讀到切換前的舊值。因此 transition trace 對 gNB routing 使用 `1 ns` 的同 timestamp deferred observation，讓 RRC indication 先完成，再記錄 `gnb-routing-observed`。
+
+這不是額外的 radio delay，也不是 artificial guard；它只是一個 observability ordering 修正，避免 trace 讀到錯誤的舊 state。
+
+### 14.6 論文方法上的重要意義
+
+本研究不把 action execution 假設成 instantaneous。每個 evaluation window 可能包含：
+
+```text
+window 前半段：舊 BWP
+transition event：gNB routing / UE primary BWP 更新
+window 後半段：新 BWP
+```
+
+因此 energy 必須依實際 transition segmentation 計算：
+
+\[
+E_{window}=P_{old}\Delta t_{old}+P_{new}\Delta t_{new}
+\]
+
+此設計確保 DRL、rule-based 與 static baseline 都是根據實際已套用的 radio state 評估，而不是根據尚未完成的 controller request 評估。這也是本研究能宣稱 scheduling eligibility、BWP routing 與 energy accounting 使用同一時間軸的關鍵依據。
+
+### 14.7 System energy 欄位定義
+
+原本 CSV 的 `TotalEnergyJoules` 與 `AvgPowerWatts` 是 gNB-only 指標；UE 能耗分別位於 `UeTotalEnergyJoules` 與 `UeAvgPowerMw`。為避免後續把 gNB energy 誤稱為 system energy，CSV 已新增：
+
+```text
+SystemTotalEnergyJoules = TotalEnergyJoules + UeTotalEnergyJoules
+SystemAvgPowerWatts = AvgPowerWatts + NumUes * UeAvgPowerMw / 1000
+```
+
+這兩個欄位才是 system-level energy comparison 應使用的指標；gNB-only 與 UE-only 指標仍保留，供 Pareto trade-off 分析使用。
+
+### 14.8 Delay summary 欄位
+
+CSV 同時輸出 `MeanLatencyMs` 與 `P99LatencyMs`。前者是所有已成功接收封包的端到端 delay 算術平均，適合描述一般傳輸成本；後者是同一批 delay samples 的 99th percentile，保留用來檢查少數封包的尾端 QoS 尖峰。平均 delay 不能取代 P99，因為少量長延遲封包可能對平均值影響很小，但仍會直接造成 SLA tail violation。
+
+### 14.9 Custom BWP dwell 清理完成（2026-10-25）
+
+已移除 `controllerBwpDwellMs`、`m_bwpDwellRemainingMs` 以及 legacy scalar path 的 queue-based BWP return timer。現在 physical-BWP 模式只使用 per-UE `bwp-InactivityTimer`：controller 可提出切換至 wide BWP 的 request，實際 DL scheduling activity 重設該 UE timer，timer 到期後才回到 default 20 MHz。`enableDciDynamic=true`、eligibility trace 與 transition trace 保持不變。
+
+Torch CU118 terminal 1 的 scalar 2D smoke test 已通過：`BWP1 activity=206`、`BWP0 activity=348`，transition trace 可觀測 `100→20 MHz` 的 timer expiry 與後續 `20→100 MHz` request；因此回切不再依賴 custom dwell。下一步是用同一 timer semantics 重跑 static、1D、2D 的正式比較，再進入 grid search/PPO。
+
+### 14.10 2D timer transition/RLC 分層結果（2026-10-25）
+
+完成 270 組正式比較後，針對 54 組 2D case 交叉統計 transition trace、effective BWP 時間與 `RlcTxDropPackets`。以下數字是同一個 UE/traffic 組合跨 QoS target 與 seed 的平均：
+
+| UE 數 | 每 UE traffic | controller request / timer expiry | effective BWP=100 比例 | RLC drop |
+|---:|---:|---:|---:|---:|
+| 2 | 1 Mbps | 0 / 0 | 0.0% | 0 |
+| 2 | 2 Mbps | 0 / 0 | 0.0% | 0 |
+| 2 | 5 Mbps | 18 / 18 | 7.6% | 1,118 |
+| 10 | 1 Mbps | 0 / 0 | 0.0% | 0 |
+| 10 | 2 Mbps | 10 / 10 | 0.8% | 0 |
+| 10 | 5 Mbps | 430 / 430 | 36.1% | 146 |
+| 20 | 1 Mbps | 846.7 / 846.7 | 35.6% | 0 |
+| 20 | 2 Mbps | 800 / 800 | 33.6% | 509 |
+| 20 | 5 Mbps | 900 / 880 | 37.0% | 12,644 |
+
+整體 transition 次數與 RLC drop 呈正相關（request 與 RLC drop 的 Pearson `r≈0.52`），但不是唯一因素；例如 UE=20、1 Mbps 有大量切換卻沒有 RLC drop。下一步應以 `UE=20` 的 threshold sweep 為主，分開固定 `Warn` 與 `High`，觀察是否能降低不必要的 20↔100 oscillation，再重新檢查 RLC drop 與 QoS。
+
+本次固定 `Warn=0.4`、UE=20、QoS target=50 ms，掃描 `High=0.5/0.6/0.7/0.8`（每個 high 包含 1/2/5 Mbps 與 3 seeds，共 36 組）：
+
+| High | request/case | timer expiry/case | effective 100 MHz | System W | Mean delay | P99 delay | Rx/Tx | RLC drop | QoS≥95% |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.5 | 993 | 978 | 41.1% | 135.2 | 28.5 ms | 90.9 ms | 96.1% | 1,669 | 4/9 |
+| 0.6 | 849 | 842 | 35.4% | 124.6 | 31.2 ms | 95.2 ms | 91.2% | 4,384 | 1/9 |
+| 0.7 | 802 | 796 | 33.4% | 122.9 | 32.3 ms | 99.9 ms | 90.7% | 4,671 | 0/9 |
+| 0.8 | 791 | 782 | 32.9% | 122.0 | 33.7 ms | 107.5 ms | 90.3% | 4,820 | 0/9 |
+
+提高 `High` 的確減少了 BWP oscillation 與 100 MHz 使用比例，但沒有改善 QoS；在本設定下 `High=0.5` 是四個候選中 QoS 最穩定者，代價是切換最頻繁。後續不應只用 transition 次數選 threshold，而應以 `QoS≥95%` 為 constraint，再在可行 high 值中比較 system energy 與 RLC drop。
+
+固定 `High=0.5` 後再掃 `Warn=0.2/0.3/0.4`，共 27 組 UE=20、QoS=50 ms case：
+
+| Warn | request/case | timer expiry/case | effective 100 MHz | System W | Mean delay | P99 delay | Rx/Tx | RLC drop | QoS≥95% |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.2 | 576 | 569 | 23.9% | 137.2 | 26.7 ms | 80.8 ms | 92.2% | 3,960 | 5/9 |
+| 0.3 | 813 | 802 | 33.7% | 134.1 | 28.5 ms | 91.0 ms | 92.4% | 3,835 | 2/9 |
+| 0.4 | 993 | 978 | 41.1% | 135.2 | 28.5 ms | 90.9 ms | 96.1% | 1,669 | 4/9 |
+
+Warn 對不同 traffic 的效果不一致：`Warn=0.2` 在 1 Mbps 的 3/3 case 達到 QoS≥95%，但 5 Mbps 的 RLC drop 很高；`Warn=0.4` 則在 5 Mbps 的 3/3 case 達標且 RLC drop 較低。這表示單一固定 Warn/High 不足以支援所有負載，threshold 需要 context-aware policy，或由 PPO 觀察 queue/traffic context 後選擇。
+
+### 14.11 四組 static DTX/DRX baseline（UE=20）
+
+固定 QoS target=50 ms、traffic=1/2/5 Mbps/UE、BWP=20/100 MHz、3 seeds，共 72 組。以下為每個 mode/BWP 的 9 組平均：
+
+| Mode | BWP | gNB W | UE total W | Mean delay | P99 delay | Rx/Tx | RLC drop |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| always-on | 20 | 153.0 | 1.878 | 22.4 ms | 34.3 ms | 74.8% | 7,756 |
+| always-on | 100 | 162.0 | 2.835 | 12.0 ms | 13.0 ms | 99.8% | 0 |
+| cell-only | 20 | 101.0 | 1.494 | 53.0 ms | 120.3 ms | 49.6% | 15,526 |
+| cell-only | 100 | 112.3 | 2.610 | 20.5 ms | 42.9 ms | 86.7% | 3,982 |
+| UE-only | 20 | 153.0 | 1.869 | 22.4 ms | 34.3 ms | 74.8% | 7,756 |
+| UE-only | 100 | 162.0 | 2.837 | 12.0 ms | 13.0 ms | 99.8% | 0 |
+| joint | 20 | 101.0 | 1.436 | 53.0 ms | 120.3 ms | 49.6% | 15,526 |
+| joint | 100 | 112.3 | 2.179 | 20.5 ms | 42.9 ms | 86.7% | 3,982 |
+
+初步結論：Cell-DTX 主要降低 gNB power；UE C-DRX 主要降低 UE power。以 `Mean delay≤50 ms` 且 `loss≤1%` 為初步 QoS gate 時，這批 UE=20 結果只有 BWP=100 的 always-on/UE-only 接近可行；Cell-DTX=20 ms active window 在高負載下造成明顯 RLC drop。joint 並不是兩者功耗簡單相加，而是目前 QoS constraint 下尚未形成新的可行 Pareto 點；需要再以較長 active window 或 context-aware Cell-DTX 做後續測試。
+
+### 14.12 aligned both-on static 驗證（2026-10-25）
+
+為排除初始 UE OnDuration=10 ms 與 Cell-DTX active=20 ms 的 phase mismatch，另跑 `both_on_static-aligned`：將 `cdrxOnDurationMs` 改為 20 ms，其他條件不變，共 18 組。結果與原本 `both_on_unaligned` 完全一致：BWP=20 平均 gNB/UE/Mean/P99/RxTx/RLC 分別為 `101.0 W / 1.436 W / 53.0 ms / 120.3 ms / 49.6% / 15,526`；BWP=100 分別為 `112.3 W / 2.179 W / 20.5 ms / 42.9 ms / 86.7% / 3,982`。
+
+這表示在 `enableDciDynamic=true` 下，初始 10 ms 與 20 ms 的差異會在 controller 的 dynamic OnDuration synchronization 後被覆蓋，對 5 秒 aggregate 結果沒有可觀測影響；後續比較可將 aligned 設定作為正式 joint static baseline，但仍需保留 startup trace 以確認同步時刻。
+
+### 14.13 Joint active=30 ms 的 Pareto 候選（2026-10-25）
+
+將 aligned joint 的 Cell-DTX active window 與 UE OnDuration 同時提高至 30 ms，完成 18 組 UE=20 測試。與 active=20 ms 相比：
+
+| BWP | active=30 gNB/UE | Mean/P99 | Rx/Tx | RLC drop | QoS gate（Mean≤50、Rx/Tx≥99） |
+|---:|---:|---:|---:|---:|---:|
+| 20 MHz | 131.3 W / 1.725 W | 30.7 / 91.5 ms | 64.9% | 10,773 | 4/9 |
+| 100 MHz | 142.3 W / 2.699 W | 14.5 / 30.6 ms | 99.2% | 102 | 8/9 |
+
+在 BWP=100 MHz，active=30 的 joint point 相較 always-on BWP=100（162.0 W gNB、2.835 W UE total）同時降低 gNB 與 UE 功耗，且平均 Rx/Tx=99.2%、8/9 case 通過初步 QoS gate。這是目前第一個具備「joint coordination 可能同時改善兩端」的候選 Pareto 點；但 BWP=20 仍有明顯 loss，不能宣稱普遍成立。
+
+### 14.14 active=35 ms 多 seed 邊界確認（2026-10-26）
+
+為判斷 active=30 ms、BWP=100 MHz、UE=20、5 Mbps/UE 下 seed=101 的 `911` 個 RLC drop 是否為偶發現象，固定相同條件，將 Cell-DTX active window 與 UE OnDuration 同步提高至 35 ms，測試 seeds `101/202/303/404/505/606/707`，共 7 組，simulation time=5 s。
+
+| active | seed 數 | RLC drop | 平均 Rx/Tx | Mean delay | P99 delay | QoS satisfaction |
+|---:|---:|---:|---:|---:|---:|---:|
+| 35 ms | 7 | 0/7 | 99.61% | 13.98 ms | 58.93 ms | 98.73% |
+
+各 seed 的 RLC drop 都是 0，FlowMonitor lost packets 也都是 0；Rx/Tx 約 99.51%～99.65%，差異主要仍反映 simulation 結束時的 `PendingBytes`（約 4.1～4.4 MB），不能把它直接解讀成 PHY loss。active=35 的 gNB 平均功耗為 240.99 W、UE total 平均功耗為 3.431 W。
+
+因此，active=30 的 911-drop 結果不是每個 seed 都會重現：在 active=30 的已測 seeds `101/202/303` 中分別為 `911/0/11`，顯示它具有強烈 seed/邊界敏感性，但 active=30 仍可能在特定 seed 產生系統性不足的傳輸窗口。提高至 35 ms 後，7 個 seed 均無 RLC drop，支持「30 ms 接近 scheduling/DTX 邊界，35 ms 提供足夠裕度」的解釋，而不是單純把 911 視為固定背景 loss。
+
+### 14.15 active=30/35 ms 完整 7-seed 配對（2026-10-26）
+
+為排除只觀察前三個 seed 造成的偏差，補跑 active=30 ms 的 seeds `404/505/606/707`，其餘條件與 active=35 sweep 完全相同。結果如下：
+
+| active | RLC drop 非零 seed | RLC drop 總數 | 平均 RLC drop | 平均 Rx/Tx | Mean delay | P99 delay | 平均 gNB W | 平均 UE total W | 平均 QoS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 30 ms | 4/7 | 1,236 | 176.6 | 99.17% | 16.51 ms | 69.25 ms | 201.24 | 3.305 | 98.56% |
+| 35 ms | 0/7 | 0 | 0.0 | 99.61% | 13.98 ms | 58.93 ms | 240.99 | 3.431 | 98.73% |
+
+active=30 的非零 drop seed 為 `101=911`、`303=11`、`505=10`、`606=304`；`202/404/707` 為 0。FlowMonitor lost packets 在七個 seed 都是 0，表示這裡主要是 RLC/scheduling boundary 現象，而非 FlowMonitor 所見的底層遺失。active=35 將 RLC drop 完全消除，但代價是約 `+39.8 W` gNB 平均功耗與 `+0.126 W` UE total 平均功耗。
+
+因此結論不是「911 是單一偶發 seed」，而是：`active=30 ms` 對 seed 具有明顯敏感性，且在 7 個 seed 中有 4 個出現 RLC drop；`active=35 ms` 在目前測試範圍內穩定通過。下一步應在 `31/32/33/34/35 ms` 做窄範圍 active sweep，尋找跨 seed 無 RLC drop 的最小 active window，再評估其 Pareto 節能代價。
+
+### 14.16 Active action range 擴展決策（2026-10-26）
+
+目前 PPO 與 rule-based 的正式 active action range 改定為 `10～40 ms`，step 維持 `2 ms`：
+
+```text
+10, 12, 14, ..., 40 ms
+```
+
+這會產生 16 個 active-window actions。`40 ms` 是 40 ms Cell-DTX cycle 的 always-active upper reference；`35 ms` 已在 7-seed 測試中顯示穩定無 RLC drop。暫時不開放 `0～8 ms`，因為這些極短窗口尚未證明具有研究上的 QoS 可行性，且會擴大 PPO 探索空間。
+
+因此後續比較必須使用相同的 `10～40 ms` action range：舊 `10～30 ms` 結果保留作為歷史 baseline，不再作為 PPO 的正式完整 action space。S5、兩個 UE 的 action space 對應為 `[16, 2, 2]`；舊 scalar BWP action 則為 `16×2=32` 個組合。
+
+### 14.17 Active=35～40 ms sweep（2026-10-26）
+
+固定 UE=20、BWP=100 MHz、traffic=5 Mbps/UE、Cell cycle=40 ms、QoS target=50 ms、`enableDciDynamic=true`，對 active/UE OnDuration=`35/36/37/38/39/40 ms` 各跑 seeds `101/202/303`，共 18 組：
+
+| active | RLC drop | 平均 Rx/Tx | Mean delay | P99 delay | gNB W | UE total W | QoS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 35 ms | 0/3 | 99.630% | 13.701 ms | 41.916 ms | 244.289 | 3.490 | 99.117% |
+| 36 ms | 0/3 | 99.663% | 13.106 ms | 31.984 ms | 241.589 | 3.510 | 99.448% |
+| 37 ms | 0/3 | 99.670% | 13.070 ms | 38.905 ms | 240.162 | 3.533 | 99.185% |
+| 38 ms | 0/3 | 99.691% | 12.814 ms | 37.243 ms | 238.738 | 3.559 | 99.239% |
+| 39 ms | 0/3 | 99.733% | 12.377 ms | 23.855 ms | 236.992 | 3.570 | 99.596% |
+| 40 ms | 0/3 | 99.761% | 11.999 ms | 13.095 ms | 236.479 | 3.568 | 100.000% |
+
+在 35～40 ms 區間，所有候選值都通過目前 QoS/RLC gate，沒有觀察到 active=35 以下的邊界型 RLC drop。active 增加時，平均 gNB power 與 delay 反而下降，但 UE total power 大致上升；因此這段不是單一「越大越好」的總能耗結論，而是 `(gNB power, UE power)` 的 trade-off：35 ms 偏向 UE 節能，40 ms 偏向 gNB 與 delay。奇數 action（35/37/39）沒有顯示出比相鄰偶數 action 穩定更好的結果；目前 PPO 維持 2 ms step 仍可行，但正式擴展後應再以更多 seed 確認。
+
+### 14.18 Active=35/40 ms 正式 7-seed Pareto 比較（2026-10-26）
+
+active=35 已使用完整 seeds `101/202/303/404/505/606/707`；另補跑 active=40 的 seeds `404/505/606/707`，與先前的 `101/202/303` 合併為完整 7-seed 比較：
+
+| active | RLC drop | 平均 Rx/Tx | Mean delay | P99 delay | gNB W | UE total W | QoS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 35 ms | 0/7 | 99.610% | 13.976 ms | 58.929 ms | 240.991 | 3.431 | 98.734% |
+| 40 ms | 0/7 | 99.761% | 11.976 ms | 13.137 ms | 232.735 | 3.503 | 100.000% |
+
+在 `(gNB power, UE total power)` 平面，兩者都是 nondominated：active=35 比 active=40 少 `0.072 W` UE power，但多 `8.256 W` gNB power；active=40 則同時有較低 gNB power、較低 Mean/P99 delay 與較高 QoS，但 UE power 略高。因此 active=35/40 構成一個可解釋的 Pareto trade-off，而不是單純由 system power 加總選出唯一答案。兩個 active 值在 7 個 seed 都沒有 RLC drop，表示 35 ms 已跨過目前觀察到的 scheduling boundary；40 ms 主要提供更好的尾延遲與 gNB/UE 之間的另一個交換點。
+
+### 14.19 On-on、BWP=20 MHz 的完整負載 capacity sweep（2026-10-26）
+
+為找出 20 MHz 的實際負載轉折，固定 `UE=20`、on-on、BWP=20 MHz，測試每 UE `0.5/1/2/3/4/5 Mbps`（aggregate `10/20/40/60/80/100 Mbps`），active/UE OnDuration=`35/40 ms`，每個條件 7 seeds，共 84 組。可行 gate 定義為 `RLC drop=0`、`Rx/Tx≥99%` 且 `Mean delay≤50 ms`：
+
+| active | 每 UE rate | aggregate load | 可行 seed | 平均 RLC drop | 平均 Rx/Tx | Mean delay | QoS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 35 ms | 0.5 Mbps | 10 Mbps | 7/7 | 0.0 | 99.56% | 14.57 ms | 99.74% |
+| 35 ms | 1 Mbps | 20 Mbps | 7/7 | 0.0 | 99.56% | 14.83 ms | 99.47% |
+| 35 ms | 2 Mbps | 40 Mbps | 6/7 | 17.0 | 99.47% | 16.93 ms | 98.18% |
+| 35 ms | 3 Mbps | 60 Mbps | 0/7 | 5,295.6 | 84.26% | 33.43 ms | 78.99% |
+| 35 ms | 4 Mbps | 80 Mbps | 0/7 | 16,234.0 | 64.68% | 44.95 ms | 78.42% |
+| 35 ms | 5 Mbps | 100 Mbps | 0/7 | 27,925.4 | 51.75% | 45.29 ms | 77.39% |
+| 40 ms | 0.5 Mbps | 10 Mbps | 7/7 | 0.0 | 100.00% | 13.77 ms | 100.00% |
+| 40 ms | 1 Mbps | 20 Mbps | 7/7 | 0.0 | 99.83% | 13.77 ms | 100.00% |
+| 40 ms | 2 Mbps | 40 Mbps | 7/7 | 0.0 | 99.74% | 13.78 ms | 100.00% |
+| 40 ms | 3 Mbps | 60 Mbps | 0/7 | 3,057.3 | 90.89% | 23.59 ms | 91.48% |
+| 40 ms | 4 Mbps | 80 Mbps | 0/7 | 11,892.6 | 74.04% | 39.62 ms | 84.80% |
+| 40 ms | 5 Mbps | 100 Mbps | 0/7 | 23,581.0 | 59.26% | 39.97 ms | 84.74% |
+
+這次才真正顯示出 capacity transition：對 20 MHz on-on，`10/20 Mbps` 穩定可行，`40 Mbps` 已接近邊界（active=35 有 1 個 seed 不通過，active=40 為 7/7），而 `60 Mbps` 以上在兩個 active 設定都全部不可行。故目前可把 boundary 限定在 aggregate `40～60 Mbps`（每 UE 約 `2～3 Mbps`），不能再說 boundary 位於 100 Mbps。下一步應在 `2.0/2.25/2.5/2.75/3.0 Mbps/UE` 做細掃，找出 20 MHz on-on 的跨 seed 可行上限。
+
+### 14.20 20 MHz capacity boundary fine sweep（2026-10-26）
+
+完成每 UE `2.0/2.25/2.5/2.75/3.0 Mbps`、active=`35/40 ms`、7 seeds 的 70 組細掃。結果顯示：
+
+| active | 每 UE rate | aggregate | 可行 seed | 平均 RLC drop | 平均 Rx/Tx | QoS |
+|---:|---:|---:|---:|---:|---:|---:|
+| 35 ms | 2.00 Mbps | 40 Mbps | 6/7 | 17.0 | 99.47% | 98.18% |
+| 35 ms | 2.25 Mbps | 45 Mbps | 4/7 | 280.1 | 98.42% | 94.43% |
+| 35 ms | 2.50 Mbps | 50 Mbps | 0/7 | 1,437.9 | 94.51% | 87.42% |
+| 40 ms | 2.00 Mbps | 40 Mbps | 7/7 | 0.0 | 99.74% | 100.00% |
+| 40 ms | 2.25 Mbps | 45 Mbps | 6/7 | 26.3 | 99.59% | 99.39% |
+| 40 ms | 2.50 Mbps | 50 Mbps | 4/7 | 311.7 | 98.63% | 96.46% |
+| 40 ms | 2.75 Mbps | 55 Mbps | 0/7 | 1,323.6 | 95.48% | 92.51% |
+| 40 ms | 3.00 Mbps | 60 Mbps | 0/7 | 3,057.3 | 90.89% | 91.48% |
+
+因此若要求 7/7 seeds 全部通過目前 gate，active=40 的穩健上限約為 `2.0 Mbps/UE`（aggregate 40 Mbps）；active=35 在 2.0 Mbps 已有 1 個 seed 失效。`2.25～2.5 Mbps/UE` 是 seed-sensitive transition region，不應直接標記為穩定可行。這也顯示 boundary 不是單一固定數字，而是受到 active window 與 seed/channel realization 共同影響的區間。
+
+### 14.21 固定 aggregate=40 Mbps 的 UE 數量公平比較（2026-10-26）
+
+為分離總流量與 UE 數量效應，固定 aggregate=40 Mbps、BWP=20 MHz、on-on、active=`35/40 ms`，設定 `(UE, 每 UE rate)` 為 `(2,20)`、`(5,8)`、`(10,4)`、`(20,2)` Mbps，各跑 7 seeds，共 56 組。可行 gate 仍為 `RLC drop=0`、`Rx/Tx≥99%`、`Mean delay≤50 ms`：
+
+| active | UE | 每 UE rate | 可行 seed | 平均 RLC drop | 平均 Rx/Tx | Mean delay | gNB W | UE total W |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 35 ms | 2 | 20 Mbps | 0/7 | 1,066.0 | 95.15% | 11.96 ms | 144.1 | 0.221 |
+| 35 ms | 5 | 8 Mbps | 7/7 | 0.0 | 99.64% | 12.79 ms | 147.2 | 0.549 |
+| 35 ms | 10 | 4 Mbps | 7/7 | 0.0 | 99.62% | 14.30 ms | 149.1 | 1.023 |
+| 35 ms | 20 | 2 Mbps | 6/7 | 17.0 | 99.47% | 16.93 ms | 168.1 | 1.900 |
+| 40 ms | 2 | 20 Mbps | 7/7 | 0.0 | 99.76% | 11.63 ms | 140.6 | 0.239 |
+| 40 ms | 5 | 8 Mbps | 7/7 | 0.0 | 99.75% | 11.85 ms | 140.9 | 0.591 |
+| 40 ms | 10 | 4 Mbps | 7/7 | 0.0 | 99.74% | 12.38 ms | 142.2 | 1.072 |
+| 40 ms | 20 | 2 Mbps | 7/7 | 0.0 | 99.74% | 13.78 ms | 160.7 | 1.919 |
+
+因此相同 aggregate traffic 並不代表相同的可行性或能耗。active=35 下，UE=2 的每 UE 20 Mbps 反而全部失敗；UE=5/10 全部通過；UE=20 又回到 6/7。這是 per-UE bearer rate、排程粒度與 C-DRX eligibility 共同造成的非單調效果。active=40 則四種 UE 數量全部 7/7 通過。後續若 PPO 要泛化，observation 不能只放 aggregate load，還必須保留 UE count/per-UE traffic 或 per-bearer backlog 資訊。
