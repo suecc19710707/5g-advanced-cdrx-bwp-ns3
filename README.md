@@ -63,7 +63,8 @@ cd ../..
 # Reconstruct the energy/BWP history, then apply grant-span eligibility.
 cd contrib/nr
 git am ../../experiment_archive/official_energy_v5_2026-10-19/000*.patch
-git am ../../experiment_archive/true_bwp_dci_v6_2026-10-19/000*.patch
+git am ../../experiment_archive/true_bwp_dci_v6_2026-10-19/0001-*.patch
+git am ../../experiment_archive/true_bwp_dci_v6_2026-10-19/0002-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0001-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0002-*.patch
 git am ../../experiment_archive/slot_start_eligibility_2026-10-23/0004-*.patch
