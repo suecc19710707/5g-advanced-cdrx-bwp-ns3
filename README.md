@@ -51,7 +51,7 @@ g++ --version
 
 ```bash
 git clone --branch true-bwp-dci-v6 \
-  https://github.com/suecc0707/5g-advanced-cdrx-bwp-ns3.git ns-3-dev
+  https://github.com/suecc19710707/5g-advanced-cdrx-bwp-ns3.git ns-3-dev
 cd ns-3-dev
 
 # Fetch the ns-3 NR module used by this experiment.

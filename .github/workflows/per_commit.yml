@@ -8,6 +8,8 @@ jobs:
       cache_misses: ${{ env.cache_misses }}
     steps:
       - uses: actions/checkout@v6
+      - name: Setup pinned 5G-LENA module and research patches
+        run: python3 scripts/ci/setup_5g_lena.py
       - name: Install required packages
         run: |
           sudo apt-get update
@@ -53,6 +55,8 @@ jobs:
     if: needs.Ubuntu.outputs.cache_misses != '0'
     steps:
       - uses: actions/checkout@v6
+      - name: Setup pinned 5G-LENA module and research patches
+        run: python3 scripts/ci/setup_5g_lena.py
       - name: Install required packages
         run: |
           sudo apt-get update
@@ -124,6 +128,8 @@ jobs:
           mingw-w64-ucrt-x86_64-lld \
           mingw-w64-ucrt-x86_64-sed
           pacman --noconfirm -Scc
+      - name: Setup pinned 5G-LENA module and research patches
+        run: python3 scripts/ci/setup_5g_lena.py
       - name: Get timestamp
         id: time
         run: python3 -c "from datetime import datetime; print('time='+datetime.now().strftime('%Y-%m-%d-%H-%M-%S'))" >> $GITHUB_ENV
@@ -162,6 +168,8 @@ jobs:
         os: [ macos-latest, macos-15 ]
     steps:
       - uses: actions/checkout@v6
+      - name: Setup pinned 5G-LENA module and research patches
+        run: python3 scripts/ci/setup_5g_lena.py
       - name: Install required packages
         run: |
           brew uninstall cmake ninja
@@ -207,6 +215,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6.2.0
+      - name: Setup pinned 5G-LENA module and research patches
+        run: python scripts/ci/setup_5g_lena.py
       - name: Configure CMake
         run: |
           %comspec% /k ""C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat""
