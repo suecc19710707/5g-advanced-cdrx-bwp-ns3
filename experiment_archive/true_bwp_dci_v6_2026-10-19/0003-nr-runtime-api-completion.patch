@@ -429,6 +429,22 @@ index db23fce0..6ac5da32 100644
      };
  
      /**
+diff --git a/test/nr-test-energy-integration.cc b/test/nr-test-energy-integration.cc
+index a2990e6c..2b438d37 100644
+--- a/test/nr-test-energy-integration.cc
++++ b/test/nr-test-energy-integration.cc
+@@ -363,6 +363,11 @@ NrEnergyIntegrationTestCase::RunScenario(bool enableDrx)
+     if (enableDrx)
+     {
+         drx = CreateObject<NrUeDrxModel>();
++        // This integration fixture validates energy accounting, not DRX
++        // scheduling eligibility. Keep the UE active while traffic is sent so
++        // the PHY consistency listener does not reject a test-only grant.
++        drx->SetAttribute("LongCycle", TimeValue(MilliSeconds(160)));
++        drx->SetAttribute("OnDuration", TimeValue(MilliSeconds(160)));
+         drx->SetEnergyModel(m_ueModel);
+         ueListener->SetDrxModel(drx);
+         drx->Start(Simulator::Now());
 diff --git a/test/nr-test-energy-models.cc b/test/nr-test-energy-models.cc
 index 37462f7a..b8b64d98 100644
 --- a/test/nr-test-energy-models.cc
